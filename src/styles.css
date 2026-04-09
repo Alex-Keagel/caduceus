@@ -1,0 +1,69 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background-color: #1e1e2e;
+  color: #cdd6f4;
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 13px;
+}
+
+.app-layout {
+  display: grid;
+  grid-template-columns: 240px 1fr 320px;
+  grid-template-rows: 1fr 28px;
+  height: 100vh;
+  gap: 0;
+}
+
+.sidebar {
+  grid-column: 1;
+  grid-row: 1;
+  background: #181825;
+  border-right: 1px solid #313244;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.main-area {
+  grid-column: 2;
+  grid-row: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.terminal-pane {
+  flex: 1;
+  overflow: hidden;
+}
+
+.chat-pane {
+  grid-column: 3;
+  grid-row: 1;
+  background: #181825;
+  border-left: 1px solid #313244;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.status-bar {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  background: #89b4fa;
+  color: #1e1e2e;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+}
