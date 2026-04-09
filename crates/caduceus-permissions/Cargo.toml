@@ -1,0 +1,17 @@
+[package]
+name = "caduceus-permissions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+caduceus-core = { path = "../caduceus-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
