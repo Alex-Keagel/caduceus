@@ -12,5 +12,6 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+chrono = { workspace = true }
 async-trait = { workspace = true }
 git2 = "0.19"
