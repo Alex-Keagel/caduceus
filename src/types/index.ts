@@ -75,3 +75,51 @@ export interface TerminalExecResponse {
   stderr: string;
   exit_code: number;
 }
+
+export interface PermissionRequest {
+  id: string;
+  session_id: string;
+  tool_name: string;
+  description: string;
+  risk_level: "Low" | "Medium" | "High" | "Critical";
+}
+
+export interface ToolCallBlock {
+  id: string;
+  name: string;
+  input_json: string;
+  result?: string;
+  is_error?: boolean;
+  collapsed: boolean;
+}
+
+export interface ChatMessage {
+  id: string;
+  role: "User" | "Assistant" | "Tool" | "System";
+  content: string;
+  tokens?: number;
+  timestamp: string;
+  tool_calls?: ToolCallBlock[];
+  permission_request?: PermissionRequest;
+}
+
+export type AgentEvent =
+  | { kind: "TextDelta"; text: string }
+  | { kind: "ThinkingDelta"; text: string }
+  | { kind: "ToolUseStart"; id: string; name: string }
+  | { kind: "ToolInputDelta"; id: string; partial_json: string }
+  | { kind: "ToolResult"; id: string; content: string; is_error: boolean }
+  | { kind: "PermissionRequest"; request: PermissionRequest }
+  | { kind: "MessageStop"; input_tokens: number; output_tokens: number; cached_tokens: number }
+  | { kind: "PhaseChange"; phase: SessionPhase }
+  | { kind: "Error"; message: string };
+
+export interface PtyDataPayload {
+  session_id: string;
+  data: string;
+}
+
+export interface TerminalTab {
+  id: string;
+  title: string;
+}

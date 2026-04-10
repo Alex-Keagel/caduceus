@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { gitStatus } from "../api/tauri";
+import { gitStatus, gitFileDiff } from "../api/tauri";
 import type { GitStatusEntry } from "../types";
 
 interface GitPanelProps {
@@ -27,6 +27,9 @@ const STATUS_COLOR: Record<string, string> = {
 export default function GitPanel({ projectRoot }: GitPanelProps) {
   const [entries, setEntries] = useState<GitStatusEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [diffContent, setDiffContent] = useState<string | null>(null);
+  const [diffLoading, setDiffLoading] = useState(false);
 
   useEffect(() => {
     if (!projectRoot) {
@@ -48,6 +51,36 @@ export default function GitPanel({ projectRoot }: GitPanelProps) {
     const interval = setInterval(load, 5000);
     return () => clearInterval(interval);
   }, [projectRoot]);
+
+  const handleFileClick = async (filePath: string) => {
+    if (selectedFile === filePath) {
+      setSelectedFile(null);
+      setDiffContent(null);
+      return;
+    }
+    setSelectedFile(filePath);
+    setDiffLoading(true);
+    try {
+      const diff = await gitFileDiff(projectRoot!, filePath);
+      setDiffContent(diff);
+    } catch (e) {
+      setDiffContent(`Error: ${e}`);
+    } finally {
+      setDiffLoading(false);
+    }
+  };
+
+  const renderDiffLine = (line: string, index: number) => {
+    let color = "#cdd6f4";
+    if (line.startsWith("+")) color = "#a6e3a1";
+    else if (line.startsWith("-")) color = "#f38ba8";
+    else if (line.startsWith("@@")) color = "#89b4fa";
+    return (
+      <div key={index} style={{ color, whiteSpace: "pre", minHeight: "1em" }}>
+        {line}
+      </div>
+    );
+  };
 
   return (
     <div>
@@ -86,6 +119,7 @@ export default function GitPanel({ projectRoot }: GitPanelProps) {
       {entries.map((entry) => (
         <div
           key={entry.path}
+          onClick={() => handleFileClick(entry.path)}
           style={{
             display: "flex",
             alignItems: "center",
@@ -93,6 +127,8 @@ export default function GitPanel({ projectRoot }: GitPanelProps) {
             padding: "3px 4px",
             borderRadius: 3,
             fontSize: 11,
+            cursor: "pointer",
+            background: selectedFile === entry.path ? "#313244" : "transparent",
           }}
         >
           <span style={{ color: STATUS_COLOR[entry.status] ?? "#cdd6f4" }}>
@@ -111,6 +147,48 @@ export default function GitPanel({ projectRoot }: GitPanelProps) {
           </span>
         </div>
       ))}
+
+      {selectedFile && (
+        <div
+          style={{
+            marginTop: 8,
+            borderTop: "1px solid #313244",
+            paddingTop: 8,
+          }}
+        >
+          <div
+            style={{
+              fontSize: 10,
+              color: "#6c7086",
+              marginBottom: 4,
+              padding: "0 4px",
+            }}
+          >
+            {selectedFile}
+          </div>
+          {diffLoading ? (
+            <div style={{ color: "#6c7086", fontSize: 11, padding: "0 4px" }}>
+              Loading diff…
+            </div>
+          ) : (
+            <pre
+              style={{
+                background: "#11111b",
+                border: "1px solid #313244",
+                borderRadius: 4,
+                padding: 6,
+                fontSize: 10,
+                fontFamily: '"JetBrains Mono", monospace',
+                overflow: "auto",
+                maxHeight: 300,
+                margin: 0,
+              }}
+            >
+              {diffContent?.split("\n").map(renderDiffLine)}
+            </pre>
+          )}
+        </div>
+      )}
     </div>
   );
 }
