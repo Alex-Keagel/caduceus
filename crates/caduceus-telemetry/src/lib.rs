@@ -46,10 +46,7 @@ impl TokenCounter {
     /// Record usage attributed to a specific model.
     pub fn record_for_model(&mut self, model: &ModelId, usage: &TokenUsage) {
         self.record(usage);
-        let entry = self
-            .per_model
-            .entry(model.0.clone())
-            .or_insert_with(TokenUsage::default);
+        let entry = self.per_model.entry(model.0.clone()).or_default();
         entry.input_tokens += usage.input_tokens;
         entry.output_tokens += usage.output_tokens;
         entry.cached_tokens += usage.cached_tokens;

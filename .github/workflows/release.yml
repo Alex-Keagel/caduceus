@@ -2,6 +2,10 @@ name: Release
 on:
   push:
     tags: ['v*']
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     strategy:
@@ -19,15 +23,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+        with:
+          node-version: 22
       - uses: dtolnay/rust-toolchain@stable
-        with: { targets: ${{ matrix.target }} }
+        with:
+          targets: ${{ matrix.target }}
       - run: npm ci
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'Caduceus ${{ github.ref_name }}'
-          releaseBody: 'See CHANGELOG.md for details'
+          releaseName: "Caduceus ${{ github.ref_name }}"
+          releaseBody: "See CHANGELOG.md for details"
           releaseDraft: true
