@@ -293,7 +293,32 @@ impl GitRepo {
 mod tests {
     use super::*;
 
-    const REPO_PATH: &str = "/Users/alexkeagel/Dev/caduceus";
+    fn make_temp_repo() -> (tempfile::TempDir, GitRepo) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+
+        // Configure git user for commits
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Test User").unwrap();
+        config.set_str("user.email", "test@example.com").unwrap();
+
+        // Create an initial commit so HEAD exists
+        let sig = repo.signature().unwrap();
+        let tree_id = {
+            let mut index = repo.index().unwrap();
+            let path = dir.path().join("README.md");
+            std::fs::write(&path, "# Test Repo\n").unwrap();
+            index.add_path(std::path::Path::new("README.md")).unwrap();
+            index.write().unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
+            .unwrap();
+
+        let git_repo = GitRepo::open(dir.path()).expect("open temp repo");
+        (dir, git_repo)
+    }
 
     #[test]
     fn file_status_variants_exist() {
@@ -308,63 +333,61 @@ mod tests {
     }
 
     #[test]
-    fn open_caduceus_repo() {
-        let repo = GitRepo::open(REPO_PATH);
-        assert!(repo.is_ok(), "should open the caduceus git repo");
+    fn open_temp_repo() {
+        let (_dir, _repo) = make_temp_repo();
     }
 
     #[test]
     fn discover_from_subdirectory() {
-        let repo = GitRepo::discover(REPO_PATH.to_string() + "/crates/caduceus-core");
-        assert!(repo.is_ok(), "should discover repo from subdirectory");
-        let root = repo.unwrap().root();
-        assert!(root.is_some());
+        let (dir, _repo) = make_temp_repo();
+        let sub = dir.path().join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let discovered = GitRepo::discover(sub.to_str().unwrap());
+        assert!(discovered.is_ok(), "should discover repo from subdirectory");
     }
 
     #[test]
     fn current_branch_returns_string() {
-        let repo = GitRepo::open(REPO_PATH).expect("open repo");
+        let (_dir, repo) = make_temp_repo();
         let branch = repo.current_branch().expect("get branch");
-        assert!(!branch.is_empty(), "branch name should not be empty");
+        assert!(!branch.is_empty());
     }
 
     #[test]
     fn log_returns_commits() {
-        let repo = GitRepo::open(REPO_PATH).expect("open repo");
+        let (_dir, repo) = make_temp_repo();
         let commits = repo.log(5).expect("get log");
-        assert!(!commits.is_empty(), "should have at least one commit");
-        // Verify all commits have non-empty SHA
-        for c in &commits {
-            assert_eq!(c.sha.len(), 40, "SHA should be 40 hex chars");
-            assert!(!c.author.is_empty());
-        }
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].sha.len(), 40);
+        assert_eq!(commits[0].author, "Test User");
+        assert!(commits[0].message.contains("Initial commit"));
     }
 
     #[test]
     fn status_returns_entries() {
-        let repo = GitRepo::open(REPO_PATH).expect("open repo");
-        // Status should succeed even if the repo is clean
+        let (dir, repo) = make_temp_repo();
+        // Create an untracked file
+        std::fs::write(dir.path().join("new.txt"), "hello").unwrap();
         let entries = repo.status().expect("get status");
-        // entries may be empty in a clean repo — just assert it doesn't error
-        let _ = entries;
+        assert!(!entries.is_empty());
     }
 
     #[test]
     fn diff_unstaged_succeeds() {
-        let repo = GitRepo::open(REPO_PATH).expect("open repo");
+        let (dir, repo) = make_temp_repo();
+        // Modify tracked file
+        std::fs::write(dir.path().join("README.md"), "# Changed\n").unwrap();
         let summaries = repo.diff_unstaged().expect("diff unstaged");
-        // Summaries may be empty; verify the method runs without error
-        for s in &summaries {
-            assert!(!s.path.is_empty());
-        }
+        assert!(!summaries.is_empty());
+        assert_eq!(summaries[0].path, "README.md");
     }
 
     #[test]
     fn diff_text_staged_is_string() {
-        let repo = GitRepo::open(REPO_PATH).expect("open repo");
+        let (_dir, repo) = make_temp_repo();
         let text = repo.diff(true).expect("diff staged text");
-        // text may be empty if nothing staged; just verify it returns a string
-        let _ = text;
+        // Nothing staged, should be empty
+        assert!(text.is_empty());
     }
 
     #[test]
