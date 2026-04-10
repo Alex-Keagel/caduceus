@@ -1,15 +1,13 @@
 pub mod sandbox;
 use caduceus_core::{CaduceusError, Result};
-use caduceus_permissions::{Capability, PermissionEnforcer};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
 
-const MAX_READ_SIZE: u64 = 1 * 1024 * 1024; // 1 MB
+const MAX_READ_SIZE: u64 = 1024 * 1024; // 1 MB
 const MAX_WRITE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
-const MAX_OUTPUT_SIZE: usize = 1 * 1024 * 1024; // 1 MB for command output
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_OUTPUT_SIZE: usize = 1024 * 1024; // 1 MB for command output
 
 // Env vars to strip from child processes for safety
 const SANITIZED_ENV_VARS: &[&str] = &[
@@ -149,7 +147,7 @@ impl FileOps {
         };
 
         if p.exists() {
-            let canonical = p.canonicalize().map_err(|e| CaduceusError::Io(e))?;
+            let canonical = p.canonicalize().map_err(CaduceusError::Io)?;
             if !canonical.starts_with(&self.workspace_root) {
                 return Err(CaduceusError::PermissionDenied {
                     capability: "fs".into(),
@@ -160,7 +158,7 @@ impl FileOps {
         } else {
             let parent = p.parent().unwrap_or(&p);
             if parent.exists() {
-                let canonical_parent = parent.canonicalize().map_err(|e| CaduceusError::Io(e))?;
+                let canonical_parent = parent.canonicalize().map_err(CaduceusError::Io)?;
                 if !canonical_parent.starts_with(&self.workspace_root) {
                     return Err(CaduceusError::PermissionDenied {
                         capability: "fs".into(),
@@ -176,7 +174,7 @@ impl FileOps {
         let resolved = self.resolve_path(path)?;
         let meta = tokio::fs::metadata(&resolved)
             .await
-            .map_err(|e| CaduceusError::Io(e))?;
+            .map_err(CaduceusError::Io)?;
         if meta.len() > MAX_READ_SIZE {
             return Err(CaduceusError::Tool {
                 tool: "runtime".into(),
@@ -189,7 +187,7 @@ impl FileOps {
         }
         tokio::fs::read_to_string(&resolved)
             .await
-            .map_err(|e| CaduceusError::Io(e))
+            .map_err(CaduceusError::Io)
     }
 
     pub async fn write(&self, path: &str, content: &str) -> Result<()> {
@@ -207,11 +205,11 @@ impl FileOps {
         if let Some(parent) = resolved.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(|e| CaduceusError::Io(e))?;
+                .map_err(CaduceusError::Io)?;
         }
         tokio::fs::write(&resolved, content)
             .await
-            .map_err(|e| CaduceusError::Io(e))
+            .map_err(CaduceusError::Io)
     }
 
     pub async fn edit(&self, path: &str, old: &str, new: &str) -> Result<usize> {
@@ -246,14 +244,10 @@ impl FileOps {
         let mut entries = Vec::new();
         let mut read_dir = tokio::fs::read_dir(&resolved)
             .await
-            .map_err(|e| CaduceusError::Io(e))?;
-        while let Some(entry) = read_dir
-            .next_entry()
-            .await
-            .map_err(|e| CaduceusError::Io(e))?
-        {
+            .map_err(CaduceusError::Io)?;
+        while let Some(entry) = read_dir.next_entry().await.map_err(CaduceusError::Io)? {
             if let Some(name) = entry.file_name().to_str() {
-                let file_type = entry.file_type().await.map_err(|e| CaduceusError::Io(e))?;
+                let file_type = entry.file_type().await.map_err(CaduceusError::Io)?;
                 let suffix = if file_type.is_dir() { "/" } else { "" };
                 entries.push(format!("{name}{suffix}"));
             }

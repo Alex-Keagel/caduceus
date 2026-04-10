@@ -399,7 +399,7 @@ impl AgentHarness {
         history.append(caduceus_providers::Message::user(user_input));
 
         let assembler = ContextAssembler::new(self.max_context_tokens, &self.system_prompt);
-        let mut final_text = String::new();
+        let final_text;
 
         // v1: single-pass (no tool-use loop — that's post-v1 multi-agent)
         {

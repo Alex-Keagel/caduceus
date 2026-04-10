@@ -285,7 +285,7 @@ async fn session_create(
         .await
         .map_err(|e| e.to_string())?;
     cancellation_token(&state, &session.id.to_string())?.store(false, Ordering::SeqCst);
-    Ok(session_info_from_state(&state.storage, session).await?)
+    session_info_from_state(&state.storage, session).await
 }
 
 #[tauri::command]
