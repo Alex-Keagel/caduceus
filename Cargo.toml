@@ -1,18 +1,18 @@
 [workspace]
 members = [
-    "caduceus-core",
-    "caduceus-storage",
-    "caduceus-scanner",
-    "caduceus-git",
-    "caduceus-providers",
-    "caduceus-permissions",
-    "caduceus-runtime",
-    "caduceus-tools",
-    "caduceus-orchestrator",
-    "caduceus-telemetry",
-    "caduceus-omniscience",
-    "caduceus-crdt",
-    "../src-tauri",
+    "crates/caduceus-core",
+    "crates/caduceus-storage",
+    "crates/caduceus-scanner",
+    "crates/caduceus-git",
+    "crates/caduceus-providers",
+    "crates/caduceus-permissions",
+    "crates/caduceus-runtime",
+    "crates/caduceus-tools",
+    "crates/caduceus-orchestrator",
+    "crates/caduceus-telemetry",
+    "crates/caduceus-omniscience",
+    "crates/caduceus-crdt",
+    "src-tauri",
 ]
 resolver = "2"
 

@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 // ── Lamport clock ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct LamportTimestamp(pub u64);
 
 impl LamportTimestamp {

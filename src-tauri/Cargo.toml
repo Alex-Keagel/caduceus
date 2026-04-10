@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
-[lib]
-name = "caduceus_tauri_lib"
-crate-type = ["lib", "cdylib", "staticlib"]
-
 [dependencies]
 caduceus-core = { path = "../crates/caduceus-core" }
 caduceus-storage = { path = "../crates/caduceus-storage" }
