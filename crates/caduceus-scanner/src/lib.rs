@@ -401,19 +401,28 @@ mod tests {
 
     #[test]
     fn token_estimate_is_file_count_times_200() {
-        // Scan a real path we know exists (the caduceus repo)
-        let scanner = ProjectScanner::new(
-            "/Users/alexkeagel/Dev/caduceus/crates/caduceus-core",
-            u32::MAX,
-        );
+        let dir = tempfile::tempdir().unwrap();
+        // Create some Rust files
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn hello() {}").unwrap();
+
+        let scanner = ProjectScanner::new(dir.path(), u32::MAX);
         let ctx = scanner.scan().expect("scan should succeed");
         assert!(ctx.total_files > 0, "should find files");
         assert_eq!(ctx.token_estimate, (ctx.total_files as u32) * 200);
     }
 
     #[test]
-    fn scan_caduceus_detects_rust_and_tokio() {
-        let scanner = ProjectScanner::new("/Users/alexkeagel/Dev/caduceus", u32::MAX);
+    fn scan_detects_rust_and_tokio() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"\n[dependencies]\ntokio = \"1\"\n",
+        )
+        .unwrap();
+
+        let scanner = ProjectScanner::new(dir.path(), u32::MAX);
         let ctx = scanner.scan().expect("scan should succeed");
 
         let lang_names: Vec<&str> = ctx.languages.iter().map(|l| l.name.as_str()).collect();
@@ -425,13 +434,12 @@ mod tests {
 
     #[test]
     fn scan_produces_non_empty_summary() {
-        let scanner = ProjectScanner::new(
-            "/Users/alexkeagel/Dev/caduceus/crates/caduceus-core",
-            u32::MAX,
-        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn hello() {}").unwrap();
+
+        let scanner = ProjectScanner::new(dir.path(), u32::MAX);
         let ctx = scanner.scan().expect("scan should succeed");
         assert!(!ctx.context_summary.is_empty());
-        assert!(ctx.context_summary.contains("caduceus-core"));
     }
 
     #[test]
