@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   SessionInfo,
   AgentTurnResponse,
@@ -6,6 +7,8 @@ import type {
   ProjectScanResult,
   GitStatusEntry,
   CaduceusConfig,
+  PtyDataPayload,
+  AgentEvent,
 } from "../types";
 
 // ── Session commands ──────────────────────────────────────────────────────────
@@ -88,4 +91,40 @@ export async function configSetProvider(
   apiKey: string
 ): Promise<void> {
   return invoke("config_set_provider", { providerId, apiKey });
+}
+
+// ── PTY commands ──────────────────────────────────────────────────────────────
+
+export async function ptyCreate(sessionId: string): Promise<void> {
+  return invoke("pty_create", { sessionId });
+}
+
+export async function ptyWrite(sessionId: string, data: string): Promise<void> {
+  return invoke("pty_write", { sessionId, data });
+}
+
+export async function ptyResize(sessionId: string, cols: number, rows: number): Promise<void> {
+  return invoke("pty_resize", { sessionId, cols, rows });
+}
+
+// ── Permission commands ───────────────────────────────────────────────────────
+
+export async function permissionRespond(requestId: string, allow: boolean): Promise<void> {
+  return invoke("permission_respond", { requestId, allow });
+}
+
+// ── File-level diff ───────────────────────────────────────────────────────────
+
+export async function gitFileDiff(projectRoot: string, filePath: string): Promise<string> {
+  return invoke("git_file_diff", { projectRoot, filePath });
+}
+
+// ── Event listeners ───────────────────────────────────────────────────────────
+
+export async function listenPtyData(handler: (payload: PtyDataPayload) => void): Promise<UnlistenFn> {
+  return listen<PtyDataPayload>("pty-data", (event) => handler(event.payload));
+}
+
+export async function listenAgentEvent(handler: (event: AgentEvent) => void): Promise<UnlistenFn> {
+  return listen<AgentEvent>("agent-event", (event) => handler(event.payload));
 }

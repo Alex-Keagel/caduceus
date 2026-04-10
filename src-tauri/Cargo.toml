@@ -24,6 +24,10 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tauri = { version = "2", features = [] }
+base64 = "0.22"
+futures = "0.3"
+portable-pty = "0.8"
+uuid = { workspace = true }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

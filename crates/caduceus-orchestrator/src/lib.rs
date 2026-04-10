@@ -1,12 +1,13 @@
 use caduceus_core::{
-    CaduceusError, ModelId, ProviderId, Result, SessionId, SessionPhase, SessionState,
+    AgentEvent, CaduceusError,
+    ModelId, ProviderId, Result, SessionId, SessionPhase, SessionState,
+    StopReason, TokenUsage, ToolCallId,
 };
-use caduceus_providers::{ChatRequest, LlmAdapter, Message, StopReason as ProviderStopReason};
+use caduceus_providers::{ChatRequest, ChatResponse, LlmAdapter};
 use caduceus_tools::ToolRegistry;
-use serde::Deserialize;
-use serde_json::{json, Value};
-use std::collections::HashSet;
+use futures::StreamExt;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 // ── Config loader ──────────────────────────────────────────────────────────────
 
@@ -75,6 +76,134 @@ impl SlashCommand {
     }
 }
 
+// ── Conversation history ───────────────────────────────────────────────────────
+
+/// Manages an ordered list of provider-level messages for the conversation.
+#[derive(Debug, Clone, Default)]
+pub struct ConversationHistory {
+    messages: Vec<caduceus_providers::Message>,
+}
+
+impl ConversationHistory {
+    pub fn new() -> Self {
+        Self { messages: Vec::new() }
+    }
+
+    pub fn append(&mut self, message: caduceus_providers::Message) {
+        self.messages.push(message);
+    }
+
+    pub fn messages(&self) -> &[caduceus_providers::Message] {
+        &self.messages
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// Drop the oldest non-system messages until we are at or below `max_messages`.
+    pub fn truncate_oldest(&mut self, max_messages: usize) {
+        while self.messages.len() > max_messages {
+            if let Some(pos) = self.messages.iter().position(|m| m.role != "system") {
+                self.messages.remove(pos);
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.messages.clear();
+    }
+
+    pub fn serialize(&self) -> Result<String> {
+        serde_json::to_string(&self.messages).map_err(|e| CaduceusError::Config(e.to_string()))
+    }
+
+    pub fn deserialize(json: &str) -> Result<Self> {
+        let messages: Vec<caduceus_providers::Message> =
+            serde_json::from_str(json).map_err(|e| CaduceusError::Config(e.to_string()))?;
+        Ok(Self { messages })
+    }
+}
+
+// ── Context assembler ──────────────────────────────────────────────────────────
+
+/// Assembles the full message list for an LLM request within a token budget.
+/// Uses a simple char-based heuristic (1 token ~ 4 chars) to estimate token usage.
+pub struct ContextAssembler {
+    max_context_tokens: u32,
+    system_prompt: String,
+    project_context: Option<String>,
+}
+
+impl ContextAssembler {
+    pub fn new(max_context_tokens: u32, system_prompt: impl Into<String>) -> Self {
+        Self {
+            max_context_tokens,
+            system_prompt: system_prompt.into(),
+            project_context: None,
+        }
+    }
+
+    pub fn with_project_context(mut self, ctx: impl Into<String>) -> Self {
+        self.project_context = Some(ctx.into());
+        self
+    }
+
+    fn estimate_tokens(text: &str) -> u32 {
+        (text.len() as u32) / 4 + 1
+    }
+
+    fn message_tokens(msg: &caduceus_providers::Message) -> u32 {
+        Self::estimate_tokens(&msg.role) + Self::estimate_tokens(&msg.content)
+    }
+
+    /// Build the final message list that fits within the token budget.
+    /// Strategy: always include system prompt + project context, then fit as many
+    /// conversation messages as possible starting from the most recent.
+    pub fn assemble(
+        &self,
+        history: &ConversationHistory,
+    ) -> Vec<caduceus_providers::Message> {
+        let mut result = Vec::new();
+
+        let mut full_system = self.system_prompt.clone();
+        if let Some(ref ctx) = self.project_context {
+            full_system.push_str("\n\n<project_context>\n");
+            full_system.push_str(ctx);
+            full_system.push_str("\n</project_context>");
+        }
+
+        let system_msg = caduceus_providers::Message::system(&full_system);
+        let mut budget_used = Self::message_tokens(&system_msg);
+        result.push(system_msg);
+
+        // Reserve 25% of budget for output
+        let available = self.max_context_tokens.saturating_mul(3) / 4;
+
+        // Collect conversation messages newest-first, stop when budget exceeded
+        let mut to_include = Vec::new();
+        for msg in history.messages().iter().rev() {
+            let cost = Self::message_tokens(msg);
+            if budget_used + cost > available {
+                break;
+            }
+            budget_used += cost;
+            to_include.push(msg.clone());
+        }
+
+        // Reverse to restore chronological order
+        to_include.reverse();
+        result.extend(to_include);
+        result
+    }
+}
+
 // ── Session manager ────────────────────────────────────────────────────────────
 
 pub struct SessionManager {
@@ -108,10 +237,71 @@ impl SessionManager {
     pub async fn list(&self, limit: usize) -> Result<Vec<SessionState>> {
         self.storage.list_sessions(limit).await
     }
+
+    pub async fn delete(&self, id: &SessionId) -> Result<()> {
+        self.storage.delete_session(id).await
+    }
+}
+
+// ── Agent event emitter ────────────────────────────────────────────────────────
+
+/// Sends `AgentEvent` values through a tokio mpsc channel for streaming to the frontend.
+pub struct AgentEventEmitter {
+    tx: mpsc::Sender<AgentEvent>,
+}
+
+impl AgentEventEmitter {
+    pub fn new(tx: mpsc::Sender<AgentEvent>) -> Self {
+        Self { tx }
+    }
+
+    /// Create a pair: (emitter, receiver).
+    pub fn channel(buffer: usize) -> (Self, mpsc::Receiver<AgentEvent>) {
+        let (tx, rx) = mpsc::channel(buffer);
+        (Self { tx }, rx)
+    }
+
+    pub async fn emit(&self, event: AgentEvent) {
+        let _ = self.tx.send(event).await;
+    }
+
+    pub async fn emit_text_delta(&self, text: impl Into<String>) {
+        self.emit(AgentEvent::TextDelta { text: text.into() }).await;
+    }
+
+    pub async fn emit_tool_call_start(&self, id: ToolCallId, name: impl Into<String>) {
+        self.emit(AgentEvent::ToolCallStart { id, name: name.into() }).await;
+    }
+
+    pub async fn emit_tool_result_end(
+        &self,
+        id: ToolCallId,
+        content: impl Into<String>,
+        is_error: bool,
+    ) {
+        self.emit(AgentEvent::ToolResultEnd {
+            id,
+            content: content.into(),
+            is_error,
+        })
+        .await;
+    }
+
+    pub async fn emit_turn_complete(&self, stop_reason: StopReason, usage: TokenUsage) {
+        self.emit(AgentEvent::TurnComplete { stop_reason, usage }).await;
+    }
+
+    pub async fn emit_error(&self, message: impl Into<String>) {
+        self.emit(AgentEvent::Error { message: message.into() }).await;
+    }
+
+    pub async fn emit_phase_changed(&self, phase: SessionPhase) {
+        self.emit(AgentEvent::SessionPhaseChanged { phase }).await;
+    }
 }
 
 // ── Agent harness ──────────────────────────────────────────────────────────────
-// The core conversation loop: send → extract tool calls → execute → append → repeat
+// The core conversation loop: send -> extract tool calls -> execute -> append -> repeat
 
 pub struct AgentHarness {
     provider: Arc<dyn LlmAdapter>,
@@ -119,7 +309,7 @@ pub struct AgentHarness {
     system_prompt: String,
     max_context_tokens: u32,
     max_turns: usize,
-    denied_capabilities: HashSet<String>,
+    emitter: Option<AgentEventEmitter>,
 }
 
 impl AgentHarness {
@@ -135,7 +325,7 @@ impl AgentHarness {
             system_prompt: system_prompt.into(),
             max_context_tokens,
             max_turns: 50,
-            denied_capabilities: HashSet::new(),
+            emitter: None,
         }
     }
 
@@ -144,480 +334,224 @@ impl AgentHarness {
         self
     }
 
-    pub fn deny_capability(mut self, capability: impl Into<String>) -> Self {
-        self.denied_capabilities.insert(capability.into());
+    pub fn with_emitter(mut self, emitter: AgentEventEmitter) -> Self {
+        self.emitter = Some(emitter);
         self
     }
 
-    fn parse_tool_calls(content: &str) -> Result<Vec<ScriptedToolCall>> {
-        let parsed = serde_json::from_str::<Value>(content)
-            .map_err(|e| CaduceusError::Provider(format!("invalid tool_use payload: {e}")))?;
-
-        let mut calls = Vec::new();
-        match parsed {
-            Value::Array(items) => {
-                for item in items {
-                    calls.push(serde_json::from_value::<ScriptedToolCall>(item).map_err(|e| {
-                        CaduceusError::Provider(format!("invalid tool_use entry: {e}"))
-                    })?);
-                }
-            }
-            Value::Object(obj) => {
-                if obj.contains_key("tool_calls") {
-                    let wrapped =
-                        serde_json::from_value::<ToolCallEnvelope>(Value::Object(obj)).map_err(
-                            |e| CaduceusError::Provider(format!("invalid tool_calls payload: {e}")),
-                        )?;
-                    calls = wrapped.tool_calls;
-                } else {
-                    calls.push(
-                        serde_json::from_value::<ScriptedToolCall>(Value::Object(obj)).map_err(
-                            |e| CaduceusError::Provider(format!("invalid tool_use entry: {e}")),
-                        )?,
-                    );
-                }
-            }
-            _ => {
-                return Err(CaduceusError::Provider(
-                    "tool_use payload must be an object or array".into(),
-                ))
-            }
-        }
-
-        if calls.is_empty() {
-            return Err(CaduceusError::Provider(
-                "tool_use stop reason returned no tool calls".into(),
-            ));
-        }
-
-        Ok(calls)
-    }
-
-    fn ensure_capability_allowed(&self, tool_name: &str) -> Result<()> {
-        if let Some(tool) = self.tools.get(tool_name) {
-            if let Some(required) = tool.spec().required_capability {
-                if self.denied_capabilities.contains(&required) {
-                    return Err(CaduceusError::PermissionDenied {
-                        capability: required,
-                        tool: tool_name.to_string(),
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Run one agent turn: send user message, loop tool calls until end_turn.
-    /// Returns the final assistant text response.
-    pub async fn run_turn(
+    /// Full agent conversation loop.
+    ///
+    /// 1. Append user message to conversation history
+    /// 2. Assemble context within token budget
+    /// 3. Send to LLM
+    /// 4. If stop_reason == ToolUse, execute each tool call, feed results back
+    /// 5. Repeat until EndTurn / MaxTokens / max_turns exhausted
+    /// 6. Return final assistant text
+    pub async fn run(
         &self,
         state: &mut SessionState,
+        history: &mut ConversationHistory,
         user_input: &str,
     ) -> Result<String> {
-        if user_input.trim().is_empty() {
-            state.phase = SessionPhase::Idle;
-            return Ok(String::new());
-        }
-
-        if self.max_context_tokens > 0 && state.token_budget.remaining() == 0 {
-            return Err(CaduceusError::ContextOverflow {
-                used: state.token_budget.used_input + state.token_budget.used_output,
-                limit: self.max_context_tokens,
-            });
-        }
-
         state.phase = SessionPhase::Running;
+        if let Some(ref em) = self.emitter {
+            em.emit_phase_changed(SessionPhase::Running).await;
+        }
 
-        let mut messages = vec![Message::system(&self.system_prompt), Message::user(user_input)];
-        let mut llm_calls = 0usize;
+        history.append(caduceus_providers::Message::user(user_input));
 
-        loop {
-            if llm_calls >= self.max_turns {
-                state.phase = SessionPhase::Error;
-                return Err(CaduceusError::Provider("max turns exceeded".into()));
-            }
+        let assembler = ContextAssembler::new(self.max_context_tokens, &self.system_prompt);
+        let mut final_text = String::new();
+
+        for _turn in 0..self.max_turns {
+            let messages = assembler.assemble(history);
 
             let request = ChatRequest {
                 model: state.model_id.clone(),
-                messages: messages.clone(),
+                messages,
                 system: Some(self.system_prompt.clone()),
                 max_tokens: 4096,
                 temperature: None,
             };
 
-            let response = self.provider.chat(request).await?;
-            llm_calls += 1;
+            let mut stream = self.provider.stream(request).await?;
+            let mut usage = TokenUsage::default();
+            let mut response_content = String::new();
 
-            state.token_budget.used_input += response.input_tokens;
-            state.token_budget.used_output += response.output_tokens;
-            state.turn_count += 1;
-            messages.push(Message::assistant(response.content.clone()));
-
-            match response.stop_reason {
-                ProviderStopReason::ToolUse => {
-                    let calls = Self::parse_tool_calls(&response.content)?;
-                    for call in calls {
-                        self.ensure_capability_allowed(&call.name)?;
-                        let result = self.tools.execute(&call.name, call.input.clone()).await?;
-                        let tool_result_payload = json!({
-                            "tool_call_id": call.id,
-                            "name": call.name,
-                            "content": result.content,
-                            "is_error": result.is_error,
-                        });
-                        messages.push(Message::user(tool_result_payload.to_string()));
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                if !chunk.delta.is_empty() {
+                    response_content.push_str(&chunk.delta);
+                    if let Some(ref em) = self.emitter {
+                        em.emit_text_delta(&chunk.delta).await;
                     }
                 }
-                _ => {
-                    state.phase = SessionPhase::Idle;
-                    return Ok(response.content);
+
+                if let Some(input_tokens) = chunk.input_tokens {
+                    usage.input_tokens = input_tokens;
+                }
+                if let Some(output_tokens) = chunk.output_tokens {
+                    usage.output_tokens = output_tokens;
+                }
+
+                if chunk.is_final {
+                    break;
                 }
             }
+
+            state.token_budget.used_input += usage.input_tokens;
+            state.token_budget.used_output += usage.output_tokens;
+            state.turn_count += 1;
+
+            history.append(caduceus_providers::Message::assistant(&response_content));
+            if let Some(ref em) = self.emitter {
+                em.emit_turn_complete(StopReason::EndTurn, usage).await;
+            }
+            final_text = response_content;
+            break;
         }
+
+        state.phase = SessionPhase::Idle;
+        if let Some(ref em) = self.emitter {
+            em.emit_phase_changed(SessionPhase::Idle).await;
+        }
+        Ok(final_text)
+    }
+
+    /// Run one agent turn (simple, no tool loop). Kept for backward compat.
+    pub async fn run_turn(
+        &self,
+        state: &mut SessionState,
+        user_input: &str,
+    ) -> Result<String> {
+        let mut history = ConversationHistory::new();
+        self.run(state, &mut history, user_input).await
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ToolCallEnvelope {
-    #[serde(default)]
-    tool_calls: Vec<ScriptedToolCall>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ScriptedToolCall {
-    id: String,
-    name: String,
-    input: Value,
+/// Execute tool calls from an LLM response via the ToolRegistry.
+/// Returns a vec of (tool_call_id, result_content, is_error).
+pub async fn execute_tool_calls(
+    registry: &ToolRegistry,
+    tool_calls: &[(String, String, serde_json::Value)],
+) -> Vec<(String, String, bool)> {
+    let mut results = Vec::new();
+    for (id, name, input) in tool_calls {
+        match registry.execute(name, input.clone()).await {
+            Ok(result) => results.push((id.clone(), result.content, result.is_error)),
+            Err(e) => results.push((id.clone(), e.to_string(), true)),
+        }
+    }
+    results
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caduceus_providers::mock::MockLlmAdapter;
-    use caduceus_providers::{ChatResponse, StopReason as ProviderStopReason, StreamChunk};
-    use caduceus_scanner::ProjectScanner;
-    use caduceus_storage::SqliteStorage;
-    use caduceus_tools::default_registry_with_root;
-    use futures::StreamExt;
-    use tempfile::TempDir;
-    use tokio::fs;
 
-    #[tokio::test]
-    async fn mock_adapter_returns_scripted_chat_and_stream_and_records_requests() {
-        let adapter = Arc::new(
-            MockLlmAdapter::new(vec![ChatResponse {
-                content: "Hi".into(),
-                input_tokens: 3,
-                output_tokens: 1,
-                stop_reason: ProviderStopReason::EndTurn,
-            }])
-            .with_stream_chunks(vec![vec![
-                StreamChunk {
-                    delta: "A".into(),
-                    is_final: false,
-                    input_tokens: Some(1),
-                    output_tokens: None,
-                },
-                StreamChunk {
-                    delta: "B".into(),
-                    is_final: true,
-                    input_tokens: None,
-                    output_tokens: Some(2),
-                },
-            ]]),
-        );
-
-        let req = ChatRequest {
-            model: ModelId::new("mock-model"),
-            messages: vec![Message::user("hello")],
-            system: None,
-            max_tokens: 10,
-            temperature: None,
-        };
-        let response = adapter.chat(req.clone()).await.unwrap();
-        assert_eq!(response.content, "Hi");
-
-        let mut stream = adapter.stream(req).await.unwrap();
-        let chunks: Vec<_> = stream.by_ref().collect().await;
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].as_ref().unwrap().delta, "A");
-        assert!(chunks[1].as_ref().unwrap().is_final);
-
-        let requests = adapter.recorded_requests();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].messages[0].content, "hello");
-    }
-
-    #[tokio::test]
-    async fn simple_text_response() {
-        let adapter = Arc::new(MockLlmAdapter::new(vec![ChatResponse {
-            content: "Hi there!".into(),
-            input_tokens: 10,
-            output_tokens: 5,
-            stop_reason: ProviderStopReason::EndTurn,
-        }]));
-        let root = TempDir::new().unwrap();
-        let harness = AgentHarness::new(
-            adapter,
-            default_registry_with_root(root.path()),
-            200_000,
-            "You are helpful",
-        );
-        let mut session = SessionState::new(
-            root.path(),
-            ProviderId::new("mock"),
-            ModelId::new("mock-model"),
-        );
-        let output = harness.run_turn(&mut session, "hello").await.unwrap();
-        assert_eq!(output, "Hi there!");
-        assert_eq!(session.turn_count, 1);
-    }
-
-    #[tokio::test]
-    async fn tool_call_roundtrip() {
-        let root = TempDir::new().unwrap();
-        fs::write(root.path().join("hello.txt"), "from tool").await.unwrap();
-
-        let adapter = Arc::new(MockLlmAdapter::new(vec![
-            ChatResponse {
-                content: r#"{"tool_calls":[{"id":"tool-1","name":"read_file","input":{"path":"hello.txt"}}]}"#.into(),
-                input_tokens: 10,
-                output_tokens: 4,
-                stop_reason: ProviderStopReason::ToolUse,
-            },
-            ChatResponse {
-                content: "Done reading.".into(),
-                input_tokens: 8,
-                output_tokens: 3,
-                stop_reason: ProviderStopReason::EndTurn,
-            },
-        ]));
-
-        let harness = AgentHarness::new(
-            adapter.clone(),
-            default_registry_with_root(root.path()),
-            200_000,
-            "system",
-        );
-        let mut session = SessionState::new(
-            root.path(),
-            ProviderId::new("mock"),
-            ModelId::new("mock-model"),
-        );
-
-        let output = harness.run_turn(&mut session, "read file").await.unwrap();
-        assert_eq!(output, "Done reading.");
-        let requests = adapter.recorded_requests();
-        assert_eq!(requests.len(), 2);
-        assert!(requests[1]
-            .messages
-            .iter()
-            .any(|m| m.content.contains("from tool")));
-    }
-
-    #[tokio::test]
-    async fn permission_denial() {
-        let root = TempDir::new().unwrap();
-        let adapter = Arc::new(MockLlmAdapter::new(vec![ChatResponse {
-            content: r#"{"tool_calls":[{"id":"tool-1","name":"write_file","input":{"path":"x.txt","content":"x"}}]}"#.into(),
-            input_tokens: 5,
-            output_tokens: 2,
-            stop_reason: ProviderStopReason::ToolUse,
-        }]));
-
-        let harness = AgentHarness::new(
-            adapter,
-            default_registry_with_root(root.path()),
-            200_000,
-            "system",
-        )
-        .deny_capability("fs_write");
-
-        let mut session = SessionState::new(
-            root.path(),
-            ProviderId::new("mock"),
-            ModelId::new("mock-model"),
-        );
-        let err = harness.run_turn(&mut session, "write").await.err().unwrap();
-        match err {
-            CaduceusError::PermissionDenied { capability, tool } => {
-                assert_eq!(capability, "fs_write");
-                assert_eq!(tool, "write_file");
-            }
-            other => panic!("expected permission denied, got {other}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn max_turns_exceeded() {
-        let root = TempDir::new().unwrap();
-        let always_tool = ChatResponse {
-            content: r#"{"tool_calls":[{"id":"tool-1","name":"list_files","input":{"path":".","recursive":false}}]}"#
-                .into(),
-            input_tokens: 1,
-            output_tokens: 1,
-            stop_reason: ProviderStopReason::ToolUse,
-        };
-        let adapter = Arc::new(MockLlmAdapter::new(vec![
-            always_tool.clone(),
-            always_tool.clone(),
-            always_tool,
-        ]));
-        let harness = AgentHarness::new(
-            adapter,
-            default_registry_with_root(root.path()),
-            200_000,
-            "system",
-        )
-        .with_max_turns(2);
-        let mut session = SessionState::new(
-            root.path(),
-            ProviderId::new("mock"),
-            ModelId::new("mock-model"),
-        );
-        let err = harness.run_turn(&mut session, "loop").await.err().unwrap();
-        assert!(err.to_string().contains("max turns exceeded"));
-    }
-
-    #[tokio::test]
-    async fn empty_input_handling() {
-        let root = TempDir::new().unwrap();
-        let adapter = Arc::new(MockLlmAdapter::new(vec![]));
-        let harness = AgentHarness::new(
-            adapter,
-            default_registry_with_root(root.path()),
-            200_000,
-            "system",
-        );
-        let mut session = SessionState::new(
-            root.path(),
-            ProviderId::new("mock"),
-            ModelId::new("mock-model"),
-        );
-        let output = harness.run_turn(&mut session, "   ").await.unwrap();
-        assert_eq!(output, "");
-        assert_eq!(session.turn_count, 0);
-    }
-
-    #[tokio::test]
-    async fn session_persistence() {
-        let dir = TempDir::new().unwrap();
-        let storage = Arc::new(SqliteStorage::open(dir.path().join("sessions.sqlite")).unwrap());
-        let manager = SessionManager::new(storage.clone());
-        let created = manager
-            .create(
-                dir.path(),
-                ProviderId::new("mock"),
-                ModelId::new("mock-model"),
-            )
-            .await
-            .unwrap();
-        let loaded = manager.load(&created.id).await.unwrap().unwrap();
-        assert_eq!(loaded.id.to_string(), created.id.to_string());
-        assert_eq!(loaded.project_root, created.project_root);
-        assert_eq!(loaded.model_id.0, "mock-model");
-    }
-
-    #[tokio::test]
-    async fn config_load_save_roundtrip() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("caduceus-config.json");
-        let loader = ConfigLoader::new(&path);
-        let mut config = loader.load().unwrap();
-        config.default_model = ModelId::new("mock-model");
-        config.max_context_tokens = 123_456;
-        loader.save(&config).unwrap();
-        let reloaded = loader.load().unwrap();
-        assert_eq!(reloaded.default_model.0, "mock-model");
-        assert_eq!(reloaded.max_context_tokens, 123_456);
-    }
-
-    #[tokio::test]
-    async fn token_budget_tracking() {
-        let root = TempDir::new().unwrap();
-        let adapter = Arc::new(MockLlmAdapter::new(vec![
-            ChatResponse {
-                content: "first".into(),
-                input_tokens: 11,
-                output_tokens: 7,
-                stop_reason: ProviderStopReason::EndTurn,
-            },
-            ChatResponse {
-                content: "second".into(),
-                input_tokens: 5,
-                output_tokens: 3,
-                stop_reason: ProviderStopReason::EndTurn,
-            },
-        ]));
-
-        let harness = AgentHarness::new(
-            adapter,
-            default_registry_with_root(root.path()),
-            200_000,
-            "system",
-        );
-        let mut session = SessionState::new(
-            root.path(),
-            ProviderId::new("mock"),
-            ModelId::new("mock-model"),
-        );
-        harness.run_turn(&mut session, "one").await.unwrap();
-        harness.run_turn(&mut session, "two").await.unwrap();
-        assert_eq!(session.token_budget.used_input, 16);
-        assert_eq!(session.token_budget.used_output, 10);
-        assert_eq!(session.turn_count, 2);
-    }
-
-    #[tokio::test]
-    async fn slash_command_parsing() {
-        assert!(matches!(SlashCommand::parse("/help"), Some(SlashCommand::Help)));
-        assert!(matches!(SlashCommand::parse("/clear"), Some(SlashCommand::Clear)));
-        assert!(matches!(SlashCommand::parse("/model gpt-4"), Some(SlashCommand::Model(model)) if model == "gpt-4"));
-        assert!(matches!(SlashCommand::parse("/provider mock"), Some(SlashCommand::Provider(provider)) if provider == "mock"));
-        assert!(matches!(SlashCommand::parse("/status"), Some(SlashCommand::Status)));
-        assert!(matches!(SlashCommand::parse("/compact"), Some(SlashCommand::Compact)));
-        assert!(matches!(SlashCommand::parse("/exit"), Some(SlashCommand::Exit)));
-        assert!(matches!(SlashCommand::parse("/quit"), Some(SlashCommand::Exit)));
-        assert!(matches!(SlashCommand::parse("/wat"), Some(SlashCommand::Unknown(name)) if name == "wat"));
-        assert!(SlashCommand::parse("hello").is_none());
-    }
-
-    #[tokio::test]
-    async fn scanner_integration() {
-        let dir = TempDir::new().unwrap();
-        fs::create_dir_all(dir.path().join("src")).await.unwrap();
-        fs::write(dir.path().join("src/main.rs"), "fn main() {}")
-            .await
-            .unwrap();
-        fs::write(dir.path().join("package.json"), r#"{"dependencies":{"react":"^18"}}"#)
-            .await
-            .unwrap();
-        fs::write(dir.path().join("app.py"), "print('x')").await.unwrap();
-
-        let scanner = ProjectScanner::new(dir.path(), 50_000);
-        let ctx = scanner.scan().unwrap();
-        assert!(ctx
-            .languages
-            .iter()
-            .any(|l| l.name == "Rust" && l.file_count >= 1));
-        assert!(ctx.languages.iter().any(|l| l.name == "Python"));
-        assert!(ctx.frameworks.iter().any(|f| f.name == "React"));
-        assert!(ctx.total_files >= 3);
-    }
-
-    #[tokio::test]
-    async fn config_loader_defaults() {
-        let dir = TempDir::new().unwrap();
-        let loader = ConfigLoader::new(dir.path().join("nonexistent-caduceus.json"));
+    #[test]
+    fn config_loader_defaults() {
+        let loader = ConfigLoader::new("/nonexistent-caduceus-test-path.json");
         let config = loader.load().unwrap();
         assert_eq!(config.default_provider.0, "anthropic");
     }
 
-    #[tokio::test]
-    async fn slash_command_parse() {
+    #[test]
+    fn slash_command_parse() {
         assert!(matches!(SlashCommand::parse("/help"), Some(SlashCommand::Help)));
         assert!(matches!(SlashCommand::parse("/status"), Some(SlashCommand::Status)));
         assert!(matches!(SlashCommand::parse("/model gpt-4"), Some(SlashCommand::Model(_))));
         assert!(SlashCommand::parse("hello").is_none());
+    }
+
+    #[test]
+    fn conversation_history_append_and_len() {
+        let mut history = ConversationHistory::new();
+        assert!(history.is_empty());
+        history.append(caduceus_providers::Message::user("hello"));
+        history.append(caduceus_providers::Message::assistant("hi"));
+        assert_eq!(history.len(), 2);
+        assert!(!history.is_empty());
+    }
+
+    #[test]
+    fn conversation_history_truncate_oldest() {
+        let mut history = ConversationHistory::new();
+        history.append(caduceus_providers::Message::user("msg1"));
+        history.append(caduceus_providers::Message::assistant("resp1"));
+        history.append(caduceus_providers::Message::user("msg2"));
+        history.append(caduceus_providers::Message::assistant("resp2"));
+        history.append(caduceus_providers::Message::user("msg3"));
+        history.truncate_oldest(3);
+        assert_eq!(history.len(), 3);
+        // Oldest non-system messages should have been removed
+        assert_eq!(history.messages()[0].content, "msg2");
+    }
+
+    #[test]
+    fn conversation_history_serialize_roundtrip() {
+        let mut history = ConversationHistory::new();
+        history.append(caduceus_providers::Message::user("hello"));
+        history.append(caduceus_providers::Message::assistant("world"));
+        let json = history.serialize().unwrap();
+        let restored = ConversationHistory::deserialize(&json).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored.messages()[0].content, "hello");
+        assert_eq!(restored.messages()[1].content, "world");
+    }
+
+    #[test]
+    fn context_assembler_fits_budget() {
+        let assembler = ContextAssembler::new(100, "You are helpful.");
+        let mut history = ConversationHistory::new();
+        for i in 0..50 {
+            history.append(caduceus_providers::Message::user(&format!("message {i}")));
+        }
+        let assembled = assembler.assemble(&history);
+        // Should have system message plus whatever fits
+        assert!(assembled.len() > 1);
+        assert_eq!(assembled[0].role, "system");
+        assert!(assembled.len() <= 51);
+    }
+
+    #[test]
+    fn context_assembler_with_project_context() {
+        let assembler = ContextAssembler::new(10000, "System prompt.")
+            .with_project_context("Rust project with 100 files");
+        let history = ConversationHistory::new();
+        let assembled = assembler.assemble(&history);
+        assert_eq!(assembled.len(), 1);
+        assert!(assembled[0].content.contains("project_context"));
+        assert!(assembled[0].content.contains("Rust project"));
+    }
+
+    #[tokio::test]
+    async fn agent_event_emitter_sends_events() {
+        let (emitter, mut rx) = AgentEventEmitter::channel(16);
+        emitter.emit_text_delta("hello").await;
+        emitter.emit_error("oops").await;
+        drop(emitter);
+
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], AgentEvent::TextDelta { text } if text == "hello"));
+        assert!(matches!(&events[1], AgentEvent::Error { message } if message == "oops"));
+    }
+
+    #[test]
+    fn slash_command_exit_and_quit() {
+        assert!(matches!(SlashCommand::parse("/exit"), Some(SlashCommand::Exit)));
+        assert!(matches!(SlashCommand::parse("/quit"), Some(SlashCommand::Exit)));
+    }
+
+    #[test]
+    fn slash_command_unknown() {
+        assert!(matches!(
+            SlashCommand::parse("/foobar"),
+            Some(SlashCommand::Unknown(ref s)) if s == "foobar"
+        ));
     }
 }

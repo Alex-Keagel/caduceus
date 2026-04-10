@@ -11,7 +11,23 @@ interface CommandItem {
   id: string;
   label: string;
   description?: string;
+  icon?: string;
   action: () => void;
+}
+
+function fuzzyScore(query: string, label: string, description: string): number {
+  const q = query.toLowerCase();
+  const l = label.toLowerCase();
+  const d = (description ?? "").toLowerCase();
+  if (l.startsWith(q)) return 100;
+  if (l.includes(q)) return 80;
+  if (d.includes(q)) return 60;
+  let qi = 0;
+  for (const ch of l) {
+    if (ch === q[qi]) qi++;
+  }
+  if (qi === q.length) return 40;
+  return 0;
 }
 
 export default function CommandPalette({ onClose, onSessionSelect }: CommandPaletteProps) {
@@ -30,12 +46,42 @@ export default function CommandPalette({ onClose, onSessionSelect }: CommandPale
       id: "new-session",
       label: "New Session",
       description: "Create a new agent session",
+      icon: "✚",
+      action: onClose,
+    },
+    {
+      id: "switch-model",
+      label: "Switch Model",
+      description: "Change the active language model",
+      icon: "🤖",
+      action: onClose,
+    },
+    {
+      id: "switch-provider",
+      label: "Switch Provider",
+      description: "Anthropic / OpenAI / Gemini",
+      icon: "⚡",
+      action: onClose,
+    },
+    {
+      id: "clear-chat",
+      label: "Clear Chat",
+      description: "Clear current conversation history",
+      icon: "🗑",
+      action: onClose,
+    },
+    {
+      id: "open-project",
+      label: "Open Project",
+      description: "Open a project directory",
+      icon: "📁",
       action: onClose,
     },
     {
       id: "settings",
       label: "Open Settings",
       description: "Configure providers and models",
+      icon: "⚙",
       action: onClose,
     },
   ];
@@ -44,6 +90,7 @@ export default function CommandPalette({ onClose, onSessionSelect }: CommandPale
     id: s.id,
     label: s.project_root,
     description: `${s.model_id} · ${s.message_count} messages`,
+    icon: "📂",
     action: () => {
       onSessionSelect(s);
       onClose();
@@ -52,12 +99,13 @@ export default function CommandPalette({ onClose, onSessionSelect }: CommandPale
 
   const allCommands = [...staticCommands, ...sessionCommands];
 
-  const filtered = allCommands.filter(
-    (c) =>
-      !query ||
-      c.label.toLowerCase().includes(query.toLowerCase()) ||
-      c.description?.toLowerCase().includes(query.toLowerCase())
-  );
+  const filtered = query
+    ? allCommands
+        .map((c) => ({ cmd: c, score: fuzzyScore(query, c.label, c.description ?? "") }))
+        .filter((item) => item.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .map((item) => item.cmd)
+    : allCommands;
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Escape") {
@@ -130,17 +178,18 @@ export default function CommandPalette({ onClose, onSessionSelect }: CommandPale
                 background: i === selectedIndex ? "#313244" : "transparent",
                 cursor: "pointer",
                 display: "flex",
-                flexDirection: "column",
-                gap: 2,
+                alignItems: "center",
+                gap: 10,
               }}
               onMouseEnter={() => setSelectedIndex(i)}
             >
-              <span style={{ fontSize: 13 }}>{cmd.label}</span>
-              {cmd.description && (
-                <span style={{ fontSize: 11, color: "#6c7086" }}>
-                  {cmd.description}
-                </span>
-              )}
+              {cmd.icon && <span style={{ fontSize: 14 }}>{cmd.icon}</span>}
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <span style={{ fontSize: 13 }}>{cmd.label}</span>
+                {cmd.description && (
+                  <span style={{ fontSize: 11, color: "#6c7086" }}>{cmd.description}</span>
+                )}
+              </div>
             </div>
           ))}
           {filtered.length === 0 && (
