@@ -1,5 +1,8 @@
 use caduceus_core::{CaduceusError, Result};
+use chrono::TimeZone;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +35,14 @@ pub struct CommitResult {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitInfo {
+    pub sha: String,
+    pub message: String,
+    pub author: String,
+    pub date: String,
+}
+
 pub struct GitRepo {
     inner: git2::Repository,
 }
@@ -51,6 +62,60 @@ impl GitRepo {
 
     pub fn root(&self) -> Option<PathBuf> {
         self.inner.workdir().map(|p| p.to_path_buf())
+    }
+
+    /// Returns the current branch name, or a short SHA for detached HEAD.
+    pub fn current_branch(&self) -> Result<String> {
+        let head = self
+            .inner
+            .head()
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("git head: {e}")))?;
+
+        if head.is_branch() {
+            Ok(head.shorthand().unwrap_or("HEAD").to_string())
+        } else {
+            let oid = head
+                .target()
+                .ok_or_else(|| CaduceusError::Other(anyhow::anyhow!("no HEAD target")))?;
+            let sha = oid.to_string();
+            Ok(format!("HEAD ({})", &sha[..7.min(sha.len())]))
+        }
+    }
+
+    /// Returns the last `n` commits from HEAD.
+    pub fn log(&self, n: usize) -> Result<Vec<CommitInfo>> {
+        let mut revwalk = self
+            .inner
+            .revwalk()
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("{e}")))?;
+        revwalk
+            .push_head()
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("{e}")))?;
+
+        let mut commits = Vec::new();
+        for oid in revwalk.take(n) {
+            let oid = oid.map_err(|e| CaduceusError::Other(anyhow::anyhow!("{e}")))?;
+            let commit = self
+                .inner
+                .find_commit(oid)
+                .map_err(|e| CaduceusError::Other(anyhow::anyhow!("{e}")))?;
+
+            let author_name = commit.author().name().unwrap_or("Unknown").to_string();
+            let secs = commit.time().seconds();
+            let date = chrono::Utc
+                .timestamp_opt(secs, 0)
+                .single()
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default();
+
+            commits.push(CommitInfo {
+                sha: oid.to_string(),
+                message: commit.message().unwrap_or("").trim().to_string(),
+                author: author_name,
+                date,
+            });
+        }
+        Ok(commits)
     }
 
     pub fn status(&self) -> Result<Vec<StatusEntry>> {
@@ -84,6 +149,29 @@ impl GitRepo {
         Ok(entries)
     }
 
+    /// Returns unified diff text for staged (`staged=true`) or unstaged changes.
+    pub fn diff(&self, staged: bool) -> Result<String> {
+        let diff = if staged {
+            let head = self.inner.head().ok().and_then(|h| h.peel_to_tree().ok());
+            self.inner
+                .diff_tree_to_index(head.as_ref(), None, None)
+                .map_err(|e| CaduceusError::Other(anyhow::anyhow!("{e}")))?
+        } else {
+            self.inner
+                .diff_index_to_workdir(None, None)
+                .map_err(|e| CaduceusError::Other(anyhow::anyhow!("{e}")))?
+        };
+
+        let mut output = Vec::<u8>::new();
+        diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+            output.extend_from_slice(line.content());
+            true
+        })
+        .map_err(|e| CaduceusError::Other(anyhow::anyhow!("{e}")))?;
+
+        Ok(String::from_utf8_lossy(&output).to_string())
+    }
+
     pub fn diff_unstaged(&self) -> Result<Vec<DiffSummary>> {
         let diff = self
             .inner
@@ -102,13 +190,11 @@ impl GitRepo {
     }
 
     fn diff_to_summaries(&self, diff: git2::Diff<'_>) -> Result<Vec<DiffSummary>> {
-        let stats = diff
-            .stats()
-            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("{e}")))?;
-        let _ = stats; // stats are per-file; iterate deltas for per-file info
+        // Use interior mutability so the FnMut closure can accumulate per-file data.
+        let file_data: RefCell<HashMap<String, (usize, usize, String)>> =
+            RefCell::new(HashMap::new());
 
-        let mut summaries = Vec::new();
-        for delta in diff.deltas() {
+        diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
             let path = delta
                 .new_file()
                 .path()
@@ -116,14 +202,41 @@ impl GitRepo {
                 .and_then(|p| p.to_str())
                 .unwrap_or("")
                 .to_string();
-            summaries.push(DiffSummary {
+
+            let mut map = file_data.borrow_mut();
+            let entry = map.entry(path).or_insert((0usize, 0usize, String::new()));
+            let content = std::str::from_utf8(line.content()).unwrap_or("");
+
+            match line.origin() {
+                '+' => {
+                    entry.0 += 1;
+                    entry.2.push('+');
+                    entry.2.push_str(content);
+                }
+                '-' => {
+                    entry.1 += 1;
+                    entry.2.push('-');
+                    entry.2.push_str(content);
+                }
+                _ => {
+                    entry.2.push(line.origin());
+                    entry.2.push_str(content);
+                }
+            }
+            true
+        })
+        .map_err(|e| CaduceusError::Other(anyhow::anyhow!("{e}")))?;
+
+        Ok(file_data
+            .into_inner()
+            .into_iter()
+            .map(|(path, (ins, del, patch))| DiffSummary {
                 path,
-                insertions: 0,
-                deletions: 0,
-                patch: String::new(),
-            });
-        }
-        Ok(summaries)
+                insertions: ins,
+                deletions: del,
+                patch,
+            })
+            .collect())
     }
 
     pub fn stage_paths(&self, paths: &[String]) -> Result<()> {
@@ -182,10 +295,85 @@ impl GitRepo {
 mod tests {
     use super::*;
 
+    const REPO_PATH: &str = "/Users/alexkeagel/Dev/caduceus";
+
     #[test]
-    fn it_works() {
-        // Just test that types exist
-        let _status = FileStatus::New;
-        let _status = FileStatus::Modified;
+    fn file_status_variants_exist() {
+        let _new = FileStatus::New;
+        let _modified = FileStatus::Modified;
+        let _deleted = FileStatus::Deleted;
+        let _renamed = FileStatus::Renamed { from: "old.rs".into() };
+        let _untracked = FileStatus::Untracked;
+        let _conflicted = FileStatus::Conflicted;
+    }
+
+    #[test]
+    fn open_caduceus_repo() {
+        let repo = GitRepo::open(REPO_PATH);
+        assert!(repo.is_ok(), "should open the caduceus git repo");
+    }
+
+    #[test]
+    fn discover_from_subdirectory() {
+        let repo = GitRepo::discover(REPO_PATH.to_string() + "/crates/caduceus-core");
+        assert!(repo.is_ok(), "should discover repo from subdirectory");
+        let root = repo.unwrap().root();
+        assert!(root.is_some());
+    }
+
+    #[test]
+    fn current_branch_returns_string() {
+        let repo = GitRepo::open(REPO_PATH).expect("open repo");
+        let branch = repo.current_branch().expect("get branch");
+        assert!(!branch.is_empty(), "branch name should not be empty");
+    }
+
+    #[test]
+    fn log_returns_commits() {
+        let repo = GitRepo::open(REPO_PATH).expect("open repo");
+        let commits = repo.log(5).expect("get log");
+        assert!(!commits.is_empty(), "should have at least one commit");
+        // Verify all commits have non-empty SHA
+        for c in &commits {
+            assert_eq!(c.sha.len(), 40, "SHA should be 40 hex chars");
+            assert!(!c.author.is_empty());
+        }
+    }
+
+    #[test]
+    fn status_returns_entries() {
+        let repo = GitRepo::open(REPO_PATH).expect("open repo");
+        // Status should succeed even if the repo is clean
+        let entries = repo.status().expect("get status");
+        // entries may be empty in a clean repo — just assert it doesn't error
+        let _ = entries;
+    }
+
+    #[test]
+    fn diff_unstaged_succeeds() {
+        let repo = GitRepo::open(REPO_PATH).expect("open repo");
+        let summaries = repo.diff_unstaged().expect("diff unstaged");
+        // Summaries may be empty; verify the method runs without error
+        for s in &summaries {
+            assert!(!s.path.is_empty());
+        }
+    }
+
+    #[test]
+    fn diff_text_staged_is_string() {
+        let repo = GitRepo::open(REPO_PATH).expect("open repo");
+        let text = repo.diff(true).expect("diff staged text");
+        // text may be empty if nothing staged; just verify it returns a string
+        let _ = text;
+    }
+
+    #[test]
+    fn commit_result_serializes() {
+        let cr = CommitResult {
+            oid: "abc123".into(),
+            message: "test commit".into(),
+        };
+        let json = serde_json::to_string(&cr).expect("serialize");
+        assert!(json.contains("abc123"));
     }
 }

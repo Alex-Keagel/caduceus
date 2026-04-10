@@ -16,3 +16,6 @@ async-trait = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled", "chrono", "uuid"] }
+
+[dev-dependencies]
+tempfile = "3"
