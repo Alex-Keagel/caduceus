@@ -146,7 +146,11 @@ impl LlmMessage {
         }
     }
 
-    pub fn tool_result(tool_call_id: ToolCallId, content: impl Into<String>, is_error: bool) -> Self {
+    pub fn tool_result(
+        tool_call_id: ToolCallId,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
         Self {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
@@ -215,16 +219,44 @@ impl LlmResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AgentEvent {
-    TextDelta { text: String },
-    ToolCallStart { id: ToolCallId, name: String },
-    ToolCallInput { id: ToolCallId, delta: String },
-    ToolCallEnd { id: ToolCallId },
-    ToolResultStart { id: ToolCallId, name: String },
-    ToolResultEnd { id: ToolCallId, content: String, is_error: bool },
-    PermissionRequest { id: String, capability: String, description: String },
-    TurnComplete { stop_reason: StopReason, usage: TokenUsage },
-    Error { message: String },
-    SessionPhaseChanged { phase: SessionPhase },
+    TextDelta {
+        text: String,
+    },
+    ToolCallStart {
+        id: ToolCallId,
+        name: String,
+    },
+    ToolCallInput {
+        id: ToolCallId,
+        delta: String,
+    },
+    ToolCallEnd {
+        id: ToolCallId,
+    },
+    ToolResultStart {
+        id: ToolCallId,
+        name: String,
+    },
+    ToolResultEnd {
+        id: ToolCallId,
+        content: String,
+        is_error: bool,
+    },
+    PermissionRequest {
+        id: String,
+        capability: String,
+        description: String,
+    },
+    TurnComplete {
+        stop_reason: StopReason,
+        usage: TokenUsage,
+    },
+    Error {
+        message: String,
+    },
+    SessionPhaseChanged {
+        phase: SessionPhase,
+    },
 }
 
 // ── Token tracking ─────────────────────────────────────────────────────────────
@@ -245,8 +277,12 @@ impl TokenUsage {
     pub fn accumulate(&mut self, other: &TokenUsage) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
-        self.cache_read_tokens = self.cache_read_tokens.saturating_add(other.cache_read_tokens);
-        self.cache_write_tokens = self.cache_write_tokens.saturating_add(other.cache_write_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
     }
 }
 
@@ -306,11 +342,17 @@ pub struct ToolResult {
 
 impl ToolResult {
     pub fn success(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false }
+        Self {
+            content: content.into(),
+            is_error: false,
+        }
     }
 
     pub fn error(message: impl Into<String>) -> Self {
-        Self { content: message.into(), is_error: true }
+        Self {
+            content: message.into(),
+            is_error: true,
+        }
     }
 }
 
@@ -522,7 +564,11 @@ mod tests {
     #[test]
     fn token_usage_accumulate() {
         let mut total = TokenUsage::default();
-        let turn = TokenUsage { input_tokens: 100, output_tokens: 50, ..Default::default() };
+        let turn = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        };
         total.accumulate(&turn);
         total.accumulate(&turn);
         assert_eq!(total.input_tokens, 200);

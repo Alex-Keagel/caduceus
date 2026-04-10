@@ -138,7 +138,9 @@ impl GitRepo {
             } else if s.is_index_deleted() || s.is_wt_deleted() {
                 FileStatus::Deleted
             } else if s.is_index_renamed() || s.is_wt_renamed() {
-                FileStatus::Renamed { from: String::new() }
+                FileStatus::Renamed {
+                    from: String::new(),
+                }
             } else if s.is_conflicted() {
                 FileStatus::Conflicted
             } else {
@@ -272,11 +274,7 @@ impl GitRepo {
             .find_tree(tree_oid)
             .map_err(|e| CaduceusError::Other(anyhow::anyhow!("{e}")))?;
 
-        let parent = self
-            .inner
-            .head()
-            .ok()
-            .and_then(|h| h.peel_to_commit().ok());
+        let parent = self.inner.head().ok().and_then(|h| h.peel_to_commit().ok());
         let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
 
         let oid = self
@@ -302,7 +300,9 @@ mod tests {
         let _new = FileStatus::New;
         let _modified = FileStatus::Modified;
         let _deleted = FileStatus::Deleted;
-        let _renamed = FileStatus::Renamed { from: "old.rs".into() };
+        let _renamed = FileStatus::Renamed {
+            from: "old.rs".into(),
+        };
         let _untracked = FileStatus::Untracked;
         let _conflicted = FileStatus::Conflicted;
     }

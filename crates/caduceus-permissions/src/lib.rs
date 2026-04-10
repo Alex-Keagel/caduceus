@@ -69,7 +69,9 @@ pub struct AuditLog {
 
 impl AuditLog {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     pub fn record(&mut self, entry: AuditEntry) {
@@ -77,7 +79,10 @@ impl AuditLog {
     }
 
     pub fn entries_for_session(&self, session_id: &SessionId) -> Vec<&AuditEntry> {
-        self.entries.iter().filter(|e| &e.session_id == session_id).collect()
+        self.entries
+            .iter()
+            .filter(|e| &e.session_id == session_id)
+            .collect()
     }
 }
 

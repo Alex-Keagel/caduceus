@@ -279,7 +279,11 @@ async fn session_create(
         ProviderId::new(request.provider_id),
         ModelId::new(request.model_id),
     );
-    state.storage.create_session(&session).await.map_err(|e| e.to_string())?;
+    state
+        .storage
+        .create_session(&session)
+        .await
+        .map_err(|e| e.to_string())?;
     cancellation_token(&state, &session.id.to_string())?.store(false, Ordering::SeqCst);
     Ok(session_info_from_state(&state.storage, session).await?)
 }
@@ -362,9 +366,12 @@ async fn agent_turn(
         Ok(content) => content,
         Err(error) => {
             session.phase = SessionPhase::Error;
-            let _ = app.emit("agent:event", caduceus_core::AgentEvent::Error {
-                message: error.to_string(),
-            });
+            let _ = app.emit(
+                "agent:event",
+                caduceus_core::AgentEvent::Error {
+                    message: error.to_string(),
+                },
+            );
             state
                 .storage
                 .update_session(&session)
@@ -375,11 +382,18 @@ async fn agent_turn(
     };
 
     let input_tokens = session.token_budget.used_input.saturating_sub(input_before);
-    let output_tokens = session.token_budget.used_output.saturating_sub(output_before);
+    let output_tokens = session
+        .token_budget
+        .used_output
+        .saturating_sub(output_before);
 
     state
         .storage
-        .save_message(&session.id, &LlmMessage::assistant(&content), Some(output_tokens))
+        .save_message(
+            &session.id,
+            &LlmMessage::assistant(&content),
+            Some(output_tokens),
+        )
         .await
         .map_err(|e| e.to_string())?;
     state
@@ -458,8 +472,16 @@ async fn project_scan(
         .scan()
         .map_err(|e| e.to_string())?;
     Ok(ProjectScanResponse {
-        languages: project.languages.into_iter().map(|language| language.name).collect(),
-        frameworks: project.frameworks.into_iter().map(|framework| framework.name).collect(),
+        languages: project
+            .languages
+            .into_iter()
+            .map(|language| language.name)
+            .collect(),
+        frameworks: project
+            .frameworks
+            .into_iter()
+            .map(|framework| framework.name)
+            .collect(),
         file_count: project.total_files,
         total_files: project.total_files,
         token_estimate: project.token_estimate,
@@ -508,7 +530,9 @@ async fn pty_create(
     state: State<'_, AppState>,
     request: PtyCreateRequest,
 ) -> Result<PtyCreateResponse, String> {
-    let pty_id = state.pty_manager.create_pty(&app, request.cols, request.rows)?;
+    let pty_id = state
+        .pty_manager
+        .create_pty(&app, request.cols, request.rows)?;
     Ok(PtyCreateResponse { pty_id })
 }
 
@@ -518,10 +542,7 @@ async fn pty_write(state: State<'_, AppState>, request: PtyWriteRequest) -> Resu
 }
 
 #[tauri::command]
-async fn pty_resize(
-    state: State<'_, AppState>,
-    request: PtyResizeRequest,
-) -> Result<(), String> {
+async fn pty_resize(state: State<'_, AppState>, request: PtyResizeRequest) -> Result<(), String> {
     state
         .pty_manager
         .resize_pty(&request.pty_id, request.cols, request.rows)
@@ -676,7 +697,10 @@ fn build_provider(
     )))
 }
 
-fn env_api_key(configured_provider: &ProviderId, config: &CaduceusConfig) -> Result<String, String> {
+fn env_api_key(
+    configured_provider: &ProviderId,
+    config: &CaduceusConfig,
+) -> Result<String, String> {
     let provider_key = configured_provider.0.to_lowercase();
     let explicit_env = match provider_key.as_str() {
         "anthropic" => Some("ANTHROPIC_API_KEY".to_string()),
@@ -691,7 +715,11 @@ fn env_api_key(configured_provider: &ProviderId, config: &CaduceusConfig) -> Res
         configured_provider
             .0
             .chars()
-            .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_uppercase() } else { '_' })
+            .map(|ch| if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            })
             .collect::<String>()
     );
     let env_names = explicit_env

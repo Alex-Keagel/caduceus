@@ -20,7 +20,10 @@ pub struct CodeChunker {
 
 impl CodeChunker {
     pub fn new(chunk_size: usize, overlap: usize) -> Self {
-        Self { chunk_size, overlap }
+        Self {
+            chunk_size,
+            overlap,
+        }
     }
 
     pub fn chunk_file(&self, path: impl Into<PathBuf>, content: &str) -> Vec<CodeChunk> {
@@ -99,7 +102,10 @@ impl SemanticIndex {
             .iter()
             .filter(|c| c.content.contains(query))
             .take(top_k)
-            .map(|c| SearchResult { chunk: c.clone(), score: 1.0 })
+            .map(|c| SearchResult {
+                chunk: c.clone(),
+                score: 1.0,
+            })
             .collect();
         Ok(results)
     }
