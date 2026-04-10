@@ -47,9 +47,10 @@ impl BashSandbox {
         if cwd.is_absolute() {
             let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
             if !canonical.starts_with(&self.workspace_root) {
-                return Err(CaduceusError::PermissionDenied(
-                    "cwd escapes workspace".into(),
-                ));
+                return Err(CaduceusError::PermissionDenied {
+                    capability: "fs".into(),
+                    tool: "cwd escapes workspace".into(),
+                });
             }
         }
 
@@ -64,7 +65,7 @@ impl BashSandbox {
 
         let output = tokio::time::timeout(timeout, cmd.output())
             .await
-            .map_err(|_| CaduceusError::Tool("Command timed out".into()))?
+            .map_err(|_| CaduceusError::Tool { tool: "bash".into(), message: "Command timed out".into() })?
             .map_err(|e| CaduceusError::Io(e))?;
 
         Ok(ExecResult {
@@ -84,7 +85,9 @@ pub struct FileOps {
 
 impl FileOps {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
-        Self { workspace_root: workspace_root.into() }
+        let root: PathBuf = workspace_root.into();
+        let canonical_root = root.canonicalize().unwrap_or(root);
+        Self { workspace_root: canonical_root }
     }
 
     fn resolve_path(&self, path: &str) -> Result<PathBuf> {
@@ -101,9 +104,10 @@ impl FileOps {
                 .canonicalize()
                 .map_err(|e| CaduceusError::Io(e))?;
             if !canonical.starts_with(&self.workspace_root) {
-                return Err(CaduceusError::PermissionDenied(
-                    "Path escapes workspace".into(),
-                ));
+                return Err(CaduceusError::PermissionDenied {
+                    capability: "fs".into(),
+                    tool: "Path escapes workspace".into(),
+                });
             }
             Ok(canonical)
         } else {
@@ -112,9 +116,10 @@ impl FileOps {
             if parent.exists() {
                 let canonical_parent = parent.canonicalize().map_err(|e| CaduceusError::Io(e))?;
                 if !canonical_parent.starts_with(&self.workspace_root) {
-                    return Err(CaduceusError::PermissionDenied(
-                        "Path escapes workspace".into(),
-                    ));
+                    return Err(CaduceusError::PermissionDenied {
+                        capability: "fs".into(),
+                        tool: "Path escapes workspace".into(),
+                    });
                 }
             }
             Ok(p)
@@ -127,11 +132,11 @@ impl FileOps {
             .await
             .map_err(|e| CaduceusError::Io(e))?;
         if meta.len() > MAX_FILE_SIZE {
-            return Err(CaduceusError::Tool(format!(
+            return Err(CaduceusError::Tool { tool: "runtime".into(), message: format!(
                 "File too large: {} bytes (max {})",
                 meta.len(),
                 MAX_FILE_SIZE
-            )));
+            )} );
         }
         tokio::fs::read_to_string(&resolved)
             .await
@@ -154,14 +159,14 @@ impl FileOps {
         let content = self.read(path).await?;
         let count = content.matches(old).count();
         if count == 0 {
-            return Err(CaduceusError::Tool(format!(
+            return Err(CaduceusError::Tool { tool: "runtime".into(), message: format!(
                 "String not found in {path}"
-            )));
+            )} );
         }
         if count > 1 {
-            return Err(CaduceusError::Tool(format!(
+            return Err(CaduceusError::Tool { tool: "runtime".into(), message: format!(
                 "Ambiguous edit: {count} occurrences in {path}"
-            )));
+            )} );
         }
         let updated = content.replacen(old, new, 1);
         self.write(path, &updated).await?;

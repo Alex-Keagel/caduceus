@@ -78,7 +78,10 @@ impl ToolRegistry {
     pub async fn call(&self, name: &str, input: Value) -> Result<ToolResult> {
         match self.tools.get(name) {
             Some(tool) => tool.call(input).await,
-            None => Err(CaduceusError::Tool(format!("Unknown tool: {name}"))),
+            None => Err(CaduceusError::Tool {
+                tool: name.to_string(),
+                message: format!("Unknown tool: {name}"),
+            }),
         }
     }
 }

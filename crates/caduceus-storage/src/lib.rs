@@ -1,5 +1,5 @@
 use caduceus_core::{
-    CaduceusError, Result, Role, SessionId, SessionState, TranscriptEntry,
+    CaduceusError, Result, SessionId, SessionState,
 };
 use rusqlite::{params, Connection};
 use std::path::Path;
@@ -161,23 +161,6 @@ impl caduceus_core::SessionStorage for SqliteStorage {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![id.to_string()])
             .map_err(|e| CaduceusError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn append_entry(&self, session_id: &SessionId, entry: &TranscriptEntry) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let role = serde_json::to_string(&entry.role)?;
-        conn.execute(
-            "INSERT INTO messages (session_id, role, content, tokens, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                session_id.to_string(),
-                role,
-                entry.content,
-                entry.tokens.map(|t| t as i64),
-                entry.timestamp.to_rfc3339()
-            ],
-        )
-        .map_err(|e| CaduceusError::Storage(e.to_string()))?;
         Ok(())
     }
 }
