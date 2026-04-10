@@ -132,9 +132,10 @@ impl PermissionEnforcer {
                         decision: PermissionDecision::Denied,
                         timestamp: Utc::now(),
                     });
-                    return Err(CaduceusError::PermissionDenied(format!(
-                        "Path {resource} escapes workspace"
-                    )));
+                    return Err(CaduceusError::PermissionDenied {
+                        capability: capability.to_string(),
+                        tool: format!("path:{resource}"),
+                    });
                 }
             }
         }
@@ -163,9 +164,10 @@ impl PermissionEnforcer {
         if decision == PermissionDecision::Allowed {
             Ok(())
         } else {
-            Err(CaduceusError::PermissionDenied(format!(
-                "Capability {capability} not granted"
-            )))
+            Err(CaduceusError::PermissionDenied {
+                capability: capability.to_string(),
+                tool: resource.to_string(),
+            })
         }
     }
 

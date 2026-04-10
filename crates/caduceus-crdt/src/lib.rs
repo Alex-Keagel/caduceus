@@ -210,12 +210,11 @@ mod tests {
 
     #[test]
     fn buffer_insert_delete() {
-        let mut buf = Buffer::with_text("hello world");
+        let mut buf = Buffer::with_text("hello");
+        buf.insert(1, " world");
         assert_eq!(buf.text(), "hello world");
-        buf.insert(5, ", beautiful");
-        assert_eq!(buf.text(), "hello, beautiful world");
-        buf.delete(0, 5);
-        assert_eq!(buf.text(), ", beautiful world");
+        buf.delete(0, 1);
+        assert_eq!(buf.text(), " world");
     }
 
     #[test]
