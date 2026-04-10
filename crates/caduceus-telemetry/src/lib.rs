@@ -46,7 +46,10 @@ impl TokenCounter {
     /// Record usage attributed to a specific model.
     pub fn record_for_model(&mut self, model: &ModelId, usage: &TokenUsage) {
         self.record(usage);
-        let entry = self.per_model.entry(model.0.clone()).or_insert_with(TokenUsage::default);
+        let entry = self
+            .per_model
+            .entry(model.0.clone())
+            .or_insert_with(TokenUsage::default);
         entry.input_tokens += usage.input_tokens;
         entry.output_tokens += usage.output_tokens;
         entry.cached_tokens += usage.cached_tokens;
@@ -105,7 +108,9 @@ pub struct CostCalculator {
 
 impl CostCalculator {
     pub fn new() -> Self {
-        Self { pricing: default_pricing() }
+        Self {
+            pricing: default_pricing(),
+        }
     }
 
     pub fn with_pricing(pricing: Vec<ModelPricing>) -> Self {
@@ -117,12 +122,7 @@ impl CostCalculator {
     }
 
     /// Calculate cost for a specific provider/model/usage combination.
-    pub fn calculate(
-        &self,
-        provider: &ProviderId,
-        model: &ModelId,
-        usage: &TokenUsage,
-    ) -> f64 {
+    pub fn calculate(&self, provider: &ProviderId, model: &ModelId, usage: &TokenUsage) -> f64 {
         self.pricing
             .iter()
             .find(|p| &p.provider_id == provider && &p.model_id == model)
@@ -131,11 +131,7 @@ impl CostCalculator {
     }
 
     /// Calculate total cost for a token counter across all models.
-    pub fn total_cost_for_counter(
-        &self,
-        provider: &ProviderId,
-        counter: &TokenCounter,
-    ) -> f64 {
+    pub fn total_cost_for_counter(&self, provider: &ProviderId, counter: &TokenCounter) -> f64 {
         counter
             .all_model_usage()
             .iter()
@@ -198,7 +194,10 @@ impl CostLogger {
 
     /// Cost records filtered to a single model.
     pub fn records_for_model(&self, model: &str) -> Vec<&CostRecord> {
-        self.records.iter().filter(|r| r.model_id == model).collect()
+        self.records
+            .iter()
+            .filter(|r| r.model_id == model)
+            .collect()
     }
 }
 
@@ -281,9 +280,8 @@ impl TraceSpan {
     }
 
     pub fn duration_ms(&self) -> Option<i64> {
-        self.ended_at.map(|end| {
-            (end - self.started_at).num_milliseconds()
-        })
+        self.ended_at
+            .map(|end| (end - self.started_at).num_milliseconds())
     }
 
     pub fn is_finished(&self) -> bool {
@@ -327,7 +325,11 @@ mod tests {
     #[test]
     fn token_counter_basic() {
         let mut counter = TokenCounter::new();
-        counter.record(&TokenUsage { input_tokens: 100, output_tokens: 50, cached_tokens: 0 });
+        counter.record(&TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_tokens: 0,
+        });
         assert_eq!(counter.session_usage().total(), 150);
     }
 
@@ -335,16 +337,22 @@ mod tests {
     fn token_counter_per_model() {
         let mut counter = TokenCounter::new();
         let model = ModelId::new("claude-sonnet-4-5");
-        counter.record_for_model(&model, &TokenUsage {
-            input_tokens: 500,
-            output_tokens: 200,
-            cached_tokens: 10,
-        });
-        counter.record_for_model(&model, &TokenUsage {
-            input_tokens: 300,
-            output_tokens: 100,
-            cached_tokens: 5,
-        });
+        counter.record_for_model(
+            &model,
+            &TokenUsage {
+                input_tokens: 500,
+                output_tokens: 200,
+                cached_tokens: 10,
+            },
+        );
+        counter.record_for_model(
+            &model,
+            &TokenUsage {
+                input_tokens: 300,
+                output_tokens: 100,
+                cached_tokens: 5,
+            },
+        );
         let usage = counter.model_usage("claude-sonnet-4-5").unwrap();
         assert_eq!(usage.input_tokens, 800);
         assert_eq!(usage.output_tokens, 300);
@@ -355,7 +363,11 @@ mod tests {
     #[test]
     fn token_counter_reset_session() {
         let mut counter = TokenCounter::new();
-        counter.record(&TokenUsage { input_tokens: 100, output_tokens: 50, cached_tokens: 0 });
+        counter.record(&TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_tokens: 0,
+        });
         counter.reset_session();
         assert_eq!(counter.session_usage().total(), 0);
         assert_eq!(counter.total_usage().total(), 150);
@@ -386,18 +398,18 @@ mod tests {
             output_tokens: 1_000_000,
             cached_tokens: 0,
         };
-        let cost = calc.calculate(
-            &ProviderId::new("openai"),
-            &ModelId::new("gpt-4o"),
-            &usage,
-        );
+        let cost = calc.calculate(&ProviderId::new("openai"), &ModelId::new("gpt-4o"), &usage);
         assert!((cost - 12.5).abs() < 0.001); // 2.50 + 10.0
     }
 
     #[test]
     fn cost_calculator_unknown_model_returns_zero() {
         let calc = CostCalculator::new();
-        let usage = TokenUsage { input_tokens: 1000, output_tokens: 500, cached_tokens: 0 };
+        let usage = TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cached_tokens: 0,
+        };
         let cost = calc.calculate(
             &ProviderId::new("unknown"),
             &ModelId::new("mystery-model"),
@@ -412,12 +424,20 @@ mod tests {
         logger.log(
             &ProviderId::new("anthropic"),
             &ModelId::new("claude-sonnet-4-5"),
-            TokenUsage { input_tokens: 1_000_000, output_tokens: 500_000, cached_tokens: 0 },
+            TokenUsage {
+                input_tokens: 1_000_000,
+                output_tokens: 500_000,
+                cached_tokens: 0,
+            },
         );
         logger.log(
             &ProviderId::new("anthropic"),
             &ModelId::new("claude-sonnet-4-5"),
-            TokenUsage { input_tokens: 2_000_000, output_tokens: 1_000_000, cached_tokens: 0 },
+            TokenUsage {
+                input_tokens: 2_000_000,
+                output_tokens: 1_000_000,
+                cached_tokens: 0,
+            },
         );
         assert_eq!(logger.records().len(), 2);
         // First: 3.0 + 7.5 = 10.5; Second: 6.0 + 15.0 = 21.0 => total 31.5
@@ -430,12 +450,20 @@ mod tests {
         logger.log(
             &ProviderId::new("anthropic"),
             &ModelId::new("claude-sonnet-4-5"),
-            TokenUsage { input_tokens: 100, output_tokens: 50, cached_tokens: 0 },
+            TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cached_tokens: 0,
+            },
         );
         logger.log(
             &ProviderId::new("anthropic"),
             &ModelId::new("claude-opus-4-5"),
-            TokenUsage { input_tokens: 200, output_tokens: 100, cached_tokens: 0 },
+            TokenUsage {
+                input_tokens: 200,
+                output_tokens: 100,
+                cached_tokens: 0,
+            },
         );
         let sonnet_records = logger.records_for_model("claude-sonnet-4-5");
         assert_eq!(sonnet_records.len(), 1);

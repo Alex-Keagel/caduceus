@@ -19,15 +19,24 @@ pub struct Message {
 
 impl Message {
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into() }
+        Self {
+            role: "user".into(),
+            content: content.into(),
+        }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: content.into() }
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+        }
     }
 
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: content.into() }
+        Self {
+            role: "system".into(),
+            content: content.into(),
+        }
     }
 }
 
@@ -267,9 +276,7 @@ fn parse_anthropic_sse_event(event_type: &str, data: &str) -> Option<Result<Stre
         }
         "message_delta" => {
             let val: serde_json::Value = serde_json::from_str(data).ok()?;
-            let output_tokens = val["usage"]["output_tokens"]
-                .as_u64()
-                .map(|n| n as u32);
+            let output_tokens = val["usage"]["output_tokens"].as_u64().map(|n| n as u32);
             Some(Ok(StreamChunk {
                 delta: String::new(),
                 is_final: false,
@@ -407,10 +414,7 @@ impl LlmAdapter for AnthropicAdapter {
             .filter_map(|result| async move {
                 match result {
                     Ok(event) => parse_anthropic_sse_event(&event.event, &event.data),
-                    Err(e) => Some(Err(CaduceusError::Provider(format!(
-                        "SSE error: {:?}",
-                        e
-                    )))),
+                    Err(e) => Some(Err(CaduceusError::Provider(format!("SSE error: {:?}", e)))),
                 }
             });
 
@@ -678,10 +682,7 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
             .filter_map(|result| async move {
                 match result {
                     Ok(event) => parse_openai_sse_event(&event.data),
-                    Err(e) => Some(Err(CaduceusError::Provider(format!(
-                        "SSE error: {:?}",
-                        e
-                    )))),
+                    Err(e) => Some(Err(CaduceusError::Provider(format!("SSE error: {:?}", e)))),
                 }
             });
 
@@ -715,7 +716,11 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
             CaduceusError::Provider(format!("Failed to parse models response: {}", e))
         })?;
 
-        Ok(models.data.into_iter().map(|m| ModelId::new(m.id)).collect())
+        Ok(models
+            .data
+            .into_iter()
+            .map(|m| ModelId::new(m.id))
+            .collect())
     }
 }
 
@@ -945,8 +950,14 @@ mod tests {
     #[test]
     fn test_stop_reason_mapping() {
         assert_eq!(map_anthropic_stop_reason("end_turn"), StopReason::EndTurn);
-        assert_eq!(map_anthropic_stop_reason("max_tokens"), StopReason::MaxTokens);
-        assert_eq!(map_anthropic_stop_reason("stop_sequence"), StopReason::StopSequence);
+        assert_eq!(
+            map_anthropic_stop_reason("max_tokens"),
+            StopReason::MaxTokens
+        );
+        assert_eq!(
+            map_anthropic_stop_reason("stop_sequence"),
+            StopReason::StopSequence
+        );
         assert_eq!(map_anthropic_stop_reason("tool_use"), StopReason::ToolUse);
         assert_eq!(map_anthropic_stop_reason("unknown"), StopReason::EndTurn);
 
@@ -976,8 +987,7 @@ mod tests {
 
     #[test]
     fn test_openai_request_body_construction() {
-        let adapter =
-            OpenAiCompatibleAdapter::new("openai", "key", "https://api.openai.com/v1");
+        let adapter = OpenAiCompatibleAdapter::new("openai", "key", "https://api.openai.com/v1");
         let request = ChatRequest {
             model: ModelId::new("gpt-4"),
             messages: vec![Message::user("Hello")],

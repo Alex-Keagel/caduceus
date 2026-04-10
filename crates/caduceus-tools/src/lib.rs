@@ -101,7 +101,9 @@ fn get_required_string(map: &Map<String, Value>, key: &str) -> std::result::Resu
 }
 
 fn get_optional_string(map: &Map<String, Value>, key: &str) -> Option<String> {
-    map.get(key).and_then(Value::as_str).map(ToString::to_string)
+    map.get(key)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn json_result(value: Value) -> ToolResult {
@@ -423,7 +425,9 @@ impl Tool for EditFileTool {
             .or_else(|| get_optional_string(&map, "new_string"));
 
         let (Some(old_str), Some(new_str)) = (old_str, new_str) else {
-            return Ok(tool_error("missing required 'old_str'/'new_str' (or old_string/new_string)"));
+            return Ok(tool_error(
+                "missing required 'old_str'/'new_str' (or old_string/new_string)",
+            ));
         };
 
         let file_ops = FileOps::new(&self.workspace_root);
@@ -488,7 +492,10 @@ impl Tool for GlobSearchTool {
             Err(err) => return Ok(tool_error(format!("invalid input: {err}"))),
         };
 
-        let base = parsed.path.or(parsed.base_dir).unwrap_or_else(|| ".".to_string());
+        let base = parsed
+            .path
+            .or(parsed.base_dir)
+            .unwrap_or_else(|| ".".to_string());
         let base_path = match resolve_workspace_path(&self.workspace_root, &base) {
             Ok(path) => path,
             Err(err) => return Ok(tool_error(err.to_string())),
@@ -497,7 +504,10 @@ impl Tool for GlobSearchTool {
         let search_pattern = if Path::new(&parsed.pattern).is_absolute() {
             parsed.pattern.clone()
         } else {
-            base_path.join(&parsed.pattern).to_string_lossy().to_string()
+            base_path
+                .join(&parsed.pattern)
+                .to_string_lossy()
+                .to_string()
         };
 
         let mut matches = Vec::new();
@@ -752,7 +762,9 @@ impl Tool for ListFilesTool {
                         }
                     }
                     Ok(None) => break,
-                    Err(err) => return Ok(tool_error(format!("failed to read directory entry: {err}"))),
+                    Err(err) => {
+                        return Ok(tool_error(format!("failed to read directory entry: {err}")))
+                    }
                 }
             }
         }
@@ -936,7 +948,8 @@ impl Tool for WebFetchTool {
             Err(err) => return Ok(tool_error(format!("invalid input: {err}"))),
         };
 
-        let timeout = Duration::from_secs(parsed.timeout_secs.unwrap_or(self.timeout.as_secs().max(1)));
+        let timeout =
+            Duration::from_secs(parsed.timeout_secs.unwrap_or(self.timeout.as_secs().max(1)));
         let client = match reqwest::Client::builder().timeout(timeout).build() {
             Ok(client) => client,
             Err(err) => return Ok(tool_error(format!("failed to create HTTP client: {err}"))),
@@ -1094,7 +1107,10 @@ mod tests {
         assert!(glob_result.content.contains("src/main.rs"));
 
         let grep_result = registry
-            .execute("grep_search", json!({"pattern": "println", "glob": "src/**/*.rs"}))
+            .execute(
+                "grep_search",
+                json!({"pattern": "println", "glob": "src/**/*.rs"}),
+            )
             .await
             .unwrap();
         assert!(!grep_result.is_error);

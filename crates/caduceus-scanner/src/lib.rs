@@ -99,9 +99,10 @@ impl ProjectScanner {
             })
             .build();
 
-        for entry in walker.filter_map(|e| e.ok()).filter(|e| {
-            e.file_type().map(|ft| ft.is_file()).unwrap_or(false)
-        }) {
+        for entry in walker
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+        {
             ctx.total_files += 1;
             if let Ok(meta) = entry.metadata() {
                 ctx.total_size_bytes += meta.len();
@@ -311,7 +312,10 @@ impl ProjectScanner {
             [first, rest @ ..] => format!(
                 "{} and {}",
                 first.name,
-                rest.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", ")
+                rest.iter()
+                    .map(|l| l.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         };
 
@@ -375,7 +379,9 @@ mod tests {
     #[test]
     fn detect_languages_all_supported() {
         let mut counts = HashMap::new();
-        for ext in ["rs", "ts", "js", "py", "go", "java", "rb", "cpp", "c", "cs", "swift", "kt"] {
+        for ext in [
+            "rs", "ts", "js", "py", "go", "java", "rb", "cpp", "c", "cs", "swift", "kt",
+        ] {
             counts.insert(ext.to_string(), 1);
         }
         let langs = ProjectScanner::detect_languages(&counts);

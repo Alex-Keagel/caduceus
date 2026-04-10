@@ -1,3 +1,4 @@
+pub mod sandbox;
 use caduceus_core::{CaduceusError, Result};
 use caduceus_permissions::{Capability, PermissionEnforcer};
 use serde::{Deserialize, Serialize};
@@ -45,7 +46,9 @@ pub struct BashSandbox {
 impl BashSandbox {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
         let root: PathBuf = workspace_root.into();
-        Self { workspace_root: root.canonicalize().unwrap_or(root) }
+        Self {
+            workspace_root: root.canonicalize().unwrap_or(root),
+        }
     }
 
     /// Truncate a string to at most `max_bytes` bytes on a valid UTF-8 boundary.
@@ -133,7 +136,9 @@ impl FileOps {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
         let root: PathBuf = workspace_root.into();
         let canonical_root = root.canonicalize().unwrap_or(root);
-        Self { workspace_root: canonical_root }
+        Self {
+            workspace_root: canonical_root,
+        }
     }
 
     fn resolve_path(&self, path: &str) -> Result<PathBuf> {
@@ -144,9 +149,7 @@ impl FileOps {
         };
 
         if p.exists() {
-            let canonical = p
-                .canonicalize()
-                .map_err(|e| CaduceusError::Io(e))?;
+            let canonical = p.canonicalize().map_err(|e| CaduceusError::Io(e))?;
             if !canonical.starts_with(&self.workspace_root) {
                 return Err(CaduceusError::PermissionDenied {
                     capability: "fs".into(),
@@ -175,11 +178,14 @@ impl FileOps {
             .await
             .map_err(|e| CaduceusError::Io(e))?;
         if meta.len() > MAX_READ_SIZE {
-            return Err(CaduceusError::Tool { tool: "runtime".into(), message: format!(
-                "File too large to read: {} bytes (max {})",
-                meta.len(),
-                MAX_READ_SIZE
-            )} );
+            return Err(CaduceusError::Tool {
+                tool: "runtime".into(),
+                message: format!(
+                    "File too large to read: {} bytes (max {})",
+                    meta.len(),
+                    MAX_READ_SIZE
+                ),
+            });
         }
         tokio::fs::read_to_string(&resolved)
             .await
@@ -188,11 +194,14 @@ impl FileOps {
 
     pub async fn write(&self, path: &str, content: &str) -> Result<()> {
         if content.len() as u64 > MAX_WRITE_SIZE {
-            return Err(CaduceusError::Tool { tool: "runtime".into(), message: format!(
-                "Content too large to write: {} bytes (max {})",
-                content.len(),
-                MAX_WRITE_SIZE
-            )} );
+            return Err(CaduceusError::Tool {
+                tool: "runtime".into(),
+                message: format!(
+                    "Content too large to write: {} bytes (max {})",
+                    content.len(),
+                    MAX_WRITE_SIZE
+                ),
+            });
         }
         let resolved = self.resolve_path(path)?;
         if let Some(parent) = resolved.parent() {
@@ -209,14 +218,16 @@ impl FileOps {
         let content = self.read(path).await?;
         let count = content.matches(old).count();
         if count == 0 {
-            return Err(CaduceusError::Tool { tool: "runtime".into(), message: format!(
-                "String not found in {path}"
-            )} );
+            return Err(CaduceusError::Tool {
+                tool: "runtime".into(),
+                message: format!("String not found in {path}"),
+            });
         }
         if count > 1 {
-            return Err(CaduceusError::Tool { tool: "runtime".into(), message: format!(
-                "Ambiguous edit: {count} occurrences in {path}"
-            )} );
+            return Err(CaduceusError::Tool {
+                tool: "runtime".into(),
+                message: format!("Ambiguous edit: {count} occurrences in {path}"),
+            });
         }
         let updated = content.replacen(old, new, 1);
         self.write(path, &updated).await?;
@@ -226,9 +237,7 @@ impl FileOps {
     /// Check whether a path exists within the workspace.
     pub async fn exists(&self, path: &str) -> Result<bool> {
         let resolved = self.resolve_path(path)?;
-        Ok(tokio::fs::try_exists(&resolved)
-            .await
-            .unwrap_or(false))
+        Ok(tokio::fs::try_exists(&resolved).await.unwrap_or(false))
     }
 
     /// List directory entries (non-recursive, names only).
@@ -238,7 +247,11 @@ impl FileOps {
         let mut read_dir = tokio::fs::read_dir(&resolved)
             .await
             .map_err(|e| CaduceusError::Io(e))?;
-        while let Some(entry) = read_dir.next_entry().await.map_err(|e| CaduceusError::Io(e))? {
+        while let Some(entry) = read_dir
+            .next_entry()
+            .await
+            .map_err(|e| CaduceusError::Io(e))?
+        {
             if let Some(name) = entry.file_name().to_str() {
                 let file_type = entry.file_type().await.map_err(|e| CaduceusError::Io(e))?;
                 let suffix = if file_type.is_dir() { "/" } else { "" };
@@ -257,11 +270,10 @@ impl FileOps {
 
         tokio::task::spawn_blocking(move || {
             let mut results = Vec::new();
-            let entries = glob::glob(&pattern_str)
-                .map_err(|e| CaduceusError::Tool {
-                    tool: "runtime".into(),
-                    message: format!("Invalid glob pattern: {e}"),
-                })?;
+            let entries = glob::glob(&pattern_str).map_err(|e| CaduceusError::Tool {
+                tool: "runtime".into(),
+                message: format!("Invalid glob pattern: {e}"),
+            })?;
             for entry in entries.flatten() {
                 if let Ok(rel) = entry.strip_prefix(&root) {
                     results.push(rel.to_string_lossy().to_string());
@@ -299,8 +311,8 @@ impl FileOps {
 
             let glob_pattern = file_glob.unwrap_or_else(|| "**/*".to_string());
             let full_glob = root.join(&glob_pattern);
-            let entries = glob::glob(&full_glob.to_string_lossy())
-                .map_err(|e| CaduceusError::Tool {
+            let entries =
+                glob::glob(&full_glob.to_string_lossy()).map_err(|e| CaduceusError::Tool {
                     tool: "runtime".into(),
                     message: format!("Invalid glob: {e}"),
                 })?;
@@ -397,13 +409,16 @@ mod tests {
     async fn bash_sandbox_echo() {
         let dir = tempfile::tempdir().unwrap();
         let sandbox = BashSandbox::new(dir.path());
-        let result = sandbox.execute(ExecRequest {
-            command: "echo hello".into(),
-            args: vec![],
-            cwd: None,
-            env: std::collections::HashMap::new(),
-            timeout_secs: Some(5),
-        }).await.unwrap();
+        let result = sandbox
+            .execute(ExecRequest {
+                command: "echo hello".into(),
+                args: vec![],
+                cwd: None,
+                env: std::collections::HashMap::new(),
+                timeout_secs: Some(5),
+            })
+            .await
+            .unwrap();
         assert_eq!(result.exit_code, 0);
         assert!(result.stdout.contains("hello"));
         assert!(!result.timed_out);
@@ -413,13 +428,16 @@ mod tests {
     async fn bash_sandbox_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let sandbox = BashSandbox::new(dir.path());
-        let result = sandbox.execute(ExecRequest {
-            command: "sleep 60".into(),
-            args: vec![],
-            cwd: None,
-            env: std::collections::HashMap::new(),
-            timeout_secs: Some(1),
-        }).await.unwrap();
+        let result = sandbox
+            .execute(ExecRequest {
+                command: "sleep 60".into(),
+                args: vec![],
+                cwd: None,
+                env: std::collections::HashMap::new(),
+                timeout_secs: Some(1),
+            })
+            .await
+            .unwrap();
         assert!(result.timed_out);
         assert_eq!(result.exit_code, -1);
     }
@@ -449,7 +467,9 @@ mod tests {
     async fn file_ops_grep_search() {
         let dir = tempfile::tempdir().unwrap();
         let ops = FileOps::new(dir.path());
-        ops.write("a.txt", "hello world\nfoo bar\nhello again").await.unwrap();
+        ops.write("a.txt", "hello world\nfoo bar\nhello again")
+            .await
+            .unwrap();
         ops.write("b.txt", "no match here").await.unwrap();
         let results = ops.grep_search("hello", Some("*.txt"), 100).await.unwrap();
         assert_eq!(results.len(), 2);

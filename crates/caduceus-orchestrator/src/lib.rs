@@ -1,6 +1,7 @@
+pub mod workers;
+
 use caduceus_core::{
-    AgentEvent, CaduceusError,
-    ModelId, ProviderId, Result, SessionId, SessionPhase, SessionState,
+    AgentEvent, CaduceusError, ModelId, ProviderId, Result, SessionId, SessionPhase, SessionState,
     StopReason, TokenUsage, ToolCallId,
 };
 use caduceus_providers::{ChatRequest, ChatResponse, LlmAdapter};
@@ -17,7 +18,9 @@ pub struct ConfigLoader {
 
 impl ConfigLoader {
     pub fn new(config_path: impl Into<std::path::PathBuf>) -> Self {
-        Self { config_path: config_path.into() }
+        Self {
+            config_path: config_path.into(),
+        }
     }
 
     pub fn load(&self) -> Result<caduceus_core::CaduceusConfig> {
@@ -32,12 +35,10 @@ impl ConfigLoader {
 
     pub fn save(&self, config: &caduceus_core::CaduceusConfig) -> Result<()> {
         if let Some(parent) = self.config_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| CaduceusError::Config(e.to_string()))?;
+            std::fs::create_dir_all(parent).map_err(|e| CaduceusError::Config(e.to_string()))?;
         }
         let json = serde_json::to_string_pretty(config)?;
-        std::fs::write(&self.config_path, json)
-            .map_err(|e| CaduceusError::Config(e.to_string()))
+        std::fs::write(&self.config_path, json).map_err(|e| CaduceusError::Config(e.to_string()))
     }
 }
 
@@ -86,7 +87,9 @@ pub struct ConversationHistory {
 
 impl ConversationHistory {
     pub fn new() -> Self {
-        Self { messages: Vec::new() }
+        Self {
+            messages: Vec::new(),
+        }
     }
 
     pub fn append(&mut self, message: caduceus_providers::Message) {
@@ -166,10 +169,7 @@ impl ContextAssembler {
     /// Build the final message list that fits within the token budget.
     /// Strategy: always include system prompt + project context, then fit as many
     /// conversation messages as possible starting from the most recent.
-    pub fn assemble(
-        &self,
-        history: &ConversationHistory,
-    ) -> Vec<caduceus_providers::Message> {
+    pub fn assemble(&self, history: &ConversationHistory) -> Vec<caduceus_providers::Message> {
         let mut result = Vec::new();
 
         let mut full_system = self.system_prompt.clone();
@@ -270,7 +270,11 @@ impl AgentEventEmitter {
     }
 
     pub async fn emit_tool_call_start(&self, id: ToolCallId, name: impl Into<String>) {
-        self.emit(AgentEvent::ToolCallStart { id, name: name.into() }).await;
+        self.emit(AgentEvent::ToolCallStart {
+            id,
+            name: name.into(),
+        })
+        .await;
     }
 
     pub async fn emit_tool_result_end(
@@ -288,11 +292,15 @@ impl AgentEventEmitter {
     }
 
     pub async fn emit_turn_complete(&self, stop_reason: StopReason, usage: TokenUsage) {
-        self.emit(AgentEvent::TurnComplete { stop_reason, usage }).await;
+        self.emit(AgentEvent::TurnComplete { stop_reason, usage })
+            .await;
     }
 
     pub async fn emit_error(&self, message: impl Into<String>) {
-        self.emit(AgentEvent::Error { message: message.into() }).await;
+        self.emit(AgentEvent::Error {
+            message: message.into(),
+        })
+        .await;
     }
 
     pub async fn emit_phase_changed(&self, phase: SessionPhase) {
@@ -419,11 +427,7 @@ impl AgentHarness {
     }
 
     /// Run one agent turn (simple, no tool loop). Kept for backward compat.
-    pub async fn run_turn(
-        &self,
-        state: &mut SessionState,
-        user_input: &str,
-    ) -> Result<String> {
+    pub async fn run_turn(&self, state: &mut SessionState, user_input: &str) -> Result<String> {
         let mut history = ConversationHistory::new();
         self.run(state, &mut history, user_input).await
     }
@@ -458,9 +462,18 @@ mod tests {
 
     #[test]
     fn slash_command_parse() {
-        assert!(matches!(SlashCommand::parse("/help"), Some(SlashCommand::Help)));
-        assert!(matches!(SlashCommand::parse("/status"), Some(SlashCommand::Status)));
-        assert!(matches!(SlashCommand::parse("/model gpt-4"), Some(SlashCommand::Model(_))));
+        assert!(matches!(
+            SlashCommand::parse("/help"),
+            Some(SlashCommand::Help)
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/status"),
+            Some(SlashCommand::Status)
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/model gpt-4"),
+            Some(SlashCommand::Model(_))
+        ));
         assert!(SlashCommand::parse("hello").is_none());
     }
 
@@ -543,8 +556,14 @@ mod tests {
 
     #[test]
     fn slash_command_exit_and_quit() {
-        assert!(matches!(SlashCommand::parse("/exit"), Some(SlashCommand::Exit)));
-        assert!(matches!(SlashCommand::parse("/quit"), Some(SlashCommand::Exit)));
+        assert!(matches!(
+            SlashCommand::parse("/exit"),
+            Some(SlashCommand::Exit)
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/quit"),
+            Some(SlashCommand::Exit)
+        ));
     }
 
     #[test]
@@ -642,12 +661,8 @@ mod tests {
     async fn cancellation_propagation() {
         // MockLlmAdapter with no scripted streams simulates an abort mid-session
         let adapter = Arc::new(MockLlmAdapter::new(vec![]));
-        let harness = AgentHarness::new(
-            adapter,
-            caduceus_tools::ToolRegistry::new(),
-            4096,
-            "system",
-        );
+        let harness =
+            AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
         let mut state = make_session();
         let mut history = ConversationHistory::new();
         let result = harness.run(&mut state, &mut history, "do something").await;
@@ -658,16 +673,11 @@ mod tests {
     #[tokio::test]
     async fn empty_input_noop() {
         let adapter = Arc::new(
-            MockLlmAdapter::new(vec![]).with_stream_chunks(vec![make_final_stream(
-                "Please provide a message.",
-            )]),
+            MockLlmAdapter::new(vec![])
+                .with_stream_chunks(vec![make_final_stream("Please provide a message.")]),
         );
-        let harness = AgentHarness::new(
-            adapter,
-            caduceus_tools::ToolRegistry::new(),
-            4096,
-            "system",
-        );
+        let harness =
+            AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
         let mut state = make_session();
         let mut history = ConversationHistory::new();
         let result = harness.run(&mut state, &mut history, "").await.unwrap();
@@ -677,23 +687,20 @@ mod tests {
     /// 6. rate_limit_recovery — successive turns both succeed (models retry after transient failure)
     #[tokio::test]
     async fn rate_limit_recovery() {
-        let adapter = Arc::new(
-            MockLlmAdapter::new(vec![]).with_stream_chunks(vec![
-                make_final_stream("first response"),
-                make_final_stream("second response after recovery"),
-            ]),
-        );
-        let harness = AgentHarness::new(
-            adapter,
-            caduceus_tools::ToolRegistry::new(),
-            4096,
-            "system",
-        );
+        let adapter = Arc::new(MockLlmAdapter::new(vec![]).with_stream_chunks(vec![
+            make_final_stream("first response"),
+            make_final_stream("second response after recovery"),
+        ]));
+        let harness =
+            AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
         let mut state = make_session();
         let mut history = ConversationHistory::new();
         let r1 = harness.run(&mut state, &mut history, "ping").await.unwrap();
         assert_eq!(r1, "first response");
-        let r2 = harness.run(&mut state, &mut history, "ping again").await.unwrap();
+        let r2 = harness
+            .run(&mut state, &mut history, "ping again")
+            .await
+            .unwrap();
         assert_eq!(r2, "second response after recovery");
     }
 
@@ -713,7 +720,10 @@ mod tests {
 
         // System message always present; total assembled must fit the budget
         assert_eq!(assembled[0].role, "system");
-        assert!(assembled.len() < 40, "oldest messages should have been dropped");
+        assert!(
+            assembled.len() < 40,
+            "oldest messages should have been dropped"
+        );
     }
 
     /// 8. malformed_response_handling — adapter returns error, agent surfaces it cleanly
@@ -721,16 +731,15 @@ mod tests {
     async fn malformed_response_handling() {
         // No scripted streams → stream() returns Err (simulates unparseable response)
         let adapter = Arc::new(MockLlmAdapter::new(vec![]));
-        let harness = AgentHarness::new(
-            adapter,
-            caduceus_tools::ToolRegistry::new(),
-            4096,
-            "system",
-        );
+        let harness =
+            AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
         let mut state = make_session();
         let mut history = ConversationHistory::new();
         let result = harness.run(&mut state, &mut history, "give me data").await;
-        assert!(result.is_err(), "malformed/missing response should be an error");
+        assert!(
+            result.is_err(),
+            "malformed/missing response should be an error"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(!msg.is_empty());
     }
@@ -746,8 +755,16 @@ mod tests {
         registry.register(Arc::new(ReadFileTool::new(dir.path())));
 
         let tool_calls = vec![
-            ("id-1".to_string(), "read_file".to_string(), serde_json::json!({"path": "a.txt"})),
-            ("id-2".to_string(), "read_file".to_string(), serde_json::json!({"path": "b.txt"})),
+            (
+                "id-1".to_string(),
+                "read_file".to_string(),
+                serde_json::json!({"path": "a.txt"}),
+            ),
+            (
+                "id-2".to_string(),
+                "read_file".to_string(),
+                serde_json::json!({"path": "b.txt"}),
+            ),
         ];
         let results = execute_tool_calls(&registry, &tool_calls).await;
 
@@ -762,18 +779,16 @@ mod tests {
     #[tokio::test]
     async fn session_state_persistence() {
         let adapter = Arc::new(
-            MockLlmAdapter::new(vec![])
-                .with_stream_chunks(vec![make_final_stream("remembered")]),
+            MockLlmAdapter::new(vec![]).with_stream_chunks(vec![make_final_stream("remembered")]),
         );
-        let harness = AgentHarness::new(
-            adapter,
-            caduceus_tools::ToolRegistry::new(),
-            4096,
-            "system",
-        );
+        let harness =
+            AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
         let mut state = make_session();
         let mut history = ConversationHistory::new();
-        harness.run(&mut state, &mut history, "remember me").await.unwrap();
+        harness
+            .run(&mut state, &mut history, "remember me")
+            .await
+            .unwrap();
 
         // Serialize and reload history
         let serialized = history.serialize().unwrap();
@@ -781,7 +796,13 @@ mod tests {
 
         assert_eq!(restored.len(), history.len());
         // User message and assistant response should survive the round-trip
-        assert!(restored.messages().iter().any(|m| m.content.contains("remember me")));
-        assert!(restored.messages().iter().any(|m| m.content.contains("remembered")));
+        assert!(restored
+            .messages()
+            .iter()
+            .any(|m| m.content.contains("remember me")));
+        assert!(restored
+            .messages()
+            .iter()
+            .any(|m| m.content.contains("remembered")));
     }
 }

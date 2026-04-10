@@ -51,7 +51,9 @@ impl LlmAdapter for MockLlmAdapter {
             .lock()
             .expect("mock responses mutex poisoned")
             .pop_front()
-            .ok_or_else(|| CaduceusError::Provider("mock adapter has no scripted chat response".into()))
+            .ok_or_else(|| {
+                CaduceusError::Provider("mock adapter has no scripted chat response".into())
+            })
     }
 
     async fn stream(&self, request: ChatRequest) -> Result<StreamResult> {
@@ -65,7 +67,9 @@ impl LlmAdapter for MockLlmAdapter {
             .lock()
             .expect("mock stream mutex poisoned")
             .pop_front()
-            .ok_or_else(|| CaduceusError::Provider("mock adapter has no scripted stream chunks".into()))?;
+            .ok_or_else(|| {
+                CaduceusError::Provider("mock adapter has no scripted stream chunks".into())
+            })?;
 
         Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
     }
