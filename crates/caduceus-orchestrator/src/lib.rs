@@ -1,10 +1,11 @@
+pub mod instructions;
 pub mod workers;
 
 use caduceus_core::{
     AgentEvent, CaduceusError, ModelId, ProviderId, Result, SessionId, SessionPhase, SessionState,
     StopReason, TokenUsage, ToolCallId,
 };
-use caduceus_providers::{ChatRequest, ChatResponse, LlmAdapter};
+use caduceus_providers::{ChatRequest, LlmAdapter};
 use caduceus_tools::ToolRegistry;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -52,6 +53,8 @@ pub enum SlashCommand {
     Provider(String),
     Status,
     Compact,
+    Agents,
+    Skills,
     Exit,
     Unknown(String),
 }
@@ -68,6 +71,8 @@ impl SlashCommand {
             "clear" => Self::Clear,
             "status" => Self::Status,
             "compact" => Self::Compact,
+            "agents" => Self::Agents,
+            "skills" => Self::Skills,
             "exit" | "quit" => Self::Exit,
             "model" => Self::Model(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
             "provider" => Self::Provider(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
@@ -313,11 +318,13 @@ impl AgentEventEmitter {
 
 pub struct AgentHarness {
     provider: Arc<dyn LlmAdapter>,
+    #[allow(dead_code)]
     tools: ToolRegistry,
     system_prompt: String,
     max_context_tokens: u32,
     max_turns: usize,
     emitter: Option<AgentEventEmitter>,
+    instruction_set: Option<instructions::InstructionSet>,
 }
 
 impl AgentHarness {
@@ -334,6 +341,7 @@ impl AgentHarness {
             max_context_tokens,
             max_turns: 50,
             emitter: None,
+            instruction_set: None,
         }
     }
 
@@ -345,6 +353,28 @@ impl AgentHarness {
     pub fn with_emitter(mut self, emitter: AgentEventEmitter) -> Self {
         self.emitter = Some(emitter);
         self
+    }
+
+    /// Load workspace instructions and merge them into the system prompt.
+    pub fn with_instructions(mut self, workspace_root: impl Into<std::path::PathBuf>) -> Self {
+        let loader = instructions::InstructionLoader::new(workspace_root);
+        match loader.load() {
+            Ok(set) => {
+                if !set.system_prompt.is_empty() {
+                    self.system_prompt = format!("{}\n\n{}", self.system_prompt, set.system_prompt);
+                }
+                self.instruction_set = Some(set);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load workspace instructions: {e}");
+            }
+        }
+        self
+    }
+
+    /// Return the loaded instruction set, if any.
+    pub fn instruction_set(&self) -> Option<&instructions::InstructionSet> {
+        self.instruction_set.as_ref()
     }
 
     /// Full agent conversation loop.
@@ -371,7 +401,8 @@ impl AgentHarness {
         let assembler = ContextAssembler::new(self.max_context_tokens, &self.system_prompt);
         let mut final_text = String::new();
 
-        for _turn in 0..self.max_turns {
+        // v1: single-pass (no tool-use loop — that's post-v1 multi-agent)
+        {
             let messages = assembler.assemble(history);
 
             let request = ChatRequest {
@@ -416,7 +447,6 @@ impl AgentHarness {
                 em.emit_turn_complete(StopReason::EndTurn, usage).await;
             }
             final_text = response_content;
-            break;
         }
 
         state.phase = SessionPhase::Idle;
