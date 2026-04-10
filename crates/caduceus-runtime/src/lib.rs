@@ -43,15 +43,18 @@ impl BashSandbox {
             .map(PathBuf::from)
             .unwrap_or_else(|| self.workspace_root.clone());
 
-        // Enforce workspace boundary for cwd
-        if cwd.is_absolute() {
-            let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
-            if !canonical.starts_with(&self.workspace_root) {
-                return Err(CaduceusError::PermissionDenied {
-                    capability: "fs".into(),
-                    tool: "cwd escapes workspace".into(),
-                });
-            }
+        // Enforce workspace boundary for cwd (both absolute and relative)
+        let resolved_cwd = if cwd.is_absolute() {
+            cwd.clone()
+        } else {
+            self.workspace_root.join(&cwd)
+        };
+        let canonical_cwd = resolved_cwd.canonicalize().unwrap_or_else(|_| resolved_cwd.clone());
+        if !canonical_cwd.starts_with(&self.workspace_root) {
+            return Err(CaduceusError::PermissionDenied {
+                capability: "fs".into(),
+                tool: "cwd escapes workspace".into(),
+            });
         }
 
         let timeout = Duration::from_secs(request.timeout_secs.unwrap_or(30));
@@ -97,33 +100,37 @@ impl FileOps {
             self.workspace_root.join(path)
         };
 
-        // We check boundary after canonicalization if the path exists,
-        // otherwise just check prefix
-        if p.exists() {
-            let canonical = p
-                .canonicalize()
-                .map_err(|e| CaduceusError::Io(e))?;
+        // Normalize to eliminate ../ components without requiring existence
+        let mut normalized = PathBuf::new();
+        for component in p.components() {
+            match component {
+                std::path::Component::ParentDir => { normalized.pop(); }
+                std::path::Component::CurDir => {}
+                other => normalized.push(other),
+            }
+        }
+
+        // Boundary check on normalized path
+        if !normalized.starts_with(&self.workspace_root) {
+            return Err(CaduceusError::PermissionDenied {
+                capability: "fs".into(),
+                tool: "Path escapes workspace".into(),
+            });
+        }
+
+        // If path exists, also verify after symlink resolution
+        if normalized.exists() {
+            let canonical = normalized.canonicalize().map_err(CaduceusError::Io)?;
             if !canonical.starts_with(&self.workspace_root) {
                 return Err(CaduceusError::PermissionDenied {
                     capability: "fs".into(),
-                    tool: "Path escapes workspace".into(),
+                    tool: "Symlink escapes workspace".into(),
                 });
             }
-            Ok(canonical)
-        } else {
-            // Parent must be within workspace
-            let parent = p.parent().unwrap_or(&p);
-            if parent.exists() {
-                let canonical_parent = parent.canonicalize().map_err(|e| CaduceusError::Io(e))?;
-                if !canonical_parent.starts_with(&self.workspace_root) {
-                    return Err(CaduceusError::PermissionDenied {
-                        capability: "fs".into(),
-                        tool: "Path escapes workspace".into(),
-                    });
-                }
-            }
-            Ok(p)
+            return Ok(canonical);
         }
+
+        Ok(normalized)
     }
 
     pub async fn read(&self, path: &str) -> Result<String> {

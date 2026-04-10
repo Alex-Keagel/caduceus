@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use tracing::warn;
 
+pub mod mock;
+
 // ── Message types ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
