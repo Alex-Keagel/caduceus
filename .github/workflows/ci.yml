@@ -28,22 +28,22 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            crates/target
+            target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Install system deps (for rusqlite/git2)
-        run: sudo apt-get install -y libssl-dev pkg-config
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
       - name: cargo fmt --check
-        run: cd crates && cargo fmt --all --check
+        run: cargo fmt --all --check
 
       - name: cargo clippy
-        run: cd crates && cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace -- -D warnings
 
       - name: cargo test
-        run: cd crates && cargo test --workspace
+        run: cargo test --workspace
 
   frontend:
     name: Frontend checks
