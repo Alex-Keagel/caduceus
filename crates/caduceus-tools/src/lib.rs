@@ -92,7 +92,7 @@ impl Default for ToolRegistry {
 // ── Built-in tool stubs ────────────────────────────────────────────────────────
 
 macro_rules! simple_tool {
-    ($name:ident, $tool_name:expr, $desc:expr, $schema:expr) => {
+    ($name:ident, $tool_name:expr, $desc:expr, $($schema:tt)+) => {
         pub struct $name;
 
         #[async_trait]
@@ -101,11 +101,12 @@ macro_rules! simple_tool {
                 ToolSpec {
                     name: $tool_name.into(),
                     description: $desc.into(),
-                    input_schema: serde_json::json!($schema),
+                    input_schema: serde_json::json!($($schema)+),
                 }
             }
 
             async fn call(&self, input: Value) -> Result<ToolResult> {
+                let _ = input;
                 todo!(concat!($tool_name, " not implemented"))
             }
         }
