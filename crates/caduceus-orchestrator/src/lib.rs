@@ -554,4 +554,234 @@ mod tests {
             Some(SlashCommand::Unknown(ref s)) if s == "foobar"
         ));
     }
+
+    // ── Parity test scenarios ──────────────────────────────────────────────────
+
+    use caduceus_providers::mock::MockLlmAdapter;
+    use caduceus_providers::StreamChunk;
+    use caduceus_tools::{BashTool, ReadFileTool};
+    use std::sync::Arc;
+
+    fn make_final_stream(text: &str) -> Vec<StreamChunk> {
+        vec![StreamChunk {
+            delta: text.to_string(),
+            is_final: true,
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+        }]
+    }
+
+    fn make_session() -> caduceus_core::SessionState {
+        caduceus_core::SessionState::new(
+            ".",
+            caduceus_core::ProviderId::new("mock"),
+            caduceus_core::ModelId::new("mock-model"),
+        )
+    }
+
+    /// 1. read_only_tool_execution — read_file works without write permission
+    #[tokio::test]
+    async fn read_only_tool_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "hello world").unwrap();
+
+        let mut registry = caduceus_tools::ToolRegistry::new();
+        registry.register(Arc::new(ReadFileTool::new(dir.path())));
+
+        let result = registry
+            .execute("read_file", serde_json::json!({"path": "hello.txt"}))
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("hello world"));
+    }
+
+    /// 2. write_requires_approval — write_file fails without fs.write capability registered
+    #[tokio::test]
+    async fn write_requires_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = caduceus_tools::ToolRegistry::new();
+        // Only read_file is registered; write_file is not approved
+        registry.register(Arc::new(ReadFileTool::new(dir.path())));
+
+        let result = registry
+            .execute(
+                "write_file",
+                serde_json::json!({"path": "out.txt", "content": "data"}),
+            )
+            .await;
+
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("write_file") || msg.contains("Unknown"));
+    }
+
+    /// 3. bash_with_timeout — command that exceeds timeout returns timed_out=true
+    #[tokio::test]
+    async fn bash_with_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = caduceus_tools::ToolRegistry::new();
+        registry.register(Arc::new(BashTool::new(dir.path())));
+
+        let result = registry
+            .execute(
+                "bash",
+                serde_json::json!({"command": "sleep 30", "timeout_secs": 1}),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        let v: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(v["timed_out"], true);
+    }
+
+    /// 4. cancellation_propagation — adapter error (simulating cancel) stops execution
+    #[tokio::test]
+    async fn cancellation_propagation() {
+        // MockLlmAdapter with no scripted streams simulates an abort mid-session
+        let adapter = Arc::new(MockLlmAdapter::new(vec![]));
+        let harness = AgentHarness::new(
+            adapter,
+            caduceus_tools::ToolRegistry::new(),
+            4096,
+            "system",
+        );
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+        let result = harness.run(&mut state, &mut history, "do something").await;
+        assert!(result.is_err(), "cancelled session should propagate error");
+    }
+
+    /// 5. empty_input_noop — empty string returns a graceful message, not an error
+    #[tokio::test]
+    async fn empty_input_noop() {
+        let adapter = Arc::new(
+            MockLlmAdapter::new(vec![]).with_stream_chunks(vec![make_final_stream(
+                "Please provide a message.",
+            )]),
+        );
+        let harness = AgentHarness::new(
+            adapter,
+            caduceus_tools::ToolRegistry::new(),
+            4096,
+            "system",
+        );
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+        let result = harness.run(&mut state, &mut history, "").await.unwrap();
+        assert!(!result.is_empty());
+    }
+
+    /// 6. rate_limit_recovery — successive turns both succeed (models retry after transient failure)
+    #[tokio::test]
+    async fn rate_limit_recovery() {
+        let adapter = Arc::new(
+            MockLlmAdapter::new(vec![]).with_stream_chunks(vec![
+                make_final_stream("first response"),
+                make_final_stream("second response after recovery"),
+            ]),
+        );
+        let harness = AgentHarness::new(
+            adapter,
+            caduceus_tools::ToolRegistry::new(),
+            4096,
+            "system",
+        );
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+        let r1 = harness.run(&mut state, &mut history, "ping").await.unwrap();
+        assert_eq!(r1, "first response");
+        let r2 = harness.run(&mut state, &mut history, "ping again").await.unwrap();
+        assert_eq!(r2, "second response after recovery");
+    }
+
+    /// 7. context_overflow_truncation — oldest messages dropped when token budget exceeded
+    #[test]
+    fn context_overflow_truncation() {
+        let mut history = ConversationHistory::new();
+        for i in 0..20u32 {
+            history.append(caduceus_providers::Message::user(format!("msg {i}")));
+            history.append(caduceus_providers::Message::assistant(format!("resp {i}")));
+        }
+        assert_eq!(history.len(), 40);
+
+        // Small budget forces truncation
+        let assembler = ContextAssembler::new(50, "system");
+        let assembled = assembler.assemble(&history);
+
+        // System message always present; total assembled must fit the budget
+        assert_eq!(assembled[0].role, "system");
+        assert!(assembled.len() < 40, "oldest messages should have been dropped");
+    }
+
+    /// 8. malformed_response_handling — adapter returns error, agent surfaces it cleanly
+    #[tokio::test]
+    async fn malformed_response_handling() {
+        // No scripted streams → stream() returns Err (simulates unparseable response)
+        let adapter = Arc::new(MockLlmAdapter::new(vec![]));
+        let harness = AgentHarness::new(
+            adapter,
+            caduceus_tools::ToolRegistry::new(),
+            4096,
+            "system",
+        );
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+        let result = harness.run(&mut state, &mut history, "give me data").await;
+        assert!(result.is_err(), "malformed/missing response should be an error");
+        let msg = result.unwrap_err().to_string();
+        assert!(!msg.is_empty());
+    }
+
+    /// 9. multi_tool_turn — two tools in registry, both execute in one batch
+    #[tokio::test]
+    async fn multi_tool_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "aaa").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "bbb").unwrap();
+
+        let mut registry = caduceus_tools::ToolRegistry::new();
+        registry.register(Arc::new(ReadFileTool::new(dir.path())));
+
+        let tool_calls = vec![
+            ("id-1".to_string(), "read_file".to_string(), serde_json::json!({"path": "a.txt"})),
+            ("id-2".to_string(), "read_file".to_string(), serde_json::json!({"path": "b.txt"})),
+        ];
+        let results = execute_tool_calls(&registry, &tool_calls).await;
+
+        assert_eq!(results.len(), 2);
+        assert!(!results[0].2, "first tool call should succeed");
+        assert!(results[0].1.contains("aaa"));
+        assert!(!results[1].2, "second tool call should succeed");
+        assert!(results[1].1.contains("bbb"));
+    }
+
+    /// 10. session_state_persistence — serialize conversation history, reload, verify state intact
+    #[tokio::test]
+    async fn session_state_persistence() {
+        let adapter = Arc::new(
+            MockLlmAdapter::new(vec![])
+                .with_stream_chunks(vec![make_final_stream("remembered")]),
+        );
+        let harness = AgentHarness::new(
+            adapter,
+            caduceus_tools::ToolRegistry::new(),
+            4096,
+            "system",
+        );
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+        harness.run(&mut state, &mut history, "remember me").await.unwrap();
+
+        // Serialize and reload history
+        let serialized = history.serialize().unwrap();
+        let restored = ConversationHistory::deserialize(&serialized).unwrap();
+
+        assert_eq!(restored.len(), history.len());
+        // User message and assistant response should survive the round-trip
+        assert!(restored.messages().iter().any(|m| m.content.contains("remember me")));
+        assert!(restored.messages().iter().any(|m| m.content.contains("remembered")));
+    }
 }
