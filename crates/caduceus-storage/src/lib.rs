@@ -6,6 +6,7 @@ use caduceus_core::{
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1414,6 +1415,310 @@ impl SessionReplayer {
     }
 }
 
+// ── Memory quality and trajectory utilities ───────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteDecision {
+    Allow,
+    FlagForReview(String),
+    Block(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemorySourceValidity {
+    Verified,
+    Unverified,
+    SuspiciouslyRepetitive,
+}
+
+pub struct MemoryEntrenchmentGuard {
+    access_counts: HashMap<String, u32>,
+    staleness_threshold: u32,
+}
+
+impl MemoryEntrenchmentGuard {
+    pub fn new(threshold: u32) -> Self {
+        Self {
+            access_counts: HashMap::new(),
+            staleness_threshold: threshold.max(1),
+        }
+    }
+
+    pub fn record_access(&mut self, memory_id: &str) {
+        let entry = self.access_counts.entry(memory_id.to_string()).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    pub fn record_write(&mut self, memory_id: &str, content: &str) -> WriteDecision {
+        match self.validate_memory_source(content) {
+            MemorySourceValidity::SuspiciouslyRepetitive => {
+                WriteDecision::Block("memory content appears suspiciously repetitive".to_string())
+            }
+            MemorySourceValidity::Unverified => {
+                self.access_counts.insert(memory_id.to_string(), 0);
+                WriteDecision::FlagForReview("memory source could not be verified".to_string())
+            }
+            MemorySourceValidity::Verified if self.check_entrenchment(memory_id) => {
+                self.access_counts.insert(memory_id.to_string(), 0);
+                WriteDecision::FlagForReview(
+                    "memory has become entrenched and needs review".to_string(),
+                )
+            }
+            MemorySourceValidity::Verified => {
+                self.access_counts.insert(memory_id.to_string(), 0);
+                WriteDecision::Allow
+            }
+        }
+    }
+
+    pub fn check_entrenchment(&self, memory_id: &str) -> bool {
+        self.access_counts
+            .get(memory_id)
+            .copied()
+            .unwrap_or_default()
+            >= self.staleness_threshold
+    }
+
+    pub fn get_stale_memories(&self) -> Vec<String> {
+        let mut stale: Vec<String> = self
+            .access_counts
+            .iter()
+            .filter(|(_, count)| **count >= self.staleness_threshold)
+            .map(|(memory_id, _)| memory_id.clone())
+            .collect();
+        stale.sort();
+        stale
+    }
+
+    pub fn validate_memory_source(&self, content: &str) -> MemorySourceValidity {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return MemorySourceValidity::Unverified;
+        }
+
+        let words: Vec<String> = trimmed
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .map(|token| token.to_ascii_lowercase())
+            .collect();
+        let unique_words = words.iter().collect::<std::collections::HashSet<_>>().len();
+        if words.len() >= 4 && unique_words.saturating_mul(2) <= words.len() {
+            return MemorySourceValidity::SuspiciouslyRepetitive;
+        }
+
+        let lower = trimmed.to_ascii_lowercase();
+        if [
+            "https://",
+            "http://",
+            "source:",
+            "according to",
+            "observed",
+            "documented",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        {
+            MemorySourceValidity::Verified
+        } else {
+            MemorySourceValidity::Unverified
+        }
+    }
+}
+
+#[derive(Debug, Clone, ReplaySerialize, ReplayDeserialize, PartialEq, Eq)]
+pub enum TrajectoryEventType {
+    ToolCall,
+    UserMessage,
+    AgentResponse,
+    ModeSwitch,
+    Error,
+}
+
+#[derive(Debug, Clone, ReplaySerialize, ReplayDeserialize, PartialEq, Eq)]
+pub struct TrajectoryEvent {
+    pub turn: usize,
+    pub event_type: TrajectoryEventType,
+    pub tool_name: Option<String>,
+    pub input_summary: String,
+    pub output_summary: String,
+    pub success: bool,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, ReplaySerialize, ReplayDeserialize)]
+pub struct TrajectoryRecorder {
+    session_id: String,
+    events: Vec<TrajectoryEvent>,
+}
+
+impl TrajectoryRecorder {
+    pub fn new(session_id: &str) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            events: Vec::new(),
+        }
+    }
+
+    pub fn record(&mut self, event: TrajectoryEvent) {
+        self.events.push(event);
+    }
+
+    pub fn export_trajectory(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn import_trajectory(json: &str) -> std::result::Result<Self, CaduceusError> {
+        let recorder: Self = serde_json::from_str(json)?;
+        if recorder.session_id.trim().is_empty() {
+            return Err(CaduceusError::Storage(
+                "trajectory session_id must not be empty".to_string(),
+            ));
+        }
+        Ok(recorder)
+    }
+
+    pub fn successful_patterns(&self) -> Vec<Vec<&TrajectoryEvent>> {
+        self.recurring_patterns(true)
+    }
+
+    pub fn failure_patterns(&self) -> Vec<Vec<&TrajectoryEvent>> {
+        self.recurring_patterns(false)
+    }
+
+    fn recurring_patterns(&self, success: bool) -> Vec<Vec<&TrajectoryEvent>> {
+        let mut runs: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        let mut index = 0;
+        while index < self.events.len() {
+            if self.events[index].success != success {
+                index += 1;
+                continue;
+            }
+
+            let start = index;
+            while index < self.events.len() && self.events[index].success == success {
+                index += 1;
+            }
+
+            if index - start >= 2 {
+                let signature = self.events[start..index]
+                    .iter()
+                    .map(pattern_key)
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                runs.entry(signature)
+                    .or_default()
+                    .push((start, index - start));
+            }
+        }
+
+        let mut patterns: Vec<(usize, Vec<&TrajectoryEvent>)> = runs
+            .into_values()
+            .filter(|occurrences| occurrences.len() > 1)
+            .map(|occurrences| {
+                let (start, len) = occurrences[0];
+                (
+                    start,
+                    self.events[start..start + len].iter().collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        patterns.sort_by_key(|(start, _)| *start);
+        patterns.into_iter().map(|(_, events)| events).collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelevanceEntry {
+    pub id: String,
+    pub initial_relevance: f64,
+    pub current_relevance: f64,
+    pub last_accessed: u64,
+    pub access_count: u32,
+}
+
+pub struct RelevanceDecayManager {
+    entries: HashMap<String, RelevanceEntry>,
+    decay_rate: f64,
+}
+
+impl RelevanceDecayManager {
+    pub fn new(decay_rate: f64) -> Self {
+        Self {
+            entries: HashMap::new(),
+            decay_rate: decay_rate.clamp(0.0, 1.0),
+        }
+    }
+
+    pub fn add_entry(&mut self, id: &str, relevance: f64) {
+        let relevance = relevance.clamp(0.0, 1.0);
+        self.entries.insert(
+            id.to_string(),
+            RelevanceEntry {
+                id: id.to_string(),
+                initial_relevance: relevance,
+                current_relevance: relevance,
+                last_accessed: 0,
+                access_count: 0,
+            },
+        );
+    }
+
+    pub fn access(&mut self, id: &str) {
+        if let Some(entry) = self.entries.get_mut(id) {
+            entry.access_count = entry.access_count.saturating_add(1);
+            entry.last_accessed = 0;
+            entry.current_relevance =
+                (entry.current_relevance + (self.decay_rate / 2.0).max(0.05)).min(1.0);
+        }
+    }
+
+    pub fn decay_tick(&mut self) {
+        let decay_factor = (1.0 - self.decay_rate).clamp(0.0, 1.0);
+        for entry in self.entries.values_mut() {
+            entry.current_relevance = (entry.current_relevance * decay_factor).clamp(0.0, 1.0);
+            entry.last_accessed = entry.last_accessed.saturating_add(1);
+        }
+    }
+
+    pub fn get_relevance(&self, id: &str) -> Option<f64> {
+        self.entries.get(id).map(|entry| entry.current_relevance)
+    }
+
+    pub fn prune_below(&mut self, threshold: f64) -> Vec<String> {
+        let mut pruned: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.current_relevance < threshold)
+            .map(|(id, _)| id.clone())
+            .collect();
+        pruned.sort();
+        for id in &pruned {
+            self.entries.remove(id);
+        }
+        pruned
+    }
+
+    pub fn top_n(&self, n: usize) -> Vec<(&str, f64)> {
+        let mut entries: Vec<(&str, f64)> = self
+            .entries
+            .values()
+            .map(|entry| (entry.id.as_str(), entry.current_relevance))
+            .collect();
+        entries.sort_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+        entries.truncate(n);
+        entries
+    }
+}
+
+fn pattern_key(event: &TrajectoryEvent) -> String {
+    format!(
+        "{:?}:{}:{}",
+        event.event_type,
+        event.tool_name.as_deref().unwrap_or("-"),
+        event.success
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2205,5 +2510,113 @@ mod tests {
         assert!(replayer.current().is_some());
         replayer.step_forward();
         assert!(replayer.current().is_none());
+    }
+
+    #[test]
+    fn memory_entrenchment_guard_detects_staleness_and_write_decisions() {
+        let mut guard = MemoryEntrenchmentGuard::new(2);
+        guard.record_access("memory-1");
+        guard.record_access("memory-1");
+
+        assert!(guard.check_entrenchment("memory-1"));
+        assert_eq!(guard.get_stale_memories(), vec!["memory-1".to_string()]);
+        assert!(matches!(
+            guard.record_write("memory-1", "source: runbook entry"),
+            WriteDecision::FlagForReview(_)
+        ));
+        assert!(matches!(
+            guard.record_write("memory-2", "echo echo echo echo"),
+            WriteDecision::Block(_)
+        ));
+    }
+
+    #[test]
+    fn memory_entrenchment_guard_validates_sources() {
+        let guard = MemoryEntrenchmentGuard::new(3);
+        assert_eq!(
+            guard.validate_memory_source("https://docs.example.com/reference"),
+            MemorySourceValidity::Verified
+        );
+        assert_eq!(
+            guard.validate_memory_source(""),
+            MemorySourceValidity::Unverified
+        );
+        assert_eq!(
+            guard.validate_memory_source("repeat repeat repeat repeat"),
+            MemorySourceValidity::SuspiciouslyRepetitive
+        );
+    }
+
+    #[test]
+    fn trajectory_recorder_round_trips_and_extracts_patterns() {
+        let mut recorder = TrajectoryRecorder::new("session-42");
+        for turn in [1, 3] {
+            recorder.record(TrajectoryEvent {
+                turn,
+                event_type: TrajectoryEventType::UserMessage,
+                tool_name: None,
+                input_summary: "ask".to_string(),
+                output_summary: "queued".to_string(),
+                success: true,
+                duration_ms: 1,
+            });
+            recorder.record(TrajectoryEvent {
+                turn,
+                event_type: TrajectoryEventType::ToolCall,
+                tool_name: Some("search".to_string()),
+                input_summary: "query".to_string(),
+                output_summary: "results".to_string(),
+                success: true,
+                duration_ms: 12,
+            });
+            recorder.record(TrajectoryEvent {
+                turn,
+                event_type: TrajectoryEventType::Error,
+                tool_name: Some("search".to_string()),
+                input_summary: "query".to_string(),
+                output_summary: "timeout".to_string(),
+                success: false,
+                duration_ms: 12,
+            });
+            recorder.record(TrajectoryEvent {
+                turn,
+                event_type: TrajectoryEventType::ModeSwitch,
+                tool_name: None,
+                input_summary: "retry".to_string(),
+                output_summary: "background".to_string(),
+                success: false,
+                duration_ms: 2,
+            });
+        }
+
+        let exported = recorder.export_trajectory();
+        let imported = TrajectoryRecorder::import_trajectory(&exported).unwrap();
+        assert_eq!(imported.session_id, "session-42");
+        assert_eq!(imported.events.len(), 8);
+        assert_eq!(imported.successful_patterns().len(), 1);
+        assert_eq!(imported.failure_patterns().len(), 1);
+        assert_eq!(imported.successful_patterns()[0].len(), 2);
+    }
+
+    #[test]
+    fn relevance_decay_manager_decays_accesses_and_prunes() {
+        let mut manager = RelevanceDecayManager::new(0.2);
+        manager.add_entry("alpha", 0.9);
+        manager.add_entry("beta", 0.4);
+
+        manager.decay_tick();
+        let alpha_after_decay = manager.get_relevance("alpha").unwrap();
+        assert!((alpha_after_decay - 0.72).abs() < 1e-9);
+
+        manager.access("beta");
+        assert!(manager.get_relevance("beta").unwrap() > 0.4);
+        assert_eq!(manager.entries["beta"].last_accessed, 0);
+        assert_eq!(manager.entries["beta"].access_count, 1);
+
+        let pruned = manager.prune_below(0.5);
+        assert_eq!(pruned, vec!["beta".to_string()]);
+        let top = manager.top_n(1);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].0, "alpha");
     }
 }

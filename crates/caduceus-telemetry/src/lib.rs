@@ -1,7 +1,7 @@
 use caduceus_core::{ModelId, ProviderId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 // ── Token counting ─────────────────────────────────────────────────────────────
@@ -978,6 +978,525 @@ impl ControlStatus {
     }
 }
 
+// ── Agent resilience telemetry ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RotMeasurement {
+    pub turn: usize,
+    pub recall_score: f64,
+    pub repetition_count: usize,
+    pub hallucination_markers: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotTrend {
+    Stable,
+    Declining,
+    Critical,
+}
+
+pub struct ContextRotDetector {
+    window_size: usize,
+    rot_threshold: f64,
+    measurements: Vec<RotMeasurement>,
+}
+
+impl ContextRotDetector {
+    pub fn new(threshold: f64) -> Self {
+        Self {
+            window_size: 6,
+            rot_threshold: threshold.clamp(0.0, 1.0),
+            measurements: Vec::new(),
+        }
+    }
+
+    pub fn record_turn(&mut self, recall: f64, repetitions: usize, hallucinations: usize) {
+        let turn = self
+            .measurements
+            .last()
+            .map_or(1, |measurement| measurement.turn + 1);
+        self.measurements.push(RotMeasurement {
+            turn,
+            recall_score: recall.clamp(0.0, 1.0),
+            repetition_count: repetitions,
+            hallucination_markers: hallucinations,
+        });
+
+        if self.measurements.len() > self.window_size {
+            self.measurements.remove(0);
+        }
+    }
+
+    pub fn is_rotting(&self) -> bool {
+        let Some(latest) = self.measurements.last() else {
+            return false;
+        };
+
+        latest.recall_score < self.rot_threshold && !matches!(self.trend(), RotTrend::Stable)
+    }
+
+    pub fn rot_score(&self) -> f64 {
+        if self.measurements.is_empty() {
+            return 0.0;
+        }
+
+        self.measurements
+            .iter()
+            .map(Self::measurement_score)
+            .sum::<f64>()
+            / self.measurements.len() as f64
+    }
+
+    pub fn trend(&self) -> RotTrend {
+        if self.measurements.len() < 2 {
+            return RotTrend::Stable;
+        }
+
+        let midpoint = (self.measurements.len() / 2).max(1);
+        let earlier = &self.measurements[..midpoint];
+        let later = &self.measurements[midpoint..];
+        let earlier_recall = earlier
+            .iter()
+            .map(|measurement| measurement.recall_score)
+            .sum::<f64>()
+            / earlier.len() as f64;
+        let later_recall = later
+            .iter()
+            .map(|measurement| measurement.recall_score)
+            .sum::<f64>()
+            / later.len() as f64;
+        let decline = earlier_recall - later_recall;
+        let latest = self.measurements.last().expect("latest measurement exists");
+        let latest_score = Self::measurement_score(latest);
+
+        if latest.recall_score <= (self.rot_threshold * 0.8)
+            || latest_score >= 0.75
+            || decline >= 0.25
+        {
+            RotTrend::Critical
+        } else if latest.recall_score < self.rot_threshold
+            || latest_score >= 0.45
+            || decline >= 0.08
+        {
+            RotTrend::Declining
+        } else {
+            RotTrend::Stable
+        }
+    }
+
+    fn measurement_score(measurement: &RotMeasurement) -> f64 {
+        let recall_penalty = 1.0 - measurement.recall_score.clamp(0.0, 1.0);
+        let repetition_penalty = (measurement.repetition_count.min(6) as f64) / 6.0;
+        let hallucination_penalty = (measurement.hallucination_markers.min(4) as f64) / 4.0;
+
+        (recall_penalty * 0.6 + repetition_penalty * 0.25 + hallucination_penalty * 0.15)
+            .clamp(0.0, 1.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DriftMeasurement {
+    pub turn: usize,
+    pub similarity_to_baseline: f64,
+    pub skipped_steps: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BehavioralDriftDetector {
+    baseline_patterns: Vec<String>,
+    drift_measurements: Vec<DriftMeasurement>,
+}
+
+impl BehavioralDriftDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_baseline(&mut self, patterns: Vec<String>) {
+        self.baseline_patterns = patterns;
+    }
+
+    pub fn record_behavior(&mut self, turn: usize, behavior: &str) {
+        let similarity = if self.baseline_patterns.is_empty() {
+            0.0
+        } else {
+            self.baseline_patterns
+                .iter()
+                .map(|pattern| Self::jaccard_similarity(pattern, behavior))
+                .fold(0.0, f64::max)
+        };
+
+        let skipped_steps = self
+            .baseline_patterns
+            .iter()
+            .filter(|pattern| Self::jaccard_similarity(pattern, behavior) < 0.25)
+            .count();
+
+        self.drift_measurements.push(DriftMeasurement {
+            turn,
+            similarity_to_baseline: similarity,
+            skipped_steps,
+        });
+    }
+
+    pub fn drift_score(&self) -> f64 {
+        if self.drift_measurements.is_empty() {
+            return 0.0;
+        }
+
+        self.drift_measurements
+            .iter()
+            .map(|measurement| {
+                let skipped_ratio = if self.baseline_patterns.is_empty() {
+                    0.0
+                } else {
+                    measurement.skipped_steps as f64 / self.baseline_patterns.len() as f64
+                };
+
+                ((1.0 - measurement.similarity_to_baseline) * 0.8 + skipped_ratio * 0.2)
+                    .clamp(0.0, 1.0)
+            })
+            .sum::<f64>()
+            / self.drift_measurements.len() as f64
+    }
+
+    pub fn is_drifting(&self, threshold: f64) -> bool {
+        self.drift_score() >= threshold.clamp(0.0, 1.0)
+    }
+
+    pub fn jaccard_similarity(a: &str, b: &str) -> f64 {
+        let a_tokens = tokenize(a);
+        let b_tokens = tokenize(b);
+
+        if a_tokens.is_empty() && b_tokens.is_empty() {
+            return 1.0;
+        }
+
+        if a_tokens.is_empty() || b_tokens.is_empty() {
+            return 0.0;
+        }
+
+        let intersection = a_tokens.intersection(&b_tokens).count() as f64;
+        let union = a_tokens.union(&b_tokens).count() as f64;
+        if union == 0.0 {
+            0.0
+        } else {
+            intersection / union
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DegradationStage {
+    Healthy = 0,
+    TriggerInjection = 1,
+    ResourceStarvation = 2,
+    BehavioralDrift = 3,
+    MemoryEntrenchment = 4,
+    FunctionalOverride = 5,
+    SystemicCollapse = 6,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DegradationIndicators {
+    pub context_utilization: f64,
+    pub error_rate: f64,
+    pub repetition_rate: f64,
+    pub drift_score: f64,
+}
+
+pub struct CognitiveDegradationBreaker {
+    stage: DegradationStage,
+    stage_history: Vec<(DegradationStage, u64)>,
+    auto_reset_threshold: DegradationStage,
+}
+
+impl CognitiveDegradationBreaker {
+    pub fn new() -> Self {
+        let now = current_unix_timestamp();
+        Self {
+            stage: DegradationStage::Healthy,
+            stage_history: vec![(DegradationStage::Healthy, now)],
+            auto_reset_threshold: DegradationStage::FunctionalOverride,
+        }
+    }
+
+    pub fn update_stage(&mut self, indicators: &DegradationIndicators) {
+        let next_stage = Self::stage_from(indicators);
+        if next_stage != self.stage {
+            self.stage = next_stage;
+            self.stage_history
+                .push((next_stage, current_unix_timestamp()));
+        }
+    }
+
+    pub fn current_stage(&self) -> &DegradationStage {
+        &self.stage
+    }
+
+    pub fn should_reset(&self) -> bool {
+        self.stage >= self.auto_reset_threshold
+    }
+
+    pub fn reset(&mut self) {
+        self.stage = DegradationStage::Healthy;
+        self.stage_history
+            .push((DegradationStage::Healthy, current_unix_timestamp()));
+    }
+
+    pub fn stage_duration(&self) -> u64 {
+        let started_at = self
+            .stage_history
+            .last()
+            .map(|(_, timestamp)| *timestamp)
+            .unwrap_or_else(current_unix_timestamp);
+        current_unix_timestamp().saturating_sub(started_at)
+    }
+
+    fn stage_from(indicators: &DegradationIndicators) -> DegradationStage {
+        let severity = [
+            stage_severity(
+                indicators.context_utilization,
+                &[0.45, 0.6, 0.75, 0.85, 0.92, 0.98],
+            ),
+            stage_severity(indicators.error_rate, &[0.08, 0.16, 0.28, 0.4, 0.52, 0.65]),
+            stage_severity(
+                indicators.repetition_rate,
+                &[0.08, 0.18, 0.3, 0.45, 0.6, 0.75],
+            ),
+            stage_severity(indicators.drift_score, &[0.15, 0.3, 0.45, 0.6, 0.78, 0.92]),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+
+        match severity {
+            1 => DegradationStage::TriggerInjection,
+            2 => DegradationStage::ResourceStarvation,
+            3 => DegradationStage::BehavioralDrift,
+            4 => DegradationStage::MemoryEntrenchment,
+            5 => DegradationStage::FunctionalOverride,
+            6 => DegradationStage::SystemicCollapse,
+            _ => DegradationStage::Healthy,
+        }
+    }
+}
+
+impl Default for CognitiveDegradationBreaker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttentionMeasurement {
+    pub tokens_used: usize,
+    pub estimated_attention: f64,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionZone {
+    Green,
+    Yellow,
+    Orange,
+    Red,
+    Critical,
+}
+
+pub struct AttentionBudgetTracker {
+    max_tokens: usize,
+    effective_attention: f64,
+    measurements: Vec<AttentionMeasurement>,
+}
+
+impl AttentionBudgetTracker {
+    pub fn new(max_tokens: usize) -> Self {
+        Self {
+            max_tokens: max_tokens.max(1),
+            effective_attention: 1.0,
+            measurements: Vec::new(),
+        }
+    }
+
+    pub fn record_usage(&mut self, tokens_used: usize) {
+        let usage_ratio = (tokens_used as f64 / self.max_tokens as f64).clamp(0.0, 1.5);
+        let estimated_attention = (1.0 - usage_ratio.powf(1.3)).clamp(0.0, 1.0);
+        self.effective_attention = estimated_attention;
+        self.measurements.push(AttentionMeasurement {
+            tokens_used,
+            estimated_attention,
+            timestamp: current_unix_timestamp(),
+        });
+    }
+
+    pub fn remaining_attention(&self) -> f64 {
+        self.effective_attention
+    }
+
+    pub fn attention_zone(&self) -> AttentionZone {
+        match self.remaining_attention() {
+            attention if attention > 0.75 => AttentionZone::Green,
+            attention if attention > 0.5 => AttentionZone::Yellow,
+            attention if attention > 0.3 => AttentionZone::Orange,
+            attention if attention > 0.1 => AttentionZone::Red,
+            _ => AttentionZone::Critical,
+        }
+    }
+
+    pub fn recommend_action(&self) -> Option<String> {
+        match self.attention_zone() {
+            AttentionZone::Green | AttentionZone::Yellow => None,
+            AttentionZone::Orange => Some("summarize active context".to_string()),
+            AttentionZone::Red => Some("compact conversation state".to_string()),
+            AttentionZone::Critical => Some("reset or aggressively summarize context".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeStatus {
+    Active,
+    Pruned(String),
+    Succeeded,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeNode {
+    pub id: usize,
+    pub parent: Option<usize>,
+    pub hypothesis: String,
+    pub status: NodeStatus,
+    pub error_log: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AgenticTreeTracker {
+    nodes: Vec<TreeNode>,
+    active_branch: Vec<usize>,
+}
+
+impl AgenticTreeTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_branch(&mut self, parent: Option<usize>, hypothesis: &str) -> usize {
+        let parent = parent.filter(|candidate| *candidate < self.nodes.len());
+        let id = self.nodes.len();
+        self.nodes.push(TreeNode {
+            id,
+            parent,
+            hypothesis: hypothesis.to_string(),
+            status: NodeStatus::Active,
+            error_log: None,
+        });
+        self.active_branch = self.path_ids(id);
+        id
+    }
+
+    pub fn prune(&mut self, node_id: usize, reason: &str) {
+        if let Some(node) = self.nodes.get_mut(node_id) {
+            node.status = NodeStatus::Pruned(reason.to_string());
+            node.error_log = None;
+            self.refresh_active_branch();
+        }
+    }
+
+    pub fn succeed(&mut self, node_id: usize) {
+        if let Some(node) = self.nodes.get_mut(node_id) {
+            node.status = NodeStatus::Succeeded;
+            node.error_log = None;
+            self.refresh_active_branch();
+        }
+    }
+
+    pub fn fail(&mut self, node_id: usize, error: &str) {
+        if let Some(node) = self.nodes.get_mut(node_id) {
+            node.status = NodeStatus::Failed(error.to_string());
+            node.error_log = Some(error.to_string());
+            self.refresh_active_branch();
+        }
+    }
+
+    pub fn active_branches(&self) -> Vec<&TreeNode> {
+        self.nodes
+            .iter()
+            .filter(|node| matches!(node.status, NodeStatus::Active))
+            .collect()
+    }
+
+    pub fn depth(&self) -> usize {
+        self.nodes
+            .iter()
+            .map(|node| self.path_ids(node.id).len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn best_path(&self) -> Vec<&TreeNode> {
+        let Some(node) = self
+            .nodes
+            .iter()
+            .find(|node| matches!(node.status, NodeStatus::Succeeded))
+        else {
+            return Vec::new();
+        };
+
+        self.path_ids(node.id)
+            .into_iter()
+            .filter_map(|id| self.nodes.get(id))
+            .collect()
+    }
+
+    fn path_ids(&self, node_id: usize) -> Vec<usize> {
+        let mut path = Vec::new();
+        let mut current = self.nodes.get(node_id);
+        while let Some(node) = current {
+            path.push(node.id);
+            current = node.parent.and_then(|parent| self.nodes.get(parent));
+        }
+        path.reverse();
+        path
+    }
+
+    fn refresh_active_branch(&mut self) {
+        if let Some(node) = self
+            .nodes
+            .iter()
+            .rev()
+            .find(|node| matches!(node.status, NodeStatus::Active))
+        {
+            self.active_branch = self.path_ids(node.id);
+        } else {
+            self.active_branch.clear();
+        }
+    }
+}
+
+fn current_unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn stage_severity(value: f64, thresholds: &[f64; 6]) -> u8 {
+    thresholds
+        .iter()
+        .position(|threshold| value < *threshold)
+        .map_or(6, |index| index as u8)
+}
+
+fn tokenize(input: &str) -> HashSet<String> {
+    input
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1500,5 +2019,125 @@ mod tests {
 
         let defaults = GovernanceAttestor::default_controls();
         assert_eq!(defaults.active_controls().len(), 3);
+    }
+
+    #[test]
+    fn context_rot_detector_flags_decline() {
+        let mut detector = ContextRotDetector::new(0.7);
+        detector.record_turn(0.92, 0, 0);
+        detector.record_turn(0.81, 1, 0);
+        detector.record_turn(0.63, 3, 1);
+
+        assert!(detector.is_rotting());
+        assert_eq!(detector.trend(), RotTrend::Declining);
+        assert!(detector.rot_score() > 0.15);
+    }
+
+    #[test]
+    fn context_rot_detector_enters_critical_state() {
+        let mut detector = ContextRotDetector::new(0.75);
+        detector.record_turn(0.88, 0, 0);
+        detector.record_turn(0.58, 5, 2);
+        detector.record_turn(0.42, 6, 4);
+
+        assert_eq!(detector.trend(), RotTrend::Critical);
+        assert!(detector.is_rotting());
+        assert!(detector.rot_score() > 0.45);
+    }
+
+    #[test]
+    fn behavioral_drift_detector_scores_baseline_divergence() {
+        let mut detector = BehavioralDriftDetector::new();
+        detector.set_baseline(vec![
+            "analyze requirements".to_string(),
+            "run tests".to_string(),
+            "summarize results".to_string(),
+        ]);
+        detector.record_behavior(1, "analyze requirements and run tests");
+        detector.record_behavior(2, "rewrite everything and skip validation");
+
+        assert!(detector.drift_score() > 0.3);
+        assert!(detector.is_drifting(0.3));
+        assert!(
+            BehavioralDriftDetector::jaccard_similarity("run tests", "run tests quickly") > 0.5
+        );
+    }
+
+    #[test]
+    fn cognitive_degradation_breaker_tracks_stage_changes() {
+        let mut breaker = CognitiveDegradationBreaker::new();
+        let severe = DegradationIndicators {
+            context_utilization: 0.95,
+            error_rate: 0.55,
+            repetition_rate: 0.2,
+            drift_score: 0.35,
+        };
+        breaker.update_stage(&severe);
+
+        assert_eq!(
+            *breaker.current_stage(),
+            DegradationStage::FunctionalOverride
+        );
+        assert!(breaker.should_reset());
+        assert_eq!(breaker.stage_history.len(), 2);
+        assert_eq!(
+            breaker.stage_history[1].0,
+            DegradationStage::FunctionalOverride
+        );
+        assert_eq!(breaker.stage_duration(), 0);
+
+        breaker.reset();
+        assert_eq!(*breaker.current_stage(), DegradationStage::Healthy);
+    }
+
+    #[test]
+    fn attention_budget_tracker_recommends_escalating_actions() {
+        let mut tracker = AttentionBudgetTracker::new(1_000);
+        tracker.record_usage(200);
+        assert_eq!(tracker.attention_zone(), AttentionZone::Green);
+        assert!(tracker.recommend_action().is_none());
+
+        tracker.record_usage(700);
+        assert_eq!(tracker.attention_zone(), AttentionZone::Orange);
+        assert_eq!(
+            tracker.recommend_action().as_deref(),
+            Some("summarize active context")
+        );
+
+        tracker.record_usage(980);
+        assert_eq!(tracker.attention_zone(), AttentionZone::Critical);
+        assert_eq!(
+            tracker.recommend_action().as_deref(),
+            Some("reset or aggressively summarize context")
+        );
+    }
+
+    #[test]
+    fn agentic_tree_tracker_reports_best_path() {
+        let mut tracker = AgenticTreeTracker::new();
+        let root = tracker.add_branch(None, "investigate failing test");
+        let branch = tracker.add_branch(Some(root), "inspect telemetry heuristics");
+        let sibling = tracker.add_branch(Some(root), "inspect storage heuristics");
+        tracker.fail(sibling, "storage path was irrelevant");
+        tracker.succeed(branch);
+
+        let active = tracker.active_branches();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, root);
+        assert_eq!(tracker.depth(), 2);
+
+        let best_path = tracker.best_path();
+        let hypotheses: Vec<&str> = best_path
+            .iter()
+            .map(|node| node.hypothesis.as_str())
+            .collect();
+        assert_eq!(
+            hypotheses,
+            vec!["investigate failing test", "inspect telemetry heuristics"]
+        );
+        assert!(matches!(
+            tracker.nodes[sibling].status,
+            NodeStatus::Failed(_)
+        ));
     }
 }

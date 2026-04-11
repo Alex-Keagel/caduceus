@@ -820,6 +820,154 @@ fn cidr_contains(cidr: &str, addr: &str) -> bool {
     }
 }
 
+// ── Feature #95: E2B Snapshot / Restore ───────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct E2bSnapshot {
+    pub id: String,
+    pub instance_id: String,
+    pub timestamp: u64,
+    pub metadata: HashMap<String, String>,
+}
+
+pub struct E2bSnapshotManager {
+    snapshots: HashMap<String, E2bSnapshot>,
+}
+
+impl E2bSnapshotManager {
+    pub fn new() -> Self {
+        Self {
+            snapshots: HashMap::new(),
+        }
+    }
+
+    pub fn create_snapshot(
+        &mut self,
+        instance_id: &str,
+        metadata: HashMap<String, String>,
+    ) -> String {
+        let id = format!(
+            "snap-{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let snap = E2bSnapshot {
+            id: id.clone(),
+            instance_id: instance_id.to_string(),
+            timestamp,
+            metadata,
+        };
+        self.snapshots.insert(id.clone(), snap);
+        id
+    }
+
+    pub fn restore_snapshot(&self, snapshot_id: &str) -> Result<String> {
+        self.snapshots
+            .get(snapshot_id)
+            .map(|s| s.instance_id.clone())
+            .ok_or_else(|| CaduceusError::Storage(format!("snapshot not found: {}", snapshot_id)))
+    }
+
+    pub fn list_snapshots(&self) -> Vec<&E2bSnapshot> {
+        self.snapshots.values().collect()
+    }
+
+    pub fn delete_snapshot(&mut self, id: &str) -> Result<()> {
+        if self.snapshots.remove(id).is_some() {
+            Ok(())
+        } else {
+            Err(CaduceusError::Storage(format!(
+                "snapshot not found: {}",
+                id
+            )))
+        }
+    }
+}
+
+impl Default for E2bSnapshotManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Feature #189: Chaos Engineering ───────────────────────────────────────────
+
+fn chaos_fnv1a(s: &str) -> u64 {
+    let mut hash: u64 = 14695981039346656037;
+    for byte in s.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    hash
+}
+
+#[derive(Debug, Clone)]
+pub enum FaultType {
+    Latency(u64),
+    Error(String),
+    Timeout,
+    PartialResult(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ChaosRule {
+    pub name: String,
+    pub target: String,
+    pub fault_type: FaultType,
+    pub probability: f64,
+}
+
+pub struct ChaosEngine {
+    pub enabled: bool,
+    faults: Vec<ChaosRule>,
+}
+
+impl ChaosEngine {
+    pub fn new() -> Self {
+        Self {
+            enabled: false,
+            faults: Vec::new(),
+        }
+    }
+
+    pub fn add_rule(&mut self, rule: ChaosRule) {
+        self.faults.push(rule);
+    }
+
+    /// Deterministic check: uses FNV-1a hash of `target` mapped to [0,1) to decide injection.
+    pub fn should_inject(&self, target: &str) -> Option<&FaultType> {
+        if !self.enabled {
+            return None;
+        }
+        let hash_val = chaos_fnv1a(target);
+        let ratio = (hash_val % 1000) as f64 / 1000.0;
+        self.faults
+            .iter()
+            .find(|r| r.target == target && ratio < r.probability)
+            .map(|r| &r.fault_type)
+    }
+
+    pub fn remove_rule(&mut self, name: &str) {
+        self.faults.retain(|r| r.name != name);
+    }
+
+    pub fn list_rules(&self) -> &[ChaosRule] {
+        &self.faults
+    }
+}
+
+impl Default for ChaosEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1383,5 +1531,146 @@ mod tests {
     fn cidr_contains_slash_32_exact_match() {
         assert!(cidr_contains("10.0.0.1/32", "10.0.0.1"));
         assert!(!cidr_contains("10.0.0.1/32", "10.0.0.2"));
+    }
+
+    // ── Feature #95: E2B Snapshot / Restore tests ──────────────────────────────
+
+    #[test]
+    fn e2b_snapshot_create_and_restore() {
+        let mut mgr = E2bSnapshotManager::new();
+        let snap_id = mgr.create_snapshot("inst-001", HashMap::new());
+        assert!(snap_id.starts_with("snap-"));
+        let instance = mgr.restore_snapshot(&snap_id).unwrap();
+        assert_eq!(instance, "inst-001");
+    }
+
+    #[test]
+    fn e2b_snapshot_restore_missing_errors() {
+        let mgr = E2bSnapshotManager::new();
+        assert!(mgr.restore_snapshot("nonexistent").is_err());
+    }
+
+    #[test]
+    fn e2b_snapshot_list_snapshots() {
+        let mut mgr = E2bSnapshotManager::new();
+        mgr.create_snapshot("inst-a", HashMap::new());
+        mgr.create_snapshot("inst-b", HashMap::new());
+        assert_eq!(mgr.list_snapshots().len(), 2);
+    }
+
+    #[test]
+    fn e2b_snapshot_delete() {
+        let mut mgr = E2bSnapshotManager::new();
+        let id = mgr.create_snapshot("inst-x", HashMap::new());
+        mgr.delete_snapshot(&id).unwrap();
+        assert!(mgr.restore_snapshot(&id).is_err());
+    }
+
+    #[test]
+    fn e2b_snapshot_delete_missing_errors() {
+        let mut mgr = E2bSnapshotManager::new();
+        assert!(mgr.delete_snapshot("ghost").is_err());
+    }
+
+    #[test]
+    fn e2b_snapshot_metadata_stored() {
+        let mut mgr = E2bSnapshotManager::new();
+        let mut meta = HashMap::new();
+        meta.insert("env".to_string(), "prod".to_string());
+        let id = mgr.create_snapshot("inst-m", meta);
+        let snap = mgr
+            .list_snapshots()
+            .into_iter()
+            .find(|s| s.id == id)
+            .unwrap();
+        assert_eq!(snap.metadata.get("env").unwrap(), "prod");
+    }
+
+    // ── Feature #189: Chaos Engineering tests ──────────────────────────────────
+
+    #[test]
+    fn chaos_engine_disabled_never_injects() {
+        let mut engine = ChaosEngine::new();
+        engine.add_rule(ChaosRule {
+            name: "always".to_string(),
+            target: "svc".to_string(),
+            fault_type: FaultType::Timeout,
+            probability: 1.0,
+        });
+        // engine.enabled == false by default
+        assert!(engine.should_inject("svc").is_none());
+    }
+
+    #[test]
+    fn chaos_engine_probability_zero_never_injects() {
+        let mut engine = ChaosEngine::new();
+        engine.enabled = true;
+        engine.add_rule(ChaosRule {
+            name: "never".to_string(),
+            target: "db".to_string(),
+            fault_type: FaultType::Timeout,
+            probability: 0.0,
+        });
+        assert!(engine.should_inject("db").is_none());
+    }
+
+    #[test]
+    fn chaos_engine_probability_one_always_injects() {
+        let mut engine = ChaosEngine::new();
+        engine.enabled = true;
+        engine.add_rule(ChaosRule {
+            name: "always".to_string(),
+            target: "cache".to_string(),
+            fault_type: FaultType::Latency(500),
+            probability: 1.0,
+        });
+        assert!(engine.should_inject("cache").is_some());
+    }
+
+    #[test]
+    fn chaos_engine_inject_returns_fault_type() {
+        let mut engine = ChaosEngine::new();
+        engine.enabled = true;
+        engine.add_rule(ChaosRule {
+            name: "err-rule".to_string(),
+            target: "api".to_string(),
+            fault_type: FaultType::Error("service unavailable".to_string()),
+            probability: 1.0,
+        });
+        let fault = engine.should_inject("api").unwrap();
+        assert!(matches!(fault, FaultType::Error(_)));
+    }
+
+    #[test]
+    fn chaos_engine_remove_rule() {
+        let mut engine = ChaosEngine::new();
+        engine.enabled = true;
+        engine.add_rule(ChaosRule {
+            name: "r1".to_string(),
+            target: "svc".to_string(),
+            fault_type: FaultType::Timeout,
+            probability: 1.0,
+        });
+        engine.remove_rule("r1");
+        assert!(engine.should_inject("svc").is_none());
+        assert!(engine.list_rules().is_empty());
+    }
+
+    #[test]
+    fn chaos_engine_list_rules() {
+        let mut engine = ChaosEngine::new();
+        engine.add_rule(ChaosRule {
+            name: "a".to_string(),
+            target: "x".to_string(),
+            fault_type: FaultType::Timeout,
+            probability: 0.5,
+        });
+        engine.add_rule(ChaosRule {
+            name: "b".to_string(),
+            target: "y".to_string(),
+            fault_type: FaultType::Timeout,
+            probability: 0.5,
+        });
+        assert_eq!(engine.list_rules().len(), 2);
     }
 }
