@@ -653,6 +653,272 @@ impl Default for SandboxManager {
     }
 }
 
+// ── Bash validation pipeline ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ValidationLevel {
+    Safe,
+    Caution,
+    Dangerous,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationResult {
+    pub level: ValidationLevel,
+    pub warnings: Vec<String>,
+}
+
+pub struct BashValidator;
+
+impl BashValidator {
+    pub fn validate(command: &str) -> ValidationResult {
+        let mut warnings = Vec::new();
+        let mut level = ValidationLevel::Safe;
+
+        let dangerous_patterns: &[(&str, &str)] = &[
+            ("rm -rf", "Recursive force remove detected"),
+            ("rm -r", "Recursive remove detected"),
+            ("dd if=", "Disk dump (dd) command detected"),
+            ("mkfs", "Filesystem format (mkfs) command detected"),
+            (
+                "chmod 777",
+                "World-writable permissions (chmod 777) detected",
+            ),
+        ];
+
+        for (pattern, warning) in dangerous_patterns {
+            if command.contains(pattern) {
+                level = ValidationLevel::Dangerous;
+                warnings.push(warning.to_string());
+            }
+        }
+
+        // Check sudo/su separately to handle word boundaries
+        if command.starts_with("sudo ")
+            || command.contains(" sudo ")
+            || command.starts_with("sudo\t")
+        {
+            level = ValidationLevel::Dangerous;
+            warnings.push("Privilege escalation (sudo) detected".to_string());
+        }
+        if command.starts_with("su ") || command.contains(" su ") || command.starts_with("su\t") {
+            level = ValidationLevel::Dangerous;
+            warnings.push("Privilege escalation (su) detected".to_string());
+        }
+
+        // curl/wget exfiltration
+        if (command.contains("curl -X POST") || command.contains("curl --data"))
+            && !command.contains("localhost")
+            && !command.contains("127.0.0.1")
+        {
+            level = ValidationLevel::Dangerous;
+            warnings.push("Potential data exfiltration via curl POST detected".to_string());
+        }
+        if command.contains("wget ") && command.contains("--post") {
+            level = ValidationLevel::Dangerous;
+            warnings.push("Potential data exfiltration via wget POST detected".to_string());
+        }
+
+        if level == ValidationLevel::Dangerous {
+            return ValidationResult { level, warnings };
+        }
+
+        // Caution patterns
+        if command.contains("rm ") && !command.contains("rm -rf") && !command.contains("rm -r") {
+            level = ValidationLevel::Caution;
+            warnings.push("File removal (rm) detected".to_string());
+        }
+        if command.contains("chmod") && !command.contains("chmod 777") {
+            level = ValidationLevel::Caution;
+            warnings.push("Permission change (chmod) detected".to_string());
+        }
+        if command.contains("chown") {
+            level = ValidationLevel::Caution;
+            warnings.push("Ownership change (chown) detected".to_string());
+        }
+        if command.contains('>') {
+            level = ValidationLevel::Caution;
+            warnings.push("Output redirection detected".to_string());
+        }
+        if command.contains("curl") && level != ValidationLevel::Dangerous {
+            level = ValidationLevel::Caution;
+            warnings.push("Network access (curl) detected".to_string());
+        }
+        if command.contains("wget") && level != ValidationLevel::Dangerous {
+            level = ValidationLevel::Caution;
+            warnings.push("Network access (wget) detected".to_string());
+        }
+
+        ValidationResult { level, warnings }
+    }
+}
+
+// ── Container-first sandbox ──────────────────────────────────────────────────
+
+pub struct ContainerSandboxProvider {
+    image: String,
+}
+
+impl ContainerSandboxProvider {
+    pub fn new(image: impl Into<String>) -> Self {
+        Self {
+            image: image.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl SandboxProvider for ContainerSandboxProvider {
+    async fn create(&self, config: SandboxConfig) -> Result<Box<dyn Sandbox>> {
+        Ok(Box::new(
+            ContainerSandbox::new(self.image.clone(), config).await?,
+        ))
+    }
+}
+
+pub struct ContainerSandbox {
+    id: String,
+    image: String,
+    workspace_root: PathBuf,
+    destroyed: AtomicBool,
+}
+
+impl ContainerSandbox {
+    pub async fn new(image: String, _config: SandboxConfig) -> Result<Self> {
+        let id = format!(
+            "container-{}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            LOCAL_SANDBOX_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let workspace_root = std::env::temp_dir().join(format!("caduceus-container-{id}"));
+        tokio::fs::create_dir_all(&workspace_root).await?;
+
+        Ok(Self {
+            id,
+            image,
+            workspace_root,
+            destroyed: AtomicBool::new(false),
+        })
+    }
+
+    fn ensure_active(&self) -> Result<()> {
+        if self.destroyed.load(Ordering::SeqCst) {
+            return Err(CaduceusError::Tool {
+                tool: "sandbox".into(),
+                message: "container sandbox is destroyed".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn resolve_path(&self, path: &str) -> Result<PathBuf> {
+        let raw = Path::new(path);
+        let relative = if raw.is_absolute() {
+            PathBuf::from(path.trim_start_matches('/'))
+        } else {
+            PathBuf::from(path)
+        };
+
+        for component in relative.components() {
+            if matches!(component, Component::ParentDir) {
+                return Err(CaduceusError::PermissionDenied {
+                    capability: "fs".into(),
+                    tool: "path escapes container workspace".into(),
+                });
+            }
+        }
+
+        Ok(self.workspace_root.join(relative))
+    }
+}
+
+#[async_trait]
+impl Sandbox for ContainerSandbox {
+    async fn exec(&self, command: &str, timeout_secs: u64) -> Result<ExecResult> {
+        self.ensure_active()?;
+
+        let workspace = self.workspace_root.to_string_lossy().to_string();
+        let mut cmd = Command::new("docker");
+        cmd.args([
+            "run",
+            "--rm",
+            "-v",
+            &format!("{workspace}:/workspace"),
+            "-w",
+            "/workspace",
+            &self.image,
+            "bash",
+            "-c",
+            command,
+        ])
+        .kill_on_drop(true);
+
+        match timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
+            Ok(Ok(output)) => Ok(ExecResult {
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                exit_code: output.status.code().unwrap_or(-1),
+                timed_out: false,
+            }),
+            Ok(Err(e)) => Err(CaduceusError::Io(e)),
+            Err(_) => Ok(ExecResult {
+                stdout: String::new(),
+                stderr: format!("Command timed out after {timeout_secs}s"),
+                exit_code: -1,
+                timed_out: true,
+            }),
+        }
+    }
+
+    async fn write_file(&self, path: &str, content: &str) -> Result<()> {
+        self.ensure_active()?;
+        let resolved = self.resolve_path(path)?;
+        if let Some(parent) = resolved.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(resolved, content).await?;
+        Ok(())
+    }
+
+    async fn read_file(&self, path: &str) -> Result<String> {
+        self.ensure_active()?;
+        let resolved = self.resolve_path(path)?;
+        Ok(tokio::fs::read_to_string(resolved).await?)
+    }
+
+    async fn list_files(&self, path: &str) -> Result<Vec<String>> {
+        self.ensure_active()?;
+        let resolved = self.resolve_path(path)?;
+        let mut entries = Vec::new();
+        let mut read_dir = tokio::fs::read_dir(resolved).await?;
+        while let Some(entry) = read_dir.next_entry().await? {
+            if let Some(name) = entry.file_name().to_str() {
+                entries.push(name.to_string());
+            }
+        }
+        entries.sort();
+        Ok(entries)
+    }
+
+    async fn destroy(&self) -> Result<()> {
+        if self.destroyed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        match tokio::fs::remove_dir_all(&self.workspace_root).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(CaduceusError::Io(e)),
+        }
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,5 +980,43 @@ mod tests {
 
         assert_eq!(first.id(), second.id());
         manager.destroy_all().await.unwrap();
+    }
+
+    // ── BashValidator tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_bash_validator_safe() {
+        let result = BashValidator::validate("echo hello");
+        assert_eq!(result.level, ValidationLevel::Safe);
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_bash_validator_dangerous_rm_rf() {
+        let result = BashValidator::validate("rm -rf /");
+        assert_eq!(result.level, ValidationLevel::Dangerous);
+        assert!(!result.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_bash_validator_dangerous_sudo() {
+        let result = BashValidator::validate("sudo apt-get install something");
+        assert_eq!(result.level, ValidationLevel::Dangerous);
+        assert!(result.warnings.iter().any(|w| w.contains("sudo")));
+    }
+
+    #[test]
+    fn test_bash_validator_caution_curl() {
+        let result = BashValidator::validate("curl https://example.com/file");
+        assert_eq!(result.level, ValidationLevel::Caution);
+        assert!(result.warnings.iter().any(|w| w.contains("curl")));
+    }
+
+    // ── ContainerSandbox tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_container_sandbox_provider_construction() {
+        let provider = ContainerSandboxProvider::new("ubuntu:22.04");
+        assert_eq!(provider.image, "ubuntu:22.04");
     }
 }

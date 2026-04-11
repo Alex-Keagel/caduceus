@@ -222,6 +222,7 @@ pub enum SlashCommand {
     Provider(String),
     Status,
     Compact,
+    Init,
     Marketplace,
     Install(String),
     Recommend,
@@ -231,10 +232,12 @@ pub enum SlashCommand {
     Skills,
     Effort(String),
     Config(String),
+    Export(String),
     Mode(String),
     Checkpoint(CheckpointCommand),
     Kanban(KanbanCommand),
     Review,
+    Fork,
     Telemetry,
     Exit,
     Unknown(String),
@@ -253,6 +256,7 @@ impl SlashCommand {
             "clear" => Self::Clear,
             "status" => Self::Status,
             "compact" => Self::Compact,
+            "init" => Self::Init,
             "marketplace" => Self::Marketplace,
             "install" => Self::Install(args.to_string()),
             "recommend" => Self::Recommend,
@@ -303,7 +307,9 @@ impl SlashCommand {
             "provider" => Self::Provider(args.to_string()),
             "effort" => Self::Effort(args.to_string()),
             "config" => Self::Config(args.to_string()),
+            "export" => Self::Export(args.to_string()),
             "mode" => Self::Mode(args.to_string()),
+            "fork" => Self::Fork,
             other => Self::Unknown(other.to_string()),
         };
         Some(cmd)
@@ -319,6 +325,7 @@ impl SlashCommand {
             Self::Provider(provider) => format!("Switch active provider to {provider}"),
             Self::Status => "Show current session status".to_string(),
             Self::Compact => "Compact the current conversation".to_string(),
+            Self::Init => "Initialize Caduceus in the current project".to_string(),
             Self::Marketplace => "Opens marketplace panel".to_string(),
             Self::Install(name) if name.is_empty() => {
                 "Install a skill/agent/plugin by name".to_string()
@@ -334,10 +341,18 @@ impl SlashCommand {
                 "Set effort level (min/low/medium/high/max)".to_string()
             }
             Self::Effort(level) => format!("Set effort level to {level}"),
-            Self::Config(args) if args.is_empty() => {
-                "Set query config (model=X temp=0.5 tokens=8192)".to_string()
+            Self::Config(args) if args.is_empty() => "Show current configuration".to_string(),
+            Self::Config(args) if args.starts_with("set ") => {
+                format!(
+                    "Set configuration value: {}",
+                    args.trim_start_matches("set ").trim()
+                )
             }
-            Self::Config(args) => format!("Set query config: {args}"),
+            Self::Config(args) => format!("Inspect or update config: {args}"),
+            Self::Export(args) if args.is_empty() => {
+                "Export current session as JSON and Markdown".to_string()
+            }
+            Self::Export(args) => format!("Export current session: {args}"),
             Self::Mode(mode) if mode.is_empty() => {
                 "Set agent mode (plan/act/research/autopilot/architect/debug/review)".to_string()
             }
@@ -361,6 +376,7 @@ impl SlashCommand {
             }
             Self::Exit => "Exit the current session".to_string(),
             Self::Review => "Run BugBot on current git diff".to_string(),
+            Self::Fork => "Fork the current session into a new branch".to_string(),
             Self::Telemetry => "Show current session telemetry metrics".to_string(),
             Self::Unknown(command) => format!("Unknown slash command: {command}"),
         }
@@ -818,6 +834,8 @@ impl AgentHarness {
                 max_tokens: self.effective_max_tokens(),
                 temperature: self.effective_temperature(),
                 thinking_mode: false,
+                tool_choice: None,
+                response_format: None,
             };
 
             // Apply thinking mode: prepend chain-of-thought instruction
@@ -919,6 +937,10 @@ mod tests {
             Some(SlashCommand::Status)
         ));
         assert!(matches!(
+            SlashCommand::parse("/init"),
+            Some(SlashCommand::Init)
+        ));
+        assert!(matches!(
             SlashCommand::parse("/model gpt-4"),
             Some(SlashCommand::Model(_))
         ));
@@ -962,6 +984,14 @@ mod tests {
             SlashCommand::parse("/kanban add Implement board"),
             Some(SlashCommand::Kanban(KanbanCommand::Add(ref title))) if title == "Implement board"
         ));
+        assert!(matches!(
+            SlashCommand::parse("/export markdown notes/session.md"),
+            Some(SlashCommand::Export(ref args)) if args == "markdown notes/session.md"
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/fork"),
+            Some(SlashCommand::Fork)
+        ));
         assert!(SlashCommand::parse("hello").is_none());
     }
 
@@ -990,12 +1020,20 @@ mod tests {
         assert_eq!(SlashCommand::Skills.description(), "List available skills");
         assert_eq!(SlashCommand::Agents.description(), "List available agents");
         assert_eq!(
+            SlashCommand::Init.description(),
+            "Initialize Caduceus in the current project"
+        );
+        assert_eq!(
             SlashCommand::Checkpoint(CheckpointCommand::List).description(),
             "List session checkpoints"
         );
         assert_eq!(
             SlashCommand::Kanban(KanbanCommand::Add("Write tests".to_string())).description(),
             "Add kanban card to backlog: Write tests"
+        );
+        assert_eq!(
+            SlashCommand::Fork.description(),
+            "Fork the current session into a new branch"
         );
     }
 
@@ -1458,6 +1496,22 @@ mod tests {
         assert!(matches!(
             SlashCommand::parse("/config model=gpt-4 temp=0.5"),
             Some(SlashCommand::Config(ref args)) if args == "model=gpt-4 temp=0.5"
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/config set default_model gpt-5.4"),
+            Some(SlashCommand::Config(ref args)) if args == "set default_model gpt-5.4"
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/config"),
+            Some(SlashCommand::Config(ref args)) if args.is_empty()
+        ));
+    }
+
+    #[test]
+    fn slash_command_export_default() {
+        assert!(matches!(
+            SlashCommand::parse("/export"),
+            Some(SlashCommand::Export(ref args)) if args.is_empty()
         ));
     }
 

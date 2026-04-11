@@ -241,19 +241,29 @@ impl BashSandbox {
 
 pub struct FileOps {
     workspace_root: PathBuf,
+    ignore_filter: IgnoreFilter,
 }
 
 impl FileOps {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
         let root: PathBuf = workspace_root.into();
         let canonical_root = root.canonicalize().unwrap_or(root);
+        let ignore_filter = IgnoreFilter::load(&canonical_root);
         Self {
             workspace_root: canonical_root,
+            ignore_filter,
         }
     }
 
     fn resolve_path(&self, path: &str) -> Result<PathBuf> {
-        resolve_workspace_path(&self.workspace_root, Path::new(path))
+        let resolved = resolve_workspace_path(&self.workspace_root, Path::new(path))?;
+        if self.ignore_filter.is_ignored(&resolved) {
+            return Err(CaduceusError::PermissionDenied {
+                capability: "fs".into(),
+                tool: format!("Path is ignored by .caduceusignore: {}", resolved.display()),
+            });
+        }
+        Ok(resolved)
     }
 
     pub async fn read(&self, path: &str) -> Result<String> {
@@ -331,6 +341,9 @@ impl FileOps {
             .await
             .map_err(CaduceusError::Io)?;
         while let Some(entry) = read_dir.next_entry().await.map_err(CaduceusError::Io)? {
+            if self.ignore_filter.is_ignored(&entry.path()) {
+                continue;
+            }
             if let Some(name) = entry.file_name().to_str() {
                 let file_type = entry.file_type().await.map_err(CaduceusError::Io)?;
                 let suffix = if file_type.is_dir() { "/" } else { "" };
@@ -346,6 +359,7 @@ impl FileOps {
         let full_pattern = self.workspace_root.join(pattern);
         let pattern_str = full_pattern.to_string_lossy().to_string();
         let root = self.workspace_root.clone();
+        let ignore_filter = self.ignore_filter.clone();
 
         tokio::task::spawn_blocking(move || {
             let mut results = Vec::new();
@@ -354,6 +368,9 @@ impl FileOps {
                 message: format!("Invalid glob pattern: {e}"),
             })?;
             for entry in entries.flatten() {
+                if ignore_filter.is_ignored(&entry) {
+                    continue;
+                }
                 if let Ok(rel) = entry.strip_prefix(&root) {
                     results.push(rel.to_string_lossy().to_string());
                 }
@@ -375,6 +392,7 @@ impl FileOps {
         max_results: usize,
     ) -> Result<Vec<String>> {
         let root = self.workspace_root.clone();
+        let ignore_filter = self.ignore_filter.clone();
         let pattern = pattern.to_string();
         let file_glob = file_glob.map(|s| s.to_string());
         let max = max_results;
@@ -401,6 +419,9 @@ impl FileOps {
                 if !entry.is_file() {
                     continue;
                 }
+                if ignore_filter.is_ignored(&entry) {
+                    continue;
+                }
                 if let Ok(content) = std::fs::read_to_string(&entry) {
                     for (line_no, line) in content.lines().enumerate() {
                         if re.is_match(line) {
@@ -423,6 +444,48 @@ impl FileOps {
             tool: "runtime".into(),
             message: format!("Grep task failed: {e}"),
         })?
+    }
+}
+
+// ── Ignore filter (.caduceusignore) ────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct IgnoreFilter {
+    root: PathBuf,
+    patterns: Vec<glob::Pattern>,
+}
+
+impl IgnoreFilter {
+    pub fn load(workspace_root: &Path) -> Self {
+        let ignore_path = workspace_root.join(".caduceusignore");
+        let patterns = if ignore_path.exists() {
+            std::fs::read_to_string(&ignore_path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+                .filter_map(|line| glob::Pattern::new(line.trim()).ok())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            root: workspace_root.to_path_buf(),
+            patterns,
+        }
+    }
+
+    pub fn is_ignored(&self, path: &Path) -> bool {
+        let relative = path.strip_prefix(&self.root).unwrap_or(path);
+        let path_str = relative.to_string_lossy();
+        self.patterns.iter().any(|pattern| {
+            pattern.matches(&path_str) || pattern.matches(path_str.trim_start_matches('/'))
+        })
+    }
+}
+
+impl Default for IgnoreFilter {
+    fn default() -> Self {
+        Self::load(Path::new("."))
     }
 }
 
@@ -635,6 +698,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_ops_respects_caduceusignore_for_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".caduceusignore"), "secret.txt\n").unwrap();
+        std::fs::write(dir.path().join("secret.txt"), "top secret").unwrap();
+
+        let ops = FileOps::new(dir.path());
+        let result = ops.read("secret.txt").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn file_ops_respects_caduceusignore_for_listing_and_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".caduceusignore"), "private/*.txt\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("private")).unwrap();
+        std::fs::write(dir.path().join("private/hidden.txt"), "secret").unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "public").unwrap();
+
+        let ops = FileOps::new(dir.path());
+        let listing = ops.list_dir(".").await.unwrap();
+        assert!(listing.contains(&"visible.txt".to_string()));
+
+        let matches = ops.glob_search("**/*.txt").await.unwrap();
+        assert!(matches.iter().any(|path| path == "visible.txt"));
+        assert!(!matches.iter().any(|path| path.contains("hidden.txt")));
+    }
+
+    #[tokio::test]
     async fn file_watcher_detects_create() {
         let dir = tempfile::tempdir().unwrap();
         let mut watcher = FileWatcher::new(dir.path()).unwrap();
@@ -650,5 +741,29 @@ mod tests {
         assert!(event.is_ok(), "Should receive a file event");
         let event = event.unwrap();
         assert!(event.is_some(), "Event should not be None");
+    }
+
+    // ── IgnoreFilter tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_caduceus_ignore_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".caduceusignore"),
+            "*.log\nsecret/*\n# comment\n\n",
+        )
+        .unwrap();
+
+        let filter = IgnoreFilter::load(dir.path());
+        assert!(filter.is_ignored(Path::new("debug.log")));
+        assert!(filter.is_ignored(Path::new("secret/key.pem")));
+        assert!(!filter.is_ignored(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn test_caduceus_ignore_filter_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let filter = IgnoreFilter::load(dir.path());
+        assert!(!filter.is_ignored(Path::new("anything.txt")));
     }
 }

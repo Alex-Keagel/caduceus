@@ -5,7 +5,7 @@ use caduceus_core::{
 };
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
 
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 const BOOTSTRAP_SCHEMA_VERSION: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -109,6 +109,17 @@ const MIGRATIONS: [&str; CURRENT_SCHEMA_VERSION as usize] = [
 
     CREATE INDEX IF NOT EXISTS idx_memory_scope_key ON memory(scope, key);
     "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS session_trace (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        event_data TEXT NOT NULL,
+        duration_ms INTEGER,
+        timestamp TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_session_trace_session_id ON session_trace(session_id, id);
+    "#,
 ];
 
 #[derive(Debug, Clone)]
@@ -169,6 +180,33 @@ pub struct MemoryRecord {
     pub source: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+// ── Structured memory bank constants ─────────────────────────────────────────
+
+pub const MEMORY_KEY_PROJECT_BRIEF: &str = "project_brief";
+pub const MEMORY_KEY_ACTIVE_CONTEXT: &str = "active_context";
+pub const MEMORY_KEY_PROGRESS: &str = "progress";
+pub const MEMORY_KEY_DECISIONS: &str = "decisions";
+pub const MEMORY_SCOPE_STRUCTURED: &str = "structured";
+
+// ── Session trace types ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceEvent {
+    pub session_id: String,
+    pub event_type: TraceEventType,
+    pub event_data: serde_json::Value,
+    pub duration_ms: Option<u64>,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceEventType {
+    LlmCall,
+    ToolExec,
+    Permission,
 }
 
 #[derive(Debug)]
@@ -729,6 +767,146 @@ impl SqliteStorage {
             )
             .map_err(storage_error)?;
             Ok(())
+        })
+    }
+
+    // ── Structured memory bank ───────────────────────────────────────────────
+
+    pub async fn set_structured(&self, key: &str, value: serde_json::Value) -> Result<()> {
+        let serialized = serde_json::to_string(&value)?;
+        self.set_memory(
+            MEMORY_SCOPE_STRUCTURED,
+            key,
+            &serialized,
+            "structured_memory_bank",
+        )
+        .await
+    }
+
+    pub async fn get_structured(&self, key: &str) -> Result<Option<serde_json::Value>> {
+        let record = self.get_memory(MEMORY_SCOPE_STRUCTURED, key).await?;
+        match record {
+            Some(rec) => {
+                let value: serde_json::Value = serde_json::from_str(&rec.value)?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    // ── Session fork ─────────────────────────────────────────────────────────
+
+    pub async fn fork_session(&self, session_id: &SessionId) -> Result<SessionId> {
+        let session_id_str = session_id.to_string();
+        self.with_connection(|conn| {
+            let row = SqliteStorage::load_session_row(conn, session_id)?
+                .ok_or_else(|| CaduceusError::SessionNotFound(session_id.clone()))?;
+
+            let new_id = Uuid::new_v4();
+            let new_id_str = new_id.to_string();
+            let now = Utc::now().to_rfc3339();
+
+            conn.execute(
+                "INSERT INTO sessions (
+                    id, phase, project_root, provider_id, model_id, turn_count, created_at, updated_at,
+                    context_limit, used_input, used_output, reserved_output
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    new_id_str,
+                    "idle",
+                    row.project_root,
+                    row.provider_id,
+                    row.model_id,
+                    0i64,
+                    now,
+                    now,
+                    row.context_limit,
+                    row.used_input,
+                    row.used_output,
+                    row.reserved_output,
+                ],
+            )
+            .map_err(storage_error)?;
+
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, tokens, timestamp)
+                 SELECT ?1, role, content, tokens, timestamp
+                 FROM messages WHERE session_id = ?2 ORDER BY id ASC",
+                params![new_id_str, session_id_str],
+            )
+            .map_err(storage_error)?;
+
+            Ok(SessionId(new_id))
+        })
+    }
+
+    // ── Session trace ────────────────────────────────────────────────────────
+
+    pub async fn record_trace_event(&self, event: &TraceEvent) -> Result<i64> {
+        let timestamp = event.timestamp.to_rfc3339();
+        let event_type = serde_json::to_string(&event.event_type)?;
+        let event_type = event_type.trim_matches('"').to_string();
+        let event_data = serde_json::to_string(&event.event_data)?;
+        let duration_ms = event.duration_ms.map(|d| d as i64);
+        let session_id = event.session_id.clone();
+
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO session_trace (session_id, event_type, event_data, duration_ms, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![session_id, event_type, event_data, duration_ms, timestamp],
+            )
+            .map_err(storage_error)?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    pub async fn list_trace_events(&self, session_id: &str) -> Result<Vec<TraceEvent>> {
+        let session_id = session_id.to_string();
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT session_id, event_type, event_data, duration_ms, timestamp
+                     FROM session_trace
+                     WHERE session_id = ?1
+                     ORDER BY id ASC",
+                )
+                .map_err(storage_error)?;
+
+            let rows = stmt
+                .query_map(params![session_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(storage_error)?;
+
+            let mut events = Vec::new();
+            for row in rows {
+                let (sid, etype, edata, duration_ms, timestamp) = row.map_err(storage_error)?;
+                let event_type = match etype.as_str() {
+                    "llm_call" => TraceEventType::LlmCall,
+                    "tool_exec" => TraceEventType::ToolExec,
+                    "permission" => TraceEventType::Permission,
+                    other => {
+                        return Err(CaduceusError::Storage(format!(
+                            "unknown trace event type `{other}`"
+                        )))
+                    }
+                };
+                events.push(TraceEvent {
+                    session_id: sid,
+                    event_type,
+                    event_data: serde_json::from_str(&edata)?,
+                    duration_ms: duration_ms.map(|d| d as u64),
+                    timestamp: parse_timestamp(&timestamp)?,
+                });
+            }
+            Ok(events)
         })
     }
 
@@ -1540,5 +1718,91 @@ mod tests {
         );
         storage.delete_api_key(&provider).await.unwrap();
         assert!(storage.get_api_key(&provider).await.unwrap().is_none());
+    }
+
+    // ── Feature tests: fork, structured memory, session trace ───────────────
+
+    #[tokio::test]
+    async fn test_fork_session_copies_messages() {
+        let (_dir, storage) = temp_storage();
+        let state = sample_state();
+        storage.create_session(&state).await.unwrap();
+        storage
+            .save_message(&state.id, &LlmMessage::user("hello"), Some(5))
+            .await
+            .unwrap();
+        storage
+            .save_message(&state.id, &LlmMessage::user("world"), Some(3))
+            .await
+            .unwrap();
+
+        let forked_id = storage.fork_session(&state.id).await.unwrap();
+
+        let forked_session = storage.load_session(&forked_id).await.unwrap().unwrap();
+        assert_eq!(forked_session.turn_count, 0);
+        assert!(matches!(forked_session.phase, SessionPhase::Idle));
+
+        let forked_messages = storage.list_messages(&forked_id).await.unwrap();
+        assert_eq!(forked_messages.len(), 2);
+
+        let original_messages = storage.list_messages(&state.id).await.unwrap();
+        assert_eq!(original_messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_structured_memory_roundtrip() {
+        let (_dir, storage) = temp_storage();
+        let data = serde_json::json!({"key": "value", "count": 42});
+        storage
+            .set_structured(MEMORY_KEY_PROJECT_BRIEF, data.clone())
+            .await
+            .unwrap();
+
+        let loaded = storage
+            .get_structured(MEMORY_KEY_PROJECT_BRIEF)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, data);
+
+        assert!(storage
+            .get_structured("nonexistent")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_session_trace_record_and_list() {
+        let (_dir, storage) = temp_storage();
+        let state = sample_state();
+        storage.create_session(&state).await.unwrap();
+
+        let event1 = TraceEvent {
+            session_id: state.id.to_string(),
+            event_type: TraceEventType::LlmCall,
+            event_data: serde_json::json!({"model": "claude"}),
+            duration_ms: Some(150),
+            timestamp: Utc::now(),
+        };
+        let event2 = TraceEvent {
+            session_id: state.id.to_string(),
+            event_type: TraceEventType::ToolExec,
+            event_data: serde_json::json!({"tool": "bash"}),
+            duration_ms: Some(50),
+            timestamp: Utc::now(),
+        };
+
+        storage.record_trace_event(&event1).await.unwrap();
+        storage.record_trace_event(&event2).await.unwrap();
+
+        let events = storage
+            .list_trace_events(&state.id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0].event_type, TraceEventType::LlmCall));
+        assert!(matches!(events[1].event_type, TraceEventType::ToolExec));
+        assert_eq!(events[0].duration_ms, Some(150));
     }
 }
