@@ -14,9 +14,8 @@ import type {
   McpServerInfo,
   KeybindingConfig,
   KeybindingPreset,
+  TranscriptEntry,
 } from "../types";
-
-// ── Session commands ──────────────────────────────────────────────────────────
 
 export async function sessionCreate(
   projectRoot: string,
@@ -36,20 +35,17 @@ export async function sessionDelete(id: string): Promise<void> {
   return invoke("session_delete", { id });
 }
 
-// ── Agent commands ────────────────────────────────────────────────────────────
+export async function sessionMessages(sessionId: string): Promise<TranscriptEntry[]> {
+  return invoke("session_messages", { sessionId });
+}
 
-export async function agentTurn(
-  sessionId: string,
-  userInput: string
-): Promise<AgentTurnResponse> {
+export async function agentTurn(sessionId: string, userInput: string): Promise<AgentTurnResponse> {
   return invoke("agent_turn", { request: { session_id: sessionId, user_input: userInput } });
 }
 
 export async function agentAbort(sessionId: string): Promise<void> {
   return invoke("agent_abort", { sessionId });
 }
-
-// ── Terminal commands ─────────────────────────────────────────────────────────
 
 export async function terminalExec(
   sessionId: string,
@@ -61,8 +57,6 @@ export async function terminalExec(
   });
 }
 
-// ── Project commands ──────────────────────────────────────────────────────────
-
 export async function projectScan(path: string): Promise<ProjectScanResult> {
   return invoke("project_scan", { path });
 }
@@ -70,8 +64,6 @@ export async function projectScan(path: string): Promise<ProjectScanResult> {
 export async function projectOpen(path: string): Promise<void> {
   return invoke("project_open", { path });
 }
-
-// ── Git commands ──────────────────────────────────────────────────────────────
 
 export async function gitStatus(projectRoot: string): Promise<GitStatusEntry[]> {
   return invoke("git_status", { projectRoot });
@@ -84,7 +76,6 @@ export async function gitDiff(projectRoot: string, staged: boolean): Promise<str
 export async function gitCommit(projectRoot: string, message: string): Promise<string> {
   return invoke("git_commit", { projectRoot, message });
 }
-
 
 export async function kanbanLoad(projectRoot: string): Promise<KanbanBoard> {
   return invoke("kanban_load", { projectRoot });
@@ -100,16 +91,11 @@ export async function kanbanAddCard(
   });
 }
 
-// ── Config commands ───────────────────────────────────────────────────────────
-
 export async function configGet(): Promise<CaduceusConfig> {
   return invoke("config_get");
 }
 
-export async function configSetProvider(
-  providerId: string,
-  apiKey: string
-): Promise<void> {
+export async function configSetProvider(providerId: string, apiKey: string): Promise<void> {
   return invoke("config_set_provider", { providerId, apiKey });
 }
 
@@ -124,8 +110,6 @@ export async function keybindingsSet(config: KeybindingConfig): Promise<void> {
 export async function keybindingsPresets(): Promise<KeybindingPreset[]> {
   return invoke("keybindings_presets");
 }
-
-// ── Marketplace commands ──────────────────────────────────────────────────────
 
 export async function marketplaceSearch(query: string): Promise<MarketplaceSearchResult> {
   return invoke("marketplace_search", { query });
@@ -147,38 +131,34 @@ export async function mcpAdd(name: string): Promise<string> {
   return invoke("mcp_add", { name });
 }
 
-// ── PTY commands ──────────────────────────────────────────────────────────────
-
-export async function ptyCreate(sessionId: string): Promise<void> {
-  return invoke("pty_create", { sessionId });
+export async function ptyCreate(cols = 120, rows = 32): Promise<{ pty_id: string }> {
+  return invoke("pty_create", { request: { cols, rows } });
 }
 
-export async function ptyWrite(sessionId: string, data: string): Promise<void> {
-  return invoke("pty_write", { sessionId, data });
+export async function ptyWrite(ptyId: string, data: string): Promise<void> {
+  return invoke("pty_write", { request: { pty_id: ptyId, data } });
 }
 
-export async function ptyResize(sessionId: string, cols: number, rows: number): Promise<void> {
-  return invoke("pty_resize", { sessionId, cols, rows });
+export async function ptyResize(ptyId: string, cols: number, rows: number): Promise<void> {
+  return invoke("pty_resize", { request: { pty_id: ptyId, cols, rows } });
 }
 
-// ── Permission commands ───────────────────────────────────────────────────────
+export async function ptyClose(ptyId: string): Promise<void> {
+  return invoke("pty_close", { request: { pty_id: ptyId } });
+}
 
 export async function permissionRespond(requestId: string, allow: boolean): Promise<void> {
   return invoke("permission_respond", { requestId, allow });
 }
 
-// ── File-level diff ───────────────────────────────────────────────────────────
-
 export async function gitFileDiff(projectRoot: string, filePath: string): Promise<string> {
   return invoke("git_file_diff", { projectRoot, filePath });
 }
 
-// ── Event listeners ───────────────────────────────────────────────────────────
-
 export async function listenPtyData(handler: (payload: PtyDataPayload) => void): Promise<UnlistenFn> {
-  return listen<PtyDataPayload>("pty-data", (event) => handler(event.payload));
+  return listen<PtyDataPayload>("pty:data", (event) => handler(event.payload));
 }
 
 export async function listenAgentEvent(handler: (event: AgentEvent) => void): Promise<UnlistenFn> {
-  return listen<AgentEvent>("agent-event", (event) => handler(event.payload));
+  return listen<AgentEvent>("agent:event", (event) => handler(event.payload));
 }

@@ -1,12 +1,17 @@
-// TypeScript types mirroring caduceus-core Rust types
-
 export type SessionPhase =
   | "Idle"
-  | "Planning"
-  | "Executing"
+  | "Running"
   | "AwaitingPermission"
-  | "Summarizing"
+  | "Cancelling"
+  | "Completed"
   | "Error";
+
+export interface TokenBudget {
+  context_limit: number;
+  used_input: number;
+  used_output: number;
+  reserved_output: number;
+}
 
 export interface SessionInfo {
   id: string;
@@ -15,6 +20,7 @@ export interface SessionInfo {
   message_count: number;
   provider_id: string;
   model_id: string;
+  token_budget: TokenBudget;
 }
 
 export interface TranscriptEntry {
@@ -24,17 +30,9 @@ export interface TranscriptEntry {
   timestamp: string;
 }
 
-export interface TokenBudget {
-  context_limit: number;
-  used_input: number;
-  used_output: number;
-  reserved_output: number;
-}
-
 export interface TokenUsage {
   input_tokens: number;
   output_tokens: number;
-  cached_tokens?: number;
   cache_read_tokens?: number;
   cache_write_tokens?: number;
 }
@@ -111,6 +109,8 @@ export interface AgentTurnResponse {
   content: string;
   input_tokens: number;
   output_tokens: number;
+  warning?: string | null;
+  session?: SessionInfo | null;
 }
 
 export interface TerminalExecResponse {
@@ -121,10 +121,8 @@ export interface TerminalExecResponse {
 
 export interface PermissionRequest {
   id: string;
-  session_id: string;
-  tool_name: string;
+  capability: string;
   description: string;
-  risk_level: "Low" | "Medium" | "High" | "Critical";
 }
 
 export interface ToolCallBlock {
@@ -147,18 +145,23 @@ export interface ChatMessage {
 }
 
 export type AgentEvent =
-  | { kind: "TextDelta"; text: string }
-  | { kind: "ThinkingDelta"; text: string }
-  | { kind: "ToolUseStart"; id: string; name: string }
-  | { kind: "ToolInputDelta"; id: string; partial_json: string }
-  | { kind: "ToolResult"; id: string; content: string; is_error: boolean }
-  | { kind: "PermissionRequest"; request: PermissionRequest }
-  | { kind: "MessageStop"; input_tokens: number; output_tokens: number; cached_tokens: number }
-  | { kind: "PhaseChange"; phase: SessionPhase }
-  | { kind: "Error"; message: string };
+  | { type: "TextDelta"; text: string }
+  | { type: "ToolCallStart"; id: string; name: string }
+  | { type: "ToolCallInput"; id: string; delta: string }
+  | { type: "ToolCallEnd"; id: string }
+  | { type: "ToolResultStart"; id: string; name: string }
+  | { type: "ToolResultEnd"; id: string; content: string; is_error: boolean }
+  | { type: "PermissionRequest"; id: string; capability: string; description: string }
+  | {
+      type: "TurnComplete";
+      stop_reason: "EndTurn" | "ToolUse" | "MaxTokens" | "StopSequence";
+      usage: TokenUsage;
+    }
+  | { type: "SessionPhaseChanged"; phase: SessionPhase }
+  | { type: "Error"; message: string };
 
 export interface PtyDataPayload {
-  session_id: string;
+  pty_id: string;
   data: string;
 }
 
