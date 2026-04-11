@@ -190,3 +190,16 @@ export interface McpServerInfo {
   connected: boolean;
   status: string;
 }
+
+export type KeybindingPreset = "intellij" | "vscode" | "vim" | "emacs" | "custom";
+
+export interface Keybinding {
+  action: string;
+  keys: string;
+  context?: string | null;
+}
+
+export interface KeybindingConfig {
+  preset: KeybindingPreset;
+  overrides: Keybinding[];
+}

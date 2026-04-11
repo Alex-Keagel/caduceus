@@ -12,6 +12,8 @@ import type {
   KanbanBoard,
   MarketplaceSearchResult,
   McpServerInfo,
+  KeybindingConfig,
+  KeybindingPreset,
 } from "../types";
 
 // ── Session commands ──────────────────────────────────────────────────────────
@@ -109,6 +111,18 @@ export async function configSetProvider(
   apiKey: string
 ): Promise<void> {
   return invoke("config_set_provider", { providerId, apiKey });
+}
+
+export async function keybindingsGet(): Promise<KeybindingConfig> {
+  return invoke("keybindings_get");
+}
+
+export async function keybindingsSet(config: KeybindingConfig): Promise<void> {
+  return invoke("keybindings_set", { config });
+}
+
+export async function keybindingsPresets(): Promise<KeybindingPreset[]> {
+  return invoke("keybindings_presets");
 }
 
 // ── Marketplace commands ──────────────────────────────────────────────────────
