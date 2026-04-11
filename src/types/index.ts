@@ -123,3 +123,27 @@ export interface TerminalTab {
   id: string;
   title: string;
 }
+
+export type MarketplaceItemKind = "skill" | "agent" | "plugin";
+
+export interface MarketplaceItem {
+  kind: MarketplaceItemKind;
+  name: string;
+  description: string;
+  categories: string[];
+  installed: boolean;
+}
+
+export interface MarketplaceSearchResult {
+  skills: MarketplaceItem[];
+  agents: MarketplaceItem[];
+  plugins: MarketplaceItem[];
+}
+
+export interface McpServerInfo {
+  name: string;
+  description: string;
+  source: string;
+  connected: boolean;
+  status: string;
+}

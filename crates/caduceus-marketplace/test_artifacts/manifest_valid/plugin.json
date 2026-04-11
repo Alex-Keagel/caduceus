@@ -1,0 +1,11 @@
+{
+                "name": "my-plugin",
+                "version": "0.1.0",
+                "description": "A test plugin",
+                "author": "Alice",
+                "categories": ["CodeReview", "Testing"],
+                "commands": ["review"],
+                "hooks": [],
+                "skills": ["code-review"],
+                "agents": []
+            }

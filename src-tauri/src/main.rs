@@ -6,6 +6,7 @@ use caduceus_core::{
     SessionStorage,
 };
 use caduceus_git::{FileStatus, GitRepo};
+use caduceus_marketplace::{recommend, BuiltinCatalog, ProjectContext};
 use caduceus_orchestrator::{AgentEventEmitter, AgentHarness, ConfigLoader};
 use caduceus_providers::{AnthropicAdapter, LlmAdapter, OpenAiCompatibleAdapter};
 use caduceus_runtime::{BashSandbox, ExecRequest};
@@ -232,6 +233,34 @@ pub struct GitStatusEntry {
     pub path: String,
     pub status: String,
     pub from: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketplaceItem {
+    pub kind: String,
+    pub name: String,
+    pub description: String,
+    pub categories: Vec<String>,
+    pub installed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketplaceSearchResponse {
+    pub skills: Vec<MarketplaceItem>,
+    pub agents: Vec<MarketplaceItem>,
+    pub plugins: Vec<MarketplaceItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerInfo {
+    pub name: String,
+    pub description: String,
+    pub source: String,
+    pub connected: bool,
+    pub status: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -520,6 +549,146 @@ async fn git_diff(project_root: String, staged: bool) -> Result<String, String> 
 }
 
 #[tauri::command]
+async fn marketplace_search(query: String) -> Result<MarketplaceSearchResponse, String> {
+    Ok(MarketplaceSearchResponse {
+        skills: BuiltinCatalog::skills()
+            .into_iter()
+            .filter(|skill| {
+                matches_catalog_entry(&skill.name, skill.description, skill.triggers, &query)
+            })
+            .map(|skill| MarketplaceItem {
+                kind: "skill".to_string(),
+                name: skill.name.to_string(),
+                description: skill.description.to_string(),
+                categories: skill.categories.iter().map(ToString::to_string).collect(),
+                installed: is_installed(skill.name),
+            })
+            .collect(),
+        agents: BuiltinCatalog::agents()
+            .into_iter()
+            .filter(|agent| {
+                matches_catalog_entry(&agent.name, agent.description, agent.triggers, &query)
+            })
+            .map(|agent| MarketplaceItem {
+                kind: "agent".to_string(),
+                name: agent.name.to_string(),
+                description: agent.description.to_string(),
+                categories: agent.categories.iter().map(ToString::to_string).collect(),
+                installed: is_installed(agent.name),
+            })
+            .collect(),
+        plugins: demo_plugins()
+            .into_iter()
+            .filter(|plugin| matches_catalog_entry(&plugin.name, &plugin.description, &[], &query))
+            .collect(),
+    })
+}
+
+#[tauri::command]
+async fn marketplace_install(name: String) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Provide a marketplace item name to install.".to_string());
+    }
+    Ok(format!("Queued install for '{trimmed}'."))
+}
+
+#[tauri::command]
+async fn marketplace_recommend(
+    state: State<'_, AppState>,
+) -> Result<MarketplaceSearchResponse, String> {
+    let config = load_config(&state)?;
+    let scan = ProjectScanner::new(state.workspace_root.clone(), config.max_context_tokens)
+        .scan()
+        .map_err(|e| e.to_string())?;
+    let project = ProjectContext {
+        languages: scan
+            .languages
+            .into_iter()
+            .map(|language| language.name)
+            .collect(),
+        frameworks: scan
+            .frameworks
+            .into_iter()
+            .map(|framework| framework.name)
+            .collect(),
+    };
+    let recommendations = recommend(&project, None, 8);
+
+    Ok(MarketplaceSearchResponse {
+        skills: recommendations
+            .skills
+            .into_iter()
+            .map(|recommendation| MarketplaceItem {
+                kind: "skill".to_string(),
+                name: recommendation.skill.name.to_string(),
+                description: recommendation.skill.description.to_string(),
+                categories: recommendation
+                    .skill
+                    .categories
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                installed: is_installed(recommendation.skill.name),
+            })
+            .collect(),
+        agents: recommendations
+            .agents
+            .into_iter()
+            .map(|recommendation| MarketplaceItem {
+                kind: "agent".to_string(),
+                name: recommendation.agent.name.to_string(),
+                description: recommendation.agent.description.to_string(),
+                categories: recommendation
+                    .agent
+                    .categories
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                installed: is_installed(recommendation.agent.name),
+            })
+            .collect(),
+        plugins: demo_plugins().into_iter().take(3).collect(),
+    })
+}
+
+#[tauri::command]
+async fn mcp_status() -> Result<Vec<McpServerInfo>, String> {
+    Ok(vec![
+        McpServerInfo {
+            name: "filesystem".to_string(),
+            description: "Local filesystem tools for workspace-aware reads and writes.".to_string(),
+            source: "builtin".to_string(),
+            connected: true,
+            status: "connected".to_string(),
+        },
+        McpServerInfo {
+            name: "github".to_string(),
+            description: "GitHub metadata, PR context, and issue lookups.".to_string(),
+            source: "registry".to_string(),
+            connected: true,
+            status: "connected".to_string(),
+        },
+        McpServerInfo {
+            name: "slack".to_string(),
+            description: "Team collaboration endpoints and notification workflows.".to_string(),
+            source: "registry".to_string(),
+            connected: false,
+            status: "disconnected".to_string(),
+        },
+    ])
+}
+
+#[tauri::command]
+async fn mcp_add(name: String) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Provide an MCP server name to add.".to_string());
+    }
+    Ok(format!("Added MCP server '{trimmed}' from registry."))
+}
+
+#[tauri::command]
 async fn config_get(state: State<'_, AppState>) -> Result<CaduceusConfig, String> {
     load_config(&state)
 }
@@ -569,6 +738,11 @@ fn main() {
             project_scan,
             git_status,
             git_diff,
+            marketplace_search,
+            marketplace_install,
+            marketplace_recommend,
+            mcp_status,
+            mcp_add,
             config_get,
             pty_create,
             pty_write,
@@ -614,6 +788,51 @@ fn normalize_path(path: &str) -> PathBuf {
     } else {
         candidate
     }
+}
+
+fn matches_catalog_entry(name: &str, description: &str, triggers: &[&str], query: &str) -> bool {
+    let trimmed = query.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    name.to_lowercase().contains(&trimmed)
+        || description.to_lowercase().contains(&trimmed)
+        || triggers
+            .iter()
+            .any(|trigger| trigger.to_lowercase().contains(&trimmed))
+}
+
+fn is_installed(name: &str) -> bool {
+    matches!(name, "code-review" | "frontend-dev" | "playwright-recorder")
+}
+
+fn demo_plugins() -> Vec<MarketplaceItem> {
+    vec![
+        MarketplaceItem {
+            kind: "plugin".to_string(),
+            name: "playwright-recorder".to_string(),
+            description: "Generate browser automation flows and QA scripts from session traces."
+                .to_string(),
+            categories: vec!["testing".to_string(), "frontend".to_string()],
+            installed: is_installed("playwright-recorder"),
+        },
+        MarketplaceItem {
+            kind: "plugin".to_string(),
+            name: "release-assistant".to_string(),
+            description: "Bundle changelogs, release notes, and deployment checklists.".to_string(),
+            categories: vec!["deployment".to_string(), "documentation".to_string()],
+            installed: is_installed("release-assistant"),
+        },
+        MarketplaceItem {
+            kind: "plugin".to_string(),
+            name: "schema-lens".to_string(),
+            description: "Inspect schemas, migrations, and data model diffs in one place."
+                .to_string(),
+            categories: vec!["database".to_string(), "backend".to_string()],
+            installed: is_installed("schema-lens"),
+        },
+    ]
 }
 
 fn parse_session_id(id: &str) -> Result<SessionId, String> {

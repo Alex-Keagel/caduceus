@@ -53,6 +53,11 @@ pub enum SlashCommand {
     Provider(String),
     Status,
     Compact,
+    Marketplace,
+    Install(String),
+    Recommend,
+    McpStatus,
+    McpAdd(String),
     Agents,
     Skills,
     Exit,
@@ -71,6 +76,21 @@ impl SlashCommand {
             "clear" => Self::Clear,
             "status" => Self::Status,
             "compact" => Self::Compact,
+            "marketplace" => Self::Marketplace,
+            "install" => Self::Install(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
+            "recommend" => Self::Recommend,
+            "mcp" => {
+                let subcommand = parts.get(1).map(|s| s.trim()).unwrap_or_default();
+                let subparts: Vec<&str> = subcommand.splitn(2, ' ').collect();
+                match subparts[0] {
+                    "status" => Self::McpStatus,
+                    "add" => {
+                        Self::McpAdd(subparts.get(1).map(|s| s.to_string()).unwrap_or_default())
+                    }
+                    _ if subcommand.is_empty() => Self::Unknown("mcp".to_string()),
+                    _ => Self::Unknown(format!("mcp {}", subcommand)),
+                }
+            }
             "agents" => Self::Agents,
             "skills" => Self::Skills,
             "exit" | "quit" => Self::Exit,
@@ -79,6 +99,32 @@ impl SlashCommand {
             other => Self::Unknown(other.to_string()),
         };
         Some(cmd)
+    }
+
+    pub fn description(&self) -> String {
+        match self {
+            Self::Help => "Show available commands".to_string(),
+            Self::Clear => "Clear current session output".to_string(),
+            Self::Model(model) if model.is_empty() => "Set active model".to_string(),
+            Self::Model(model) => format!("Switch active model to {model}"),
+            Self::Provider(provider) if provider.is_empty() => "Set active provider".to_string(),
+            Self::Provider(provider) => format!("Switch active provider to {provider}"),
+            Self::Status => "Show current session status".to_string(),
+            Self::Compact => "Compact the current conversation".to_string(),
+            Self::Marketplace => "Opens marketplace panel".to_string(),
+            Self::Install(name) if name.is_empty() => {
+                "Install a skill/agent/plugin by name".to_string()
+            }
+            Self::Install(name) => format!("Install a skill/agent/plugin by name: {name}"),
+            Self::Recommend => "Get recommendations for current project".to_string(),
+            Self::McpStatus => "Show connected MCP servers".to_string(),
+            Self::McpAdd(name) if name.is_empty() => "Add MCP server from registry".to_string(),
+            Self::McpAdd(name) => format!("Add MCP server from registry: {name}"),
+            Self::Agents => "List available agents".to_string(),
+            Self::Skills => "List available skills".to_string(),
+            Self::Exit => "Exit the current session".to_string(),
+            Self::Unknown(command) => format!("Unknown slash command: {command}"),
+        }
     }
 }
 
@@ -504,7 +550,53 @@ mod tests {
             SlashCommand::parse("/model gpt-4"),
             Some(SlashCommand::Model(_))
         ));
+        assert!(matches!(
+            SlashCommand::parse("/marketplace"),
+            Some(SlashCommand::Marketplace)
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/install code-review"),
+            Some(SlashCommand::Install(ref name)) if name == "code-review"
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/recommend"),
+            Some(SlashCommand::Recommend)
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/mcp status"),
+            Some(SlashCommand::McpStatus)
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/mcp add github"),
+            Some(SlashCommand::McpAdd(ref name)) if name == "github"
+        ));
         assert!(SlashCommand::parse("hello").is_none());
+    }
+
+    #[test]
+    fn slash_command_description_strings() {
+        assert_eq!(
+            SlashCommand::Marketplace.description(),
+            "Opens marketplace panel"
+        );
+        assert_eq!(
+            SlashCommand::Install("skill-name".to_string()).description(),
+            "Install a skill/agent/plugin by name: skill-name"
+        );
+        assert_eq!(
+            SlashCommand::Recommend.description(),
+            "Get recommendations for current project"
+        );
+        assert_eq!(
+            SlashCommand::McpStatus.description(),
+            "Show connected MCP servers"
+        );
+        assert_eq!(
+            SlashCommand::McpAdd("registry-name".to_string()).description(),
+            "Add MCP server from registry: registry-name"
+        );
+        assert_eq!(SlashCommand::Skills.description(), "List available skills");
+        assert_eq!(SlashCommand::Agents.description(), "List available agents");
     }
 
     #[test]
