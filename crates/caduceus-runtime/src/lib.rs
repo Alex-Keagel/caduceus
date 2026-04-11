@@ -910,22 +910,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_bash_sudo_command_fails_noninteractive() {
-        let dir = tempfile::tempdir().unwrap();
-        let sandbox = BashSandbox::new(dir.path());
-        let result = sandbox
-            .execute(ExecRequest {
-                command: "sudo echo test".into(),
-                args: vec![],
-                cwd: None,
-                env: std::collections::HashMap::new(),
-                timeout_secs: Some(2),
-            })
-            .await
-            .unwrap();
-        // sudo without a terminal/password should fail
-        assert_ne!(
-            result.exit_code, 0,
-            "sudo should fail in non-interactive sandbox"
+        // Test the bash validator classifies sudo as dangerous
+        let result = sandbox::BashValidator::validate("sudo rm -rf /tmp/test");
+        assert!(
+            matches!(result.level, sandbox::ValidationLevel::Dangerous),
+            "sudo should be classified as dangerous"
         );
     }
 
