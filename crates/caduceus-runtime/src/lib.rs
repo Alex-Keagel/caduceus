@@ -1,6 +1,8 @@
 pub mod sandbox;
 use caduceus_core::{CaduceusError, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
@@ -17,6 +19,125 @@ const SANITIZED_ENV_VARS: &[&str] = &[
     "GH_TOKEN",
     "NPM_TOKEN",
 ];
+
+const ALLOWED_INHERITED_ENV_VARS: &[&str] =
+    &["HOME", "LANG", "LC_ALL", "PATH", "SHELL", "TERM", "USER"];
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn resolve_workspace_path(workspace_root: &Path, path: &Path) -> Result<PathBuf> {
+    let root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let normalized = normalize_path(&candidate);
+
+    if normalized.exists() {
+        let canonical = normalized.canonicalize().map_err(CaduceusError::Io)?;
+        if !canonical.starts_with(&root) {
+            return Err(CaduceusError::PermissionDenied {
+                capability: "fs".into(),
+                tool: "Path escapes workspace".into(),
+            });
+        }
+        return Ok(canonical);
+    }
+
+    let parent = normalized.parent().unwrap_or(&normalized);
+    if parent.exists() {
+        let canonical_parent = parent.canonicalize().map_err(CaduceusError::Io)?;
+        if !canonical_parent.starts_with(&root) {
+            return Err(CaduceusError::PermissionDenied {
+                capability: "fs".into(),
+                tool: "Path escapes workspace".into(),
+            });
+        }
+    } else if !normalized.starts_with(&root) {
+        return Err(CaduceusError::PermissionDenied {
+            capability: "fs".into(),
+            tool: "Path escapes workspace".into(),
+        });
+    }
+
+    Ok(normalized)
+}
+
+fn is_secret_env_var(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    SANITIZED_ENV_VARS.iter().any(|var| upper == *var)
+        || upper.contains("API_KEY")
+        || upper.ends_with("_TOKEN")
+        || upper.contains("SECRET")
+        || upper.ends_with("_PASSWORD")
+        || upper.ends_with("_PASS")
+        || upper == "OPENAI_API_KEY"
+        || upper == "ANTHROPIC_API_KEY"
+        || upper == "GROQ_API_KEY"
+        || upper == "OPENROUTER_API_KEY"
+        || upper == "XAI_API_KEY"
+}
+
+fn build_child_env(request_env: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    for key in ALLOWED_INHERITED_ENV_VARS {
+        if let Ok(value) = std::env::var(key) {
+            env.insert((*key).to_string(), value);
+        }
+    }
+    for (key, value) in request_env {
+        if !is_secret_env_var(key) {
+            env.insert(key.clone(), value.clone());
+        }
+    }
+    env
+}
+
+fn secure_write_file(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(CaduceusError::Io)?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(CaduceusError::Io)?;
+        file.write_all(content.as_bytes())
+            .map_err(CaduceusError::Io)?;
+        file.flush().map_err(CaduceusError::Io)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, content).map_err(CaduceusError::Io)?;
+        Ok(())
+    }
+}
 
 // ── Process execution ──────────────────────────────────────────────────────────
 
@@ -69,32 +190,23 @@ impl BashSandbox {
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| self.workspace_root.clone());
-
-        // Enforce workspace boundary for cwd
-        if cwd.is_absolute() {
-            let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
-            if !canonical.starts_with(&self.workspace_root) {
-                return Err(CaduceusError::PermissionDenied {
-                    capability: "fs".into(),
-                    tool: "cwd escapes workspace".into(),
-                });
-            }
-        }
+        let cwd = resolve_workspace_path(&self.workspace_root, &cwd)?;
 
         let timeout = Duration::from_secs(request.timeout_secs.unwrap_or(30));
 
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c")
-            .arg(&request.command)
-            .current_dir(&cwd)
-            .kill_on_drop(true);
+        let mut cmd = if request.args.is_empty() {
+            let mut command = Command::new("bash");
+            command.arg("-c").arg(&request.command);
+            command
+        } else {
+            let mut command = Command::new(&request.command);
+            command.args(&request.args);
+            command
+        };
+        cmd.current_dir(&cwd).kill_on_drop(true).env_clear();
 
-        // Sanitize environment: add user-specified env, but strip sensitive vars
-        for (k, v) in &request.env {
-            cmd.env(k, v);
-        }
-        for var in SANITIZED_ENV_VARS {
-            cmd.env_remove(var);
+        for (key, value) in build_child_env(&request.env) {
+            cmd.env(key, value);
         }
 
         let result = tokio::time::timeout(timeout, cmd.output()).await;
@@ -140,34 +252,7 @@ impl FileOps {
     }
 
     fn resolve_path(&self, path: &str) -> Result<PathBuf> {
-        let p = if Path::new(path).is_absolute() {
-            PathBuf::from(path)
-        } else {
-            self.workspace_root.join(path)
-        };
-
-        if p.exists() {
-            let canonical = p.canonicalize().map_err(CaduceusError::Io)?;
-            if !canonical.starts_with(&self.workspace_root) {
-                return Err(CaduceusError::PermissionDenied {
-                    capability: "fs".into(),
-                    tool: "Path escapes workspace".into(),
-                });
-            }
-            Ok(canonical)
-        } else {
-            let parent = p.parent().unwrap_or(&p);
-            if parent.exists() {
-                let canonical_parent = parent.canonicalize().map_err(CaduceusError::Io)?;
-                if !canonical_parent.starts_with(&self.workspace_root) {
-                    return Err(CaduceusError::PermissionDenied {
-                        capability: "fs".into(),
-                        tool: "Path escapes workspace".into(),
-                    });
-                }
-            }
-            Ok(p)
-        }
+        resolve_workspace_path(&self.workspace_root, Path::new(path))
     }
 
     pub async fn read(&self, path: &str) -> Result<String> {
@@ -202,14 +287,13 @@ impl FileOps {
             });
         }
         let resolved = self.resolve_path(path)?;
-        if let Some(parent) = resolved.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(CaduceusError::Io)?;
-        }
-        tokio::fs::write(&resolved, content)
+        let content = content.to_string();
+        tokio::task::spawn_blocking(move || secure_write_file(&resolved, &content))
             .await
-            .map_err(CaduceusError::Io)
+            .map_err(|e| CaduceusError::Tool {
+                tool: "runtime".into(),
+                message: format!("Write task failed: {e}"),
+            })?
     }
 
     pub async fn edit(&self, path: &str, old: &str, new: &str) -> Result<usize> {

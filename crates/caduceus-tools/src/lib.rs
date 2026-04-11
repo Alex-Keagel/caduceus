@@ -6,6 +6,8 @@ use regex::RegexBuilder;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::io::Write;
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -196,9 +198,29 @@ fn resolve_workspace_path(workspace_root: &Path, path: &str) -> Result<PathBuf> 
     } else {
         root.join(path)
     };
-
     let normalized = normalize_path(&raw);
-    if !normalized.starts_with(&root) {
+
+    if normalized.exists() {
+        let canonical = std::fs::canonicalize(&normalized).map_err(CaduceusError::Io)?;
+        if !canonical.starts_with(&root) {
+            return Err(CaduceusError::PermissionDenied {
+                capability: "fs".to_string(),
+                tool: "path escapes workspace".to_string(),
+            });
+        }
+        return Ok(canonical);
+    }
+
+    let parent = normalized.parent().unwrap_or(&normalized);
+    if parent.exists() {
+        let canonical_parent = std::fs::canonicalize(parent).map_err(CaduceusError::Io)?;
+        if !canonical_parent.starts_with(&root) {
+            return Err(CaduceusError::PermissionDenied {
+                capability: "fs".to_string(),
+                tool: "path escapes workspace".to_string(),
+            });
+        }
+    } else if !normalized.starts_with(&root) {
         return Err(CaduceusError::PermissionDenied {
             capability: "fs".to_string(),
             tool: "path escapes workspace".to_string(),
@@ -206,6 +228,145 @@ fn resolve_workspace_path(workspace_root: &Path, path: &str) -> Result<PathBuf> 
     }
 
     Ok(normalized)
+}
+
+fn secure_write_path(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(CaduceusError::Io)?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(CaduceusError::Io)?;
+        file.write_all(content.as_bytes())
+            .map_err(CaduceusError::Io)?;
+        file.flush().map_err(CaduceusError::Io)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, content).map_err(CaduceusError::Io)?;
+        Ok(())
+    }
+}
+
+fn is_metadata_hostname(host: &str) -> bool {
+    matches!(
+        host,
+        "metadata.google.internal"
+            | "metadata"
+            | "metadata.azure.internal"
+            | "instance-data"
+            | "100.100.100.200"
+    )
+}
+
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || octets[0] == 0
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+                || octets == [100, 100, 100, 200]
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        }
+    }
+}
+
+async fn validate_web_fetch_url(url: &reqwest::Url) -> Result<()> {
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(CaduceusError::Tool {
+                tool: "web_fetch".into(),
+                message: format!("unsupported URL scheme `{other}`"),
+            });
+        }
+    }
+
+    let host = url.host_str().ok_or_else(|| CaduceusError::Tool {
+        tool: "web_fetch".into(),
+        message: "URL must include a host".into(),
+    })?;
+    let host_lower = host.to_ascii_lowercase();
+    if host_lower == "localhost"
+        || host_lower.ends_with(".localhost")
+        || host_lower.ends_with(".local")
+    {
+        return Err(CaduceusError::Tool {
+            tool: "web_fetch".into(),
+            message: "requests to localhost or local domains are blocked".into(),
+        });
+    }
+    if is_metadata_hostname(&host_lower) {
+        return Err(CaduceusError::Tool {
+            tool: "web_fetch".into(),
+            message: "requests to metadata endpoints are blocked".into(),
+        });
+    }
+
+    if let Ok(ip) = host_lower.parse::<IpAddr>() {
+        if is_blocked_ip(ip) {
+            return Err(CaduceusError::Tool {
+                tool: "web_fetch".into(),
+                message: "requests to private or local IP addresses are blocked".into(),
+            });
+        }
+        return Ok(());
+    }
+
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| CaduceusError::Tool {
+            tool: "web_fetch".into(),
+            message: "unable to determine target port".into(),
+        })?;
+
+    let resolved =
+        tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|err| CaduceusError::Tool {
+                tool: "web_fetch".into(),
+                message: format!("failed to resolve host `{host}`: {err}"),
+            })?;
+
+    for addr in resolved {
+        if is_blocked_ip(addr.ip()) {
+            return Err(CaduceusError::Tool {
+                tool: "web_fetch".into(),
+                message: "requests to private or local network addresses are blocked".into(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -271,14 +432,8 @@ impl Tool for BashTool {
             None => Some(self.workspace_root.to_string_lossy().to_string()),
         };
 
-        let command = if parsed.args.is_empty() {
-            parsed.command
-        } else {
-            format!("{} {}", parsed.command, parsed.args.join(" "))
-        };
-
         let request = ExecRequest {
-            command,
+            command: parsed.command,
             args: parsed.args,
             cwd,
             env: parsed.env,
@@ -802,7 +957,7 @@ fn apply_unified_diff(workspace_root: &Path, patch: &str) -> std::result::Result
         }
         match &write.content {
             Some(content) => {
-                std::fs::write(&write.path, content)
+                secure_write_path(&write.path, content)
                     .map_err(|err| format!("failed to write `{}`: {err}", write.path.display()))?;
             }
             None => {
@@ -1362,18 +1517,58 @@ impl Tool for WebFetchTool {
 
         let timeout =
             Duration::from_secs(parsed.timeout_secs.unwrap_or(self.timeout.as_secs().max(1)));
-        let client = match reqwest::Client::builder().timeout(timeout).build() {
+        let client = match reqwest::Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+        {
             Ok(client) => client,
             Err(err) => return Ok(tool_error(format!("failed to create HTTP client: {err}"))),
         };
+        let mut current_url = match reqwest::Url::parse(&parsed.url) {
+            Ok(url) => url,
+            Err(err) => return Ok(tool_error(format!("invalid URL: {err}"))),
+        };
+        if let Err(err) = validate_web_fetch_url(&current_url).await {
+            return Ok(tool_error(err.to_string()));
+        }
 
-        let response = match client.get(&parsed.url).send().await {
-            Ok(response) => response,
-            Err(err) => return Ok(tool_error(format!("request failed: {err}"))),
+        let mut redirect_count = 0usize;
+        let response = loop {
+            let response = match client.get(current_url.clone()).send().await {
+                Ok(response) => response,
+                Err(err) => return Ok(tool_error(format!("request failed: {err}"))),
+            };
+
+            if response.status().is_redirection() {
+                redirect_count += 1;
+                if redirect_count > 5 {
+                    return Ok(tool_error("too many redirects"));
+                }
+
+                let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                    return Ok(tool_error("redirect response missing Location header"));
+                };
+                let location = match location.to_str() {
+                    Ok(value) => value,
+                    Err(err) => return Ok(tool_error(format!("invalid redirect location: {err}"))),
+                };
+                let next_url = match current_url.join(location) {
+                    Ok(url) => url,
+                    Err(err) => return Ok(tool_error(format!("invalid redirect target: {err}"))),
+                };
+                if let Err(err) = validate_web_fetch_url(&next_url).await {
+                    return Ok(tool_error(err.to_string()));
+                }
+                current_url = next_url;
+                continue;
+            }
+
+            break response;
         };
 
         let status = response.status();
-        let final_url = response.url().to_string();
+        let final_url = current_url.to_string();
         let text = match response.text().await {
             Ok(text) => text,
             Err(err) => return Ok(tool_error(format!("failed reading response body: {err}"))),

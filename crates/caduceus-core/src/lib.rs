@@ -309,12 +309,13 @@ impl Default for TokenBudget {
 
 impl TokenBudget {
     pub fn remaining(&self) -> u32 {
-        self.context_limit
-            .saturating_sub(self.used_input + self.used_output + self.reserved_output)
+        let used = self.used_input.saturating_add(self.used_output);
+        let reserved = used.saturating_add(self.reserved_output);
+        self.context_limit.saturating_sub(reserved)
     }
 
     pub fn fill_fraction(&self) -> f64 {
-        let used = self.used_input + self.used_output;
+        let used = self.used_input.saturating_add(self.used_output);
         if self.context_limit == 0 {
             return 0.0;
         }

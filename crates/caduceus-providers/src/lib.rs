@@ -1114,14 +1114,13 @@ impl GeminiAdapter {
             "generateContent"
         };
         let mut url = format!(
-            "{}/models/{}:{}?key={}",
+            "{}/models/{}:{}",
             self.base_url.trim_end_matches('/'),
             model.0,
-            method,
-            self.api_key
+            method
         );
         if stream {
-            url.push_str("&alt=sse");
+            url.push_str("?alt=sse");
         }
         url
     }
@@ -1180,6 +1179,7 @@ impl LlmAdapter for GeminiAdapter {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let body = self.build_request_body(&request);
         let url = self.endpoint(&request.model, false);
+        let api_key = self.api_key.clone();
         let client = self.client.clone();
         let retry_config = RetryConfig::default();
 
@@ -1189,6 +1189,7 @@ impl LlmAdapter for GeminiAdapter {
                 client
                     .post(&url)
                     .header("content-type", "application/json")
+                    .header("x-goog-api-key", &api_key)
                     .json(&body)
             },
             &retry_config,
@@ -1205,6 +1206,7 @@ impl LlmAdapter for GeminiAdapter {
     async fn stream(&self, request: ChatRequest) -> Result<StreamResult> {
         let body = self.build_request_body(&request);
         let url = self.endpoint(&request.model, true);
+        let api_key = self.api_key.clone();
         let client = self.client.clone();
         let retry_config = RetryConfig::default();
 
@@ -1214,6 +1216,7 @@ impl LlmAdapter for GeminiAdapter {
                 client
                     .post(&url)
                     .header("content-type", "application/json")
+                    .header("x-goog-api-key", &api_key)
                     .json(&body)
             },
             &retry_config,
@@ -1467,6 +1470,13 @@ where
                 }
                 adapter.chat(request).await.map(|_| ())
             }
+            "copilot" => {
+                let mut adapter = CopilotLmAdapter::new(key);
+                if let Some(base_url) = config.base_url {
+                    adapter = adapter.with_base_url(base_url);
+                }
+                adapter.chat(request).await.map(|_| ())
+            }
             other => Err(CaduceusError::Provider(format!(
                 "unsupported provider for connection: {other}"
             ))),
@@ -1481,6 +1491,7 @@ fn default_validation_model(provider_id: &ProviderId) -> ModelId {
         "gemini" => ModelId::new("gemini-1.5-flash"),
         "azure" => ModelId::new("azure-deployment"),
         "ollama" => ModelId::new("llama3.2"),
+        "copilot" => ModelId::new("gpt-4o-mini"),
         _ => ModelId::new("default"),
     }
 }
@@ -1532,6 +1543,132 @@ impl ProviderRegistry {
 impl Default for ProviderRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── GitHub Copilot LM API adapter ──────────────────────────────────────────────
+
+/// Adapter for the GitHub Copilot Language Model API.
+///
+/// Uses the OpenAI-compatible chat/completions format with GitHub token auth.
+/// Auth: `GITHUB_TOKEN` env var as Bearer token.
+/// Base URL: configurable, defaults to GitHub Copilot's local proxy endpoint.
+pub struct CopilotLmAdapter {
+    provider_id: ProviderId,
+    token: String,
+    base_url: String,
+    client: reqwest::Client,
+}
+
+impl CopilotLmAdapter {
+    /// Create a new adapter using the `GITHUB_TOKEN` environment variable.
+    pub fn from_env() -> std::result::Result<Self, String> {
+        let token = std::env::var("GITHUB_TOKEN")
+            .map_err(|_| "GITHUB_TOKEN env var not set".to_string())?;
+        Ok(Self::new(token))
+    }
+
+    /// Create a new adapter with an explicit token.
+    pub fn new(token: impl Into<String>) -> Self {
+        Self {
+            provider_id: ProviderId::new("copilot"),
+            token: token.into(),
+            base_url: "http://localhost:1234".into(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        self.base_url = url.into();
+        self
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    fn build_request_body(&self, request: &ChatRequest, stream: bool) -> serde_json::Value {
+        build_openai_request_body(request, stream, true)
+    }
+}
+
+#[async_trait]
+impl LlmAdapter for CopilotLmAdapter {
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let body = self.build_request_body(&request, false);
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let token = self.token.clone();
+        let client = self.client.clone();
+        let retry = RetryConfig::default();
+
+        let resp = send_with_retry(
+            &client,
+            || {
+                client
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {}", &token))
+                    .json(&body)
+            },
+            &retry,
+        )
+        .await?;
+
+        let resp_body = resp
+            .text()
+            .await
+            .map_err(|e| CaduceusError::Provider(format!("Failed to read response: {}", e)))?;
+
+        parse_openai_chat_response(&resp_body)
+    }
+
+    async fn stream(&self, request: ChatRequest) -> Result<StreamResult> {
+        let body = self.build_request_body(&request, true);
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let token = self.token.clone();
+        let client = self.client.clone();
+        let retry = RetryConfig::default();
+
+        let resp = send_with_retry(
+            &client,
+            || {
+                client
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {}", &token))
+                    .json(&body)
+            },
+            &retry,
+        )
+        .await?;
+
+        let stream = resp
+            .bytes_stream()
+            .eventsource()
+            .filter_map(|result| async move {
+                match result {
+                    Ok(event) => parse_openai_sse_event(&event.data),
+                    Err(e) => Some(Err(CaduceusError::Provider(format!("SSE error: {:?}", e)))),
+                }
+            });
+
+        Ok(Box::pin(stream))
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelId>> {
+        Ok(vec![
+            ModelId::new("gpt-4o"),
+            ModelId::new("gpt-4o-mini"),
+            ModelId::new("claude-sonnet-4-5"),
+        ])
     }
 }
 
@@ -2077,5 +2214,77 @@ mod tests {
         assert!(req.thinking_mode);
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"thinking_mode\":true"));
+    }
+
+    // ── Copilot LM adapter tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_copilot_adapter_construction() {
+        let adapter = CopilotLmAdapter::new("gh-token-123");
+        assert_eq!(adapter.provider_id().0, "copilot");
+        assert_eq!(adapter.token(), "gh-token-123");
+        assert_eq!(adapter.base_url(), "http://localhost:1234");
+    }
+
+    #[test]
+    fn test_copilot_adapter_custom_base_url() {
+        let adapter =
+            CopilotLmAdapter::new("token").with_base_url("https://copilot.example.com/v1");
+        assert_eq!(adapter.base_url(), "https://copilot.example.com/v1");
+    }
+
+    #[test]
+    fn test_copilot_adapter_request_body() {
+        let adapter = CopilotLmAdapter::new("token");
+        let request = ChatRequest {
+            model: ModelId::new("gpt-4o"),
+            messages: vec![Message::user("Hello")],
+            system: Some("You are helpful.".into()),
+            max_tokens: 1024,
+            temperature: Some(0.5),
+            thinking_mode: false,
+        };
+
+        let body = adapter.build_request_body(&request, true);
+        assert_eq!(body["model"], "gpt-4o");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn test_copilot_adapter_chat() {
+        let server = TestServer::respond(
+            "200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"Hello from Copilot"},"finish_reason":"stop"}],"usage":{"prompt_tokens":15,"completion_tokens":4}}"#,
+            1,
+        );
+        let adapter = CopilotLmAdapter::new("test-token").with_base_url(server.base_url);
+        let request = ChatRequest {
+            model: ModelId::new("gpt-4o"),
+            messages: vec![Message::user("Hi")],
+            system: None,
+            max_tokens: 64,
+            temperature: None,
+            thinking_mode: false,
+        };
+
+        let resp = adapter.chat(request).await.unwrap();
+        assert_eq!(resp.content, "Hello from Copilot");
+        assert_eq!(resp.input_tokens, 15);
+        assert_eq!(resp.output_tokens, 4);
+    }
+
+    #[test]
+    fn test_copilot_adapter_in_registry() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Box::new(CopilotLmAdapter::new("token")));
+        assert!(registry.get(&ProviderId::new("copilot")).is_some());
+        let resolved = registry.resolve_model("copilot:gpt-4o");
+        assert!(resolved.is_some());
+        let (pid, mid) = resolved.unwrap();
+        assert_eq!(pid.0, "copilot");
+        assert_eq!(mid.0, "gpt-4o");
     }
 }
