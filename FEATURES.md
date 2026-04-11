@@ -1,6 +1,6 @@
 # Caduceus — Feature Matrix
 
-> **Caduceus** synthesizes capabilities from **7 source repositories** and **3 competitive research analyses** into a unified Rust-based AI coding assistant, organized across **6 architectural layers**. This document catalogs every feature — implemented, stubbed, planned, and envisioned — providing a single source of truth for project scope and progress.
+> **Caduceus** synthesizes capabilities from **8 source repositories** and **3 competitive research analyses** into a unified Rust-based AI coding assistant, organized across **7 architectural layers**. This document catalogs every feature — implemented, stubbed, planned, and envisioned — providing a single source of truth for project scope and progress.
 
 | Source Repo | Shorthand |
 |---|---|
@@ -14,6 +14,7 @@
 | Cline (Research) | Cline |
 | Cursor (Research) | Cursor |
 | Cline Kanban (Research) | Kanban |
+| MS Agent Governance Toolkit | MS Governance |
 
 **Status Legend:** ✅ Implemented · 🔧 Stubbed · 📋 Planned · 💡 Future  
 **Priority:** P0 (Critical) · P1 (High) · P2 (Medium) · P3 (Nice-to-have)
@@ -227,6 +228,25 @@
 | 174 | Per-card terminal with live status | Each kanban card shows mini-terminal preview with agent status, latest message, token usage; expandable to full view | Kanban | 📋 | P2 | `caduceus-app` |
 | 175 | Inline diff review with comments | Click kanban card to see worktree diff; click lines to leave comments that feed back into agent's next prompt | Kanban | 📋 | P2 | `caduceus-app` |
 
+### 1.7 Governance & Compliance Layer (14 features)
+
+| # | Feature | Description | Source(s) | Status | Priority | Crate |
+|---|---------|-------------|-----------|--------|----------|-------|
+| 176 | Policy engine | YAML-based policy rules evaluated before every tool call | MS Governance | 📋 | P1 | `caduceus-permissions` |
+| 177 | Agent trust scoring | Trust score (0-1000) based on task success rate, error rate, permission violations | MS Governance | 📋 | P2 | `caduceus-permissions` |
+| 178 | MCP security scanner | Detect tool poisoning, typosquatting, hidden instructions in MCP servers | MS Governance | 📋 | P1 | `caduceus-mcp` |
+| 179 | Kill switch | Emergency stop for all running agents with state preservation | MS Governance | 📋 | P0 | `caduceus-orchestrator` |
+| 180 | Circuit breakers | Auto-disable failing tools/providers after N consecutive failures | MS Governance | 📋 | P1 | `caduceus-providers` |
+| 181 | SLO monitoring | Define and track service level objectives for agent operations | MS Governance | 📋 | P2 | `caduceus-telemetry` |
+| 182 | Error budgets | Track error rate vs budget, auto-throttle when exceeded | MS Governance | 📋 | P2 | `caduceus-telemetry` |
+| 183 | Secret scanning | Detect leaked secrets/credentials in agent outputs before display | MS Governance | 📋 | P1 | `caduceus-permissions` |
+| 184 | Privilege rings | 4-tier execution privilege (read-only → workspace → system → unrestricted) | MS Governance | 📋 | P1 | `caduceus-permissions` |
+| 185 | OWASP Agentic compliance | Coverage for all 10 OWASP Agentic Security risks | MS Governance | 📋 | P2 | `caduceus-permissions` |
+| 186 | Governance attestation | Generate compliance reports proving governance controls are active | MS Governance | 📋 | P2 | `caduceus-telemetry` |
+| 187 | Replay debugging | Record and replay agent sessions for debugging and audit | MS Governance | 📋 | P2 | `caduceus-storage` |
+| 188 | Agent identity (DID) | Cryptographic agent identity for multi-agent trust | MS Governance | 📋 | P3 | `caduceus-core` |
+| 189 | Chaos engineering | Inject failures to test agent resilience | MS Governance | 💡 | P3 | `caduceus-runtime` |
+
 ### Summary
 
 | Layer | Features | ✅ | 🔧 | 📋 | 💡 |
@@ -237,7 +257,8 @@
 | Sandbox | 25 | 8 | 1 | 13 | 3 |
 | Omniscience | 25 | 14 | 1 | 8 | 2 |
 | Multiplayer | 24 | 4 | 0 | 10 | 10 |
-| **Total** | **176** | **49** | **4** | **92** | **31** |
+| Governance | 14 | 0 | 0 | 13 | 1 |
+| **Total** | **190** | **49** | **4** | **105** | **32** |
 
 ---
 
@@ -609,4 +630,4 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 
 ---
 
-*Generated for Caduceus — 176 features across 6 layers, synthesized from 7 source repositories and 3 competitive research analyses.*
+*Generated for Caduceus — 190 features across 7 layers, synthesized from 8 source repositories and 3 competitive research analyses.*
