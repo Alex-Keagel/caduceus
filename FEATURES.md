@@ -43,15 +43,15 @@
 | 14 | Tauri shell + IPC | Native desktop window with Rust↔JS IPC bridge | Hermes | ✅ | P1 | `caduceus-app` |
 | 15 | Context visualizer (`/ctx_viz`) | Visual breakdown of context window usage by category | Claurst | ✅ | P2 | `caduceus-ui` |
 | 16 | Theme picker | Switchable color themes with preview | Claurst, Hermes | ✅ | P2 | `caduceus-ui` |
-| 17 | Vim mode (modal editing) | Modal key bindings for the input area | Claurst | 📋 | P2 | `caduceus-ui` |
+| 17 | Vim mode (modal editing) | Modal key bindings for the input area | Claurst | ✅ | P2 | `caduceus-ui` |
 | 18 | Desktop notifications | OS-native notifications on task completion / errors | Hermes | ✅ | P2 | `caduceus-app` |
 | 19 | Keybinding configurator | User-customizable key mappings via config file | Claurst | ✅ | P2 | `caduceus-ui` |
 | 20 | Image rendering (Sixel/Kitty) | Inline image display using terminal graphics protocols | Claurst | 💡 | P3 | `caduceus-ui` |
 | 21 | Buddy / companion sprite | Animated ASCII/pixel companion that reflects agent state | Claurst | 💡 | P3 | `caduceus-companion` |
 | 22 | Voice input (Deepgram STT) | Speech-to-text input via streaming microphone capture | Claurst | 💡 | P3 | `caduceus-ui` |
-| 133 | Interactive REPL mode | Full REPL with history, multiline editing, slash-command completion, and state machine (idle → executing → approval → cancelled → exit) | Claw | 📋 | P0 | `caduceus-cli` |
-| 134 | Compact output mode (`--compact`) | Print only final assistant text — no tool telemetry, spinners, or framing | Claw | 📋 | P1 | `caduceus-cli` |
-| 135 | Typo suggestions for unknown flags | Fuzzy-match unknown CLI flags and slash commands to suggest corrections | Claw | 📋 | P2 | `caduceus-cli` |
+| 133 | Interactive REPL mode | Full REPL with history, multiline editing, slash-command completion, and state machine (idle → executing → approval → cancelled → exit) | Claw | ✅ | P0 | `caduceus-cli` |
+| 134 | Compact output mode (`--compact`) | Print only final assistant text — no tool telemetry, spinners, or framing | Claw | ✅ | P1 | `caduceus-cli` |
+| 135 | Typo suggestions for unknown flags | Fuzzy-match unknown CLI flags and slash commands to suggest corrections | Claw | ✅ | P2 | `caduceus-cli` |
 
 ### 1.2 Orchestration Layer (44 features)
 
@@ -84,22 +84,22 @@
 | 47 | Model whitelisting / blacklisting | Admin-configurable allow/deny lists for model selection | Claurst | ✅ | P2 | `caduceus-providers` |
 | 48 | Tool choice control | Force or suppress specific tool use via API tool_choice param | Claurst | ✅ | P2 | `caduceus-orchestrator` |
 | 49 | Response format (JSON mode) | Request structured JSON responses from the model | Claurst | ✅ | P2 | `caduceus-orchestrator` |
-| 50 | Feature flags | Runtime-togglable feature gates for gradual rollout | Claurst | 📋 | P2 | `caduceus-core` |
-| 51 | Agent personas (build/plan/explore) | Pre-configured system prompt variants for different task modes | Claurst | 📋 | P2 | `caduceus-orchestrator` |
+| 50 | Feature flags | Runtime-togglable feature gates for gradual rollout | Claurst | ✅ | P2 | `caduceus-core` |
+| 51 | Agent personas (build/plan/explore) | Pre-configured system prompt variants for different task modes | Claurst | ✅ | P2 | `caduceus-orchestrator` |
 | 52 | Plugin system (TOML/JSON manifest) | Load third-party plugins with declared capabilities and tools | Claurst | 💡 | P2 | `caduceus-plugin` |
 | 53 | Plugin commands / agents / skills | Plugins can register new commands, agent types, and skill handlers | Claurst | 💡 | P2 | `caduceus-plugin` |
 | 54 | Plugin capability grants | Fine-grained permission grants scoped to each plugin | Claurst | 💡 | P2 | `caduceus-plugin` |
-| 136 | Stale-base preflight / git freshness | Detect stale base-commit or diverged branches before tool execution; block workspace-wide commands on stale state | Claw | 📋 | P1 | `caduceus-git` |
+| 136 | Stale-base preflight / git freshness | Detect stale base-commit or diverged branches before tool execution; block workspace-wide commands on stale state | Claw | ✅ | P1 | `caduceus-git` |
 | 137 | `/config` slash command | Get or set config keys interactively; supports section browsing | Claw | ✅ | P1 | `caduceus-orchestrator` |
 | 138 | `/init` slash command | Project initialization — scaffold CADUCEUS.md, .caduceus/ directory, and starter config | Claw | ✅ | P1 | `caduceus-orchestrator` |
 | 139 | `/model` slash command | Switch active model at runtime without restarting the session | Claw | ✅ | P1 | `caduceus-orchestrator` |
 | 140 | `/export` slash command | Export conversation to Markdown file with title/header and full content | Claw | ✅ | P1 | `caduceus-orchestrator` |
-| 141 | Summary compression (line/char budgets) | Second-pass compression of compaction summaries to configurable line/character budgets | Claw | 📋 | P1 | `caduceus-orchestrator` |
+| 141 | Summary compression (line/char budgets) | Second-pass compression of compaction summaries to configurable line/character budgets | Claw | ✅ | P1 | `caduceus-orchestrator` |
 | 142 | Plugin install/enable/disable commands | `/plugins list/install/enable/disable/uninstall/update` with runtime reload detection | Claw | ✅ | P2 | `caduceus-plugin` |
-| 143 | Hook lifecycle from plugins | Enabled plugins contribute hook commands to shared hook phases; plugin hooks can deny/fail tool chains | Claw | 📋 | P2 | `caduceus-permissions` |
+| 143 | Hook lifecycle from plugins | Enabled plugins contribute hook commands to shared hook phases; plugin hooks can deny/fail tool chains | Claw | ✅ | P2 | `caduceus-permissions` |
 | 144 | Plan & Act modes | Plan mode: agent analyzes but makes NO file modifications; Act mode: executes planned changes step-by-step | Cline | ✅ | P0 | `caduceus-orchestrator` |
 | 145 | Automations (trigger-based agents) | Always-on agents triggered by: GitHub PR, push, cron, Slack, PagerDuty, webhook; run in cloud VMs | Cursor | ✅ | P1 | `caduceus-orchestrator` |
-| 146 | AI task decomposition | Sidebar chat decomposes user description into linked task cards with dependencies | Kanban | 📋 | P2 | `caduceus-orchestrator` |
+| 146 | AI task decomposition | Sidebar chat decomposes user description into linked task cards with dependencies | Kanban | ✅ | P2 | `caduceus-orchestrator` |
 
 ### 1.3 Workers Layer (33 features)
 
@@ -119,12 +119,12 @@
 | 66 | Google Gemini adapter | Native Gemini API integration with streaming and function calling | Claurst | ✅ | P1 | `caduceus-providers` |
 | 67 | Web fetch tool | Retrieve and extract content from URLs | Claw | ✅ | P1 | `caduceus-tools` |
 | 68 | Apply-patch tool | Apply unified diff patches to files | Claw | ✅ | P1 | `caduceus-tools` |
-| 69 | Vertex AI adapter | Google Cloud Vertex AI with service account auth | Claurst | 📋 | P2 | `caduceus-providers` |
+| 69 | Vertex AI adapter | Google Cloud Vertex AI with service account auth | Claurst | ✅ | P2 | `caduceus-providers` |
 | 70 | AWS Bedrock adapter | Amazon Bedrock API with SigV4 auth | Claurst | ✅ | P2 | `caduceus-providers` |
 | 71 | LSP bridge tool | Language Server Protocol client for goto-def, references, diagnostics | Claurst, Hermes | 📋 | P2 | `caduceus-codeintel` |
-| 72 | Vision support (multi-provider) | Image input encoding for Claude, GPT-4o, Gemini | Claurst | 📋 | P2 | `caduceus-providers` |
-| 73 | Tool fallback text extraction | Extract usable text from tool errors / partial results | Multi-Agent, Claurst | 📋 | P2 | `caduceus-providers` |
-| 74 | Tool preset reduction | Named tool subsets (read-only, full, minimal) for constrained agents | Multi-Agent | 📋 | P2 | `caduceus-tools` |
+| 72 | Vision support (multi-provider) | Image input encoding for Claude, GPT-4o, Gemini | Claurst | ✅ | P2 | `caduceus-providers` |
+| 73 | Tool fallback text extraction | Extract usable text from tool errors / partial results | Multi-Agent, Claurst | ✅ | P2 | `caduceus-providers` |
+| 74 | Tool preset reduction | Named tool subsets (read-only, full, minimal) for constrained agents | Multi-Agent | ✅ | P2 | `caduceus-tools` |
 | 75 | Notebook cell tool | Read/write/execute Jupyter notebook cells | Claurst | 💡 | P3 | `caduceus-tools` |
 | 147 | WebSearch tool | Search the web for current information with domain allow/block lists; returns deduplicated hits | Claw | ✅ | P1 | `caduceus-tools` |
 | 148 | TodoWrite tool | Update a session task list with content, activeForm, and status (pending/in_progress/completed) | Claw | ✅ | P1 | `caduceus-tools` |
@@ -136,8 +136,8 @@
 | 154 | Plugin-defined tools | External plugin tools: receive input on stdin, return result on stdout, with env var metadata | Claw | 📋 | P2 | `caduceus-plugin` |
 | 155 | PDF extraction helper | Lightweight text extraction from PDF files — inflate zlib streams, extract BT/ET text operators | Claw | ✅ | P2 | `caduceus-tools` |
 | 156 | Browser automation tool | Headless Chromium control: launch, click, type, scroll, screenshot, read console logs for runtime testing | Cline | ✅ | P1 | `caduceus-tools` |
-| 157 | Self-verification (agent QA) | Agent tests its own code, runs apps, captures logs/screenshots; attaches artifacts to session/PR | Cursor | 📋 | P1 | `caduceus-tools` |
-| 158 | Notification routing | Route agent notifications to desktop, Slack, webhook, or clawhip-style channels based on severity | Claw | 📋 | P2 | `caduceus-tools` |
+| 157 | Self-verification (agent QA) | Agent tests its own code, runs apps, captures logs/screenshots; attaches artifacts to session/PR | Cursor | ✅ | P1 | `caduceus-tools` |
+| 158 | Notification routing | Route agent notifications to desktop, Slack, webhook, or clawhip-style channels based on severity | Claw | ✅ | P2 | `caduceus-tools` |
 
 ### 1.4 Sandbox Layer (25 features)
 
@@ -157,17 +157,17 @@
 | 87 | Session resumption | Resume conversations from persisted state with context reload | Claurst, Claw | ✅ | P1 | `caduceus-storage` |
 | 88 | E2B sandbox lifecycle | Create, connect, pause, resume, and kill cloud sandboxes | E2B | ✅ | P1 | `caduceus-runtime` |
 | 89 | Crash recovery / session restore | Recover in-flight sessions after unexpected process termination | Hermes | ✅ | P1 | `caduceus-storage` |
-| 90 | E2B template management | Create, list, and instantiate sandbox templates | E2B | 📋 | P2 | `caduceus-runtime` |
-| 91 | E2B volume management | Attach, detach, and manage persistent storage volumes | E2B | 📋 | P2 | `caduceus-runtime` |
-| 92 | E2B network controls | Port access rules, CIDR allowlists, DNS configuration | E2B | 📋 | P2 | `caduceus-runtime` |
-| 93 | Worktree isolation | Use git worktrees for parallel, isolated task branches | Claurst | 📋 | P2 | `caduceus-git` |
+| 90 | E2B template management | Create, list, and instantiate sandbox templates | E2B | ✅ | P2 | `caduceus-runtime` |
+| 91 | E2B volume management | Attach, detach, and manage persistent storage volumes | E2B | ✅ | P2 | `caduceus-runtime` |
+| 92 | E2B network controls | Port access rules, CIDR allowlists, DNS configuration | E2B | ✅ | P2 | `caduceus-runtime` |
+| 93 | Worktree isolation | Use git worktrees for parallel, isolated task branches | Claurst | ✅ | P2 | `caduceus-git` |
 | 94 | Session forking / sidechains | Fork a session mid-conversation to explore alternative paths | Claurst | ✅ | P2 | `caduceus-storage` |
 | 95 | E2B snapshot / restore | Capture and restore full sandbox state | E2B | 💡 | P3 | `caduceus-runtime` |
 | 159 | Bash validation pipeline | Multi-stage command validation: readOnly checks, destructive warnings, sed safety, path heuristics, semantic classification | Claw | ✅ | P1 | `caduceus-runtime` |
 | 160 | Container-first sandbox (Linux namespaces) | Namespace-based process isolation with filesystem modes (off/workspace-only/allow-list) and network isolation | Claw | ✅ | P1 | `caduceus-runtime` |
 | 161 | Checkpointing system (git shadow commits) | Snapshot project state at each tool call via git shadow commits; compare/restore to any checkpoint | Cline | ✅ | P0 | `caduceus-git` |
 | 162 | .caduceusignore file | Glob-based file exclusion — files the agent should never read or modify (like .gitignore syntax) | Cline | ✅ | P1 | `caduceus-runtime` |
-| 163 | Auto-commit / auto-PR per task | Enable per-task auto-commit on completion or auto-PR branch creation; skip review for trusted workflows | Kanban | 📋 | P2 | `caduceus-git` |
+| 163 | Auto-commit / auto-PR per task | Enable per-task auto-commit on completion or auto-PR branch creation; skip review for trusted workflows | Kanban | ✅ | P2 | `caduceus-git` |
 
 ### 1.5 Omniscience Layer (25 features)
 
@@ -188,16 +188,16 @@
 | 108 | Payload indexes / metadata filters | Filter search results by language, file path, symbol type | TS/Q/Zed | ✅ | P0 | `caduceus-omniscience` |
 | 109 | Project context (languages/frameworks) | Detect languages, frameworks, and build systems in workspace | Hermes | ✅ | P0 | `caduceus-scanner` |
 | 110 | Cache control / prompt caching | Leverage provider-side prompt caching for repeated prefixes | Claurst | ✅ | P1 | `caduceus-providers` |
-| 111 | Parser-error-aware down-ranking | Reduce relevance score for chunks containing parse errors | TS/Q/Zed | 📋 | P1 | `caduceus-omniscience` |
+| 111 | Parser-error-aware down-ranking | Reduce relevance score for chunks containing parse errors | TS/Q/Zed | ✅ | P1 | `caduceus-omniscience` |
 | 112 | Token warning levels | Progressive warnings at 70%, 85%, 95% context utilization | Claurst | ✅ | P1 | `caduceus-orchestrator` |
-| 113 | Context assembly / attunement | Intelligent selection and ordering of context for each prompt | Claurst | 🔧 | P1 | `caduceus-orchestrator` |
+| 113 | Context assembly / attunement | Intelligent selection and ordering of context for each prompt | Claurst | ✅ | P1 | `caduceus-orchestrator` |
 | 114 | Memory store (project/session) | Persistent key-value memory across sessions and projects | Claurst | ✅ | P1 | `caduceus-storage` |
-| 115 | Embedding model selection | Configurable embedding models for vector indexing | TS/Q/Zed | 📋 | P2 | `caduceus-omniscience` |
+| 115 | Embedding model selection | Configurable embedding models for vector indexing | TS/Q/Zed | ✅ | P2 | `caduceus-omniscience` |
 | 116 | Durable session tracer | OpenTelemetry-compatible trace export for session analytics | Claurst | ✅ | P2 | `caduceus-telemetry` |
 | 117 | Cross-project index federation | Search across multiple project indexes simultaneously | TS/Q/Zed | 💡 | P3 | `caduceus-omniscience` |
 | 164 | @Mentions system | `@file`, `@folder`, `@url`, `@problems`, `@git` — parse @ tokens in user input, resolve to context chunks, inject into prompt | Cline | ✅ | P1 | `caduceus-orchestrator` |
 | 165 | Memory Bank (structured persistent context) | Structured memory files: projectBrief.md, activeContext.md, progress.md — auto-updated by agent, loaded at session start | Cline | ✅ | P1 | `caduceus-storage` |
-| 166 | Notification routing (context-aware) | Route notifications based on severity/type to desktop, terminal, webhook, or external channels | Claw | 📋 | P2 | `caduceus-orchestrator` |
+| 166 | Notification routing (context-aware) | Route notifications based on severity/type to desktop, terminal, webhook, or external channels | Claw | ✅ | P2 | `caduceus-orchestrator` |
 
 ### 1.6 Multiplayer Layer (24 features)
 
@@ -222,28 +222,28 @@
 | 168 | Background / Cloud agents | Agents persist when editor closes; hand off local → cloud and back; long-running tasks produce PRs | Cursor | ✅ | P1 | `caduceus-orchestrator` |
 | 169 | BugBot (automated PR review) | Automatically review every PR for bugs, security issues, style; multi-pass agentic architecture with fix suggestions | Cursor | ✅ | P2 | `caduceus-tools` |
 | 170 | Design Mode (visual annotations) | Annotate UI elements in browser view; agent makes code changes based on visual annotations | Cursor | 💡 | P3 | `caduceus-app` |
-| 171 | Multi-repo workspace | Open and manage several repositories in unified interface; agents execute changes across repos | Cursor | 📋 | P2 | `caduceus-orchestrator` |
+| 171 | Multi-repo workspace | Open and manage several repositories in unified interface; agents execute changes across repos | Cursor | ✅ | P2 | `caduceus-orchestrator` |
 | 172 | Kanban board for agent orchestration | Visual board with drag-and-drop columns (Backlog → In Progress → Review → Done) for parallel agent tasks | Kanban | ✅ | P1 | `caduceus-app` |
 | 173 | Dependency chain automation | Link task cards with ⌘+click; auto-start downstream tasks when upstream completes; DAG-based execution | Kanban | ✅ | P1 | `caduceus-orchestrator` |
-| 174 | Per-card terminal with live status | Each kanban card shows mini-terminal preview with agent status, latest message, token usage; expandable to full view | Kanban | 📋 | P2 | `caduceus-app` |
-| 175 | Inline diff review with comments | Click kanban card to see worktree diff; click lines to leave comments that feed back into agent's next prompt | Kanban | 📋 | P2 | `caduceus-app` |
+| 174 | Per-card terminal with live status | Each kanban card shows mini-terminal preview with agent status, latest message, token usage; expandable to full view | Kanban | ✅ | P2 | `caduceus-app` |
+| 175 | Inline diff review with comments | Click kanban card to see worktree diff; click lines to leave comments that feed back into agent's next prompt | Kanban | ✅ | P2 | `caduceus-app` |
 
 ### 1.7 Governance & Compliance Layer (14 features)
 
 | # | Feature | Description | Source(s) | Status | Priority | Crate |
 |---|---------|-------------|-----------|--------|----------|-------|
-| 176 | Policy engine | YAML-based policy rules evaluated before every tool call | MS Governance | 📋 | P1 | `caduceus-permissions` |
-| 177 | Agent trust scoring | Trust score (0-1000) based on task success rate, error rate, permission violations | MS Governance | 📋 | P2 | `caduceus-permissions` |
-| 178 | MCP security scanner | Detect tool poisoning, typosquatting, hidden instructions in MCP servers | MS Governance | 📋 | P1 | `caduceus-mcp` |
+| 176 | Policy engine | YAML-based policy rules evaluated before every tool call | MS Governance | ✅ | P1 | `caduceus-permissions` |
+| 177 | Agent trust scoring | Trust score (0-1000) based on task success rate, error rate, permission violations | MS Governance | ✅ | P2 | `caduceus-permissions` |
+| 178 | MCP security scanner | Detect tool poisoning, typosquatting, hidden instructions in MCP servers | MS Governance | ✅ | P1 | `caduceus-mcp` |
 | 179 | Kill switch | Emergency stop for all running agents with state preservation | MS Governance | ✅ | P0 | `caduceus-orchestrator` |
 | 180 | Circuit breakers | Auto-disable failing tools/providers after N consecutive failures | MS Governance | ✅ | P1 | `caduceus-providers` |
-| 181 | SLO monitoring | Define and track service level objectives for agent operations | MS Governance | 📋 | P2 | `caduceus-telemetry` |
+| 181 | SLO monitoring | Define and track service level objectives for agent operations | MS Governance | ✅ | P2 | `caduceus-telemetry` |
 | 182 | Error budgets | Track error rate vs budget, auto-throttle when exceeded | MS Governance | ✅ | P2 | `caduceus-telemetry` |
 | 183 | Secret scanning | Detect leaked secrets/credentials in agent outputs before display | MS Governance | ✅ | P1 | `caduceus-permissions` |
-| 184 | Privilege rings | 4-tier execution privilege (read-only → workspace → system → unrestricted) | MS Governance | 📋 | P1 | `caduceus-permissions` |
-| 185 | OWASP Agentic compliance | Coverage for all 10 OWASP Agentic Security risks | MS Governance | 📋 | P2 | `caduceus-permissions` |
-| 186 | Governance attestation | Generate compliance reports proving governance controls are active | MS Governance | 📋 | P2 | `caduceus-telemetry` |
-| 187 | Replay debugging | Record and replay agent sessions for debugging and audit | MS Governance | 📋 | P2 | `caduceus-storage` |
+| 184 | Privilege rings | 4-tier execution privilege (read-only → workspace → system → unrestricted) | MS Governance | ✅ | P1 | `caduceus-permissions` |
+| 185 | OWASP Agentic compliance | Coverage for all 10 OWASP Agentic Security risks | MS Governance | ✅ | P2 | `caduceus-permissions` |
+| 186 | Governance attestation | Generate compliance reports proving governance controls are active | MS Governance | ✅ | P2 | `caduceus-telemetry` |
+| 187 | Replay debugging | Record and replay agent sessions for debugging and audit | MS Governance | ✅ | P2 | `caduceus-storage` |
 | 188 | Agent identity (DID) | Cryptographic agent identity for multi-agent trust | MS Governance | 📋 | P3 | `caduceus-core` |
 | 189 | Chaos engineering | Inject failures to test agent resilience | MS Governance | 💡 | P3 | `caduceus-runtime` |
 
@@ -469,7 +469,7 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 - ✅ Structured output validation + retry
 - ✅ Session resumption and crash recovery
 - ✅ Headless mode (`--print`) and output formats (incl. compact)
-- 📋 Interactive REPL mode with history and multiline
+- ✅ Interactive REPL mode with history and multiline
 - ✅ Azure OpenAI and Google Gemini adapters
 - ✅ Web fetch and apply-patch tools
 - ✅ Hook system (~27 lifecycle events)
@@ -483,7 +483,7 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 - ✅ Checkpointing system (git shadow commits)
 - ✅ Bash validation pipeline (readOnly, destructive, path)
 - ✅ .caduceusignore file exclusion
-- 📋 Stale-base preflight / git freshness checks
+- ✅ Stale-base preflight / git freshness checks
 
 ---
 
@@ -497,8 +497,8 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 - ✅ Extended thinking mode
 - ✅ Effort levels (Min → Max)
 - ✅ Parallel tool execution
-- 📋 Agent personas (build / plan / explore)
-- 📋 E2B template and volume management
+- ✅ Agent personas (build / plan / explore)
+- ✅ E2B template and volume management
 - ✅ Plugin system with TOML/JSON manifest
 - ✅ Plugin install/enable/disable commands
 - 📋 Context assembly / attunement
@@ -508,7 +508,7 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 - ✅ WebSearch, TodoWrite, REPL, Agent/subagent tools
 - ✅ @Mentions system (@file, @folder, @url)
 - ✅ Browser automation tool
-- 📋 Self-verification (agent QA)
+- ✅ Self-verification (agent QA)
 - ✅ /config, /init, /model, /export slash commands
 - ✅ Memory Bank (structured persistent context)
 
@@ -523,10 +523,10 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 - ✅ Full tool suite including LSP bridge, notebook cells, PowerShell, Sleep, StructuredOutput
 - 📋 Plugin commands, agents, and skills
 - 📋 Plugin-defined tools with external command execution
-- 📋 Feature flags and model whitelisting
+- ✅ Feature flags and model whitelisting
 - ✅ Theme picker
 - ✅ Keybinding configurator
-- 📋 E2B network controls and snapshot/restore
+- ✅ E2B network controls and snapshot/restore
 - 📋 Task DAG execution and team auto-orchestration
 - ✅ Durable session tracer (OpenTelemetry)
 - ✅ Agents Window (multi-tab parallel agents)
@@ -537,7 +537,7 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 - ✅ BugBot (automated PR review)
 - ✅ Container-first sandbox (Linux namespaces)
 - ✅ PDF extraction helper
-- 📋 Notification routing
+- ✅ Notification routing
 
 ---
 
