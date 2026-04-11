@@ -82,6 +82,8 @@ struct StdioTransport {
     stdout_lines: Arc<Mutex<tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>>>,
 }
 
+const STDIO_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl StdioTransport {
     async fn send(&mut self, req: &JsonRpcRequest) -> Result<JsonRpcResponse> {
         use tokio::io::AsyncWriteExt;
@@ -96,10 +98,17 @@ impl StdioTransport {
         self.stdin.flush().await.map_err(McpError::Io)?;
 
         let mut guard = self.stdout_lines.lock().await;
+        let deadline = tokio::time::Instant::now() + STDIO_RPC_TIMEOUT;
         loop {
-            let line = guard
-                .next_line()
+            let line = tokio::time::timeout_at(deadline, guard.next_line())
                 .await
+                .map_err(|_| McpError::JsonRpc {
+                    code: -32000,
+                    message: format!(
+                        "MCP server did not respond within {}s",
+                        STDIO_RPC_TIMEOUT.as_secs()
+                    ),
+                })?
                 .map_err(McpError::Io)?
                 .ok_or(McpError::ServerClosed)?;
 

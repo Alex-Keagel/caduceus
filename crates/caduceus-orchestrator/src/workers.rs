@@ -144,13 +144,11 @@ impl TaskDAG {
 
     /// Insert a task.  Returns `Err` if a cycle would be introduced.
     pub fn add_task(&mut self, task: TaskDefinition) -> Result<(), String> {
-        // Validate all dependency IDs exist (or at least don't create a cycle
-        // with tasks that are already in the graph).
-        self.tasks.insert(task.id.clone(), task);
+        let task_id = task.id.clone();
+        self.tasks.insert(task_id.clone(), task);
         if self.has_cycle() {
-            let id = self.tasks.keys().last().unwrap().clone();
-            self.tasks.remove(&id);
-            return Err(format!("Adding task '{id}' would create a cycle"));
+            self.tasks.remove(&task_id);
+            return Err(format!("Adding task '{task_id}' would create a cycle"));
         }
         Ok(())
     }
@@ -199,7 +197,7 @@ impl TaskDAG {
         }
         while let Some(cid) = to_cancel.pop_front() {
             if let Some(t) = self.tasks.get_mut(&cid) {
-                if t.status == TaskStatus::Pending {
+                if matches!(t.status, TaskStatus::Pending | TaskStatus::Running) {
                     t.status = TaskStatus::Cancelled;
                     // Cascade further
                     let dependents: Vec<String> = self

@@ -318,6 +318,9 @@ impl HookRegistry {
         Ok(())
     }
 
+    /// Convenience wrapper for calling `emit` from async contexts.
+    /// Note: handlers are still invoked synchronously — this does **not** support
+    /// `async` hook handlers.  It exists so callers don't need `spawn_blocking`.
     pub async fn emit_async(&self, event: &HookEvent, context: &serde_json::Value) -> Result<()> {
         self.emit(event, context)
     }
