@@ -643,6 +643,34 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 | 182 | Context-aware retrieval (RAG-based) | When context is tight (Yellow+), use vector search to inject only relevant code chunks | Omniscience | P1 | `caduceus-omniscience` | ✅ |
 | 183 | Sliding window + summarization hybrid | Default compaction: summarize old turns, keep recent N verbatim | Orchestration | P1 | `caduceus-orchestrator` | ✅ |
 | 184 | `.caduceusignore` integration | Glob-based file exclusion from context injection and indexing | Sandbox | P2 | `caduceus-runtime` | ✅ |
+| 190 | Compaction pipeline | Ordered chain: tool-collapse → summarize → sliding-window → truncate | CORAL/MS | 📋 | P1 | `caduceus-orchestrator` |
+| 191 | Atomic message groups | Tool call + results as atomic units; never split during compaction | MS Framework | 📋 | P1 | `caduceus-orchestrator` |
+| 192 | Compaction triggers | Token/message/turn threshold triggers with AND/OR composition | MS Framework | 📋 | P1 | `caduceus-orchestrator` |
+| 193 | Self-eviction tools | Agent-callable: `/checkpoint`, `/purge`, `/resume` for self-managed context | CORAL | 📋 | P1 | `caduceus-orchestrator` |
+| 194 | Dual-model compaction | Use cheaper model (e.g., Haiku) for summarization pass | Forge | 📋 | P2 | `caduceus-orchestrator` |
+| 195 | Compaction entropy check | Verify summary information density before replacing original | Forge | 📋 | P2 | `caduceus-orchestrator` |
+| 196 | Pattern-based compaction | Only compact [Assistant→ToolCall→ToolResult→Assistant] sequences | Forge | 📋 | P2 | `caduceus-orchestrator` |
+| 197 | Emergency truncation | Last-resort oldest-first drop with configurable minimum preserved | MS Framework | 📋 | P1 | `caduceus-orchestrator` |
+| 198 | Context rot detector | Monitor recall accuracy, detect attention degradation signs | CDR/Anthropic | 📋 | P1 | `caduceus-orchestrator` |
+| 199 | Behavioral drift detector | Detect deviation from expected reasoning patterns | CDR | 📋 | P2 | `caduceus-orchestrator` |
+| 200 | Memory entrenchment guard | Prevent poisoned/hallucinated data from persisting to memory | CDR | 📋 | P2 | `caduceus-storage` |
+| 201 | Cognitive degradation circuit breaker | Auto-reset agent on stage 3+ degradation detection | CDR/CORAL | 📋 | P1 | `caduceus-orchestrator` |
+| 202 | Attention budget tracker | Track/display remaining effective attention capacity | Anthropic | 📋 | P2 | `caduceus-telemetry` |
+| 203 | Agentic tree search | Branch/prune hypothesis tree for complex tasks | AI-Scientist-v2 | 📋 | P2 | `caduceus-orchestrator` |
+| 204 | Branch reflection | On error, analyze log and choose alternative approach path | AI-Scientist-v2 | 📋 | P2 | `caduceus-orchestrator` |
+| 205 | Autonomous error recovery | Self-heal from errors without human escalation | AI-Scientist-v2 | 📋 | P2 | `caduceus-orchestrator` |
+| 206 | Session trajectory recorder | Record full session artifacts for skill evolution | SkillClaw | 📋 | P2 | `caduceus-storage` |
+| 207 | Skill evolver service | Background: summarize → aggregate → execute skill updates | SkillClaw | 📋 | P2 | `caduceus-marketplace` |
+| 208 | Pattern aggregator | Cross-session behavioral pattern detection and consolidation | SkillClaw | 📋 | P2 | `caduceus-marketplace` |
+| 209 | Skill auto-generator | Auto-create SKILL.md from recurring successful patterns | SkillClaw | 📋 | P2 | `caduceus-marketplace` |
+| 210 | Skill quality scorer (PRM) | Process Reward Model scoring for skill effectiveness | SkillClaw | 📋 | P3 | `caduceus-marketplace` |
+| 211 | Collective skill sync | Push/pull evolved skills across Caduceus instances | SkillClaw | 📋 | P3 | `caduceus-marketplace` |
+| 212 | Skill versioning & rollback | Track skill evolution history with safe rollback | SkillClaw | 📋 | P2 | `caduceus-marketplace` |
+| 213 | Just-in-time context loader | Replace large content with references; load on demand | Anthropic | 📋 | P1 | `caduceus-orchestrator` |
+| 214 | Relevance decay | Memory relevance scores decay over time unless re-accessed | Memory Survey | 📋 | P2 | `caduceus-storage` |
+| 215 | Memory garbage collector | Periodic pruning of stale/unreferenced memories | Memory Survey | 📋 | P2 | `caduceus-storage` |
+| 216 | Context quality scorer | Score context density/relevance before each LLM call | Confucius | 📋 | P2 | `caduceus-orchestrator` |
+| 217 | Scaffold quality benchmark | Measure orchestration quality independent of model choice | Confucius | 📋 | P3 | `caduceus-telemetry` |
 
 ---
 
