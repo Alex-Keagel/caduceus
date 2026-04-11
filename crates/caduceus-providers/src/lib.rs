@@ -208,6 +208,126 @@ impl RetryConfig {
     }
 }
 
+// ── Circuit breaker ──────────────────────────────────────────────────────────
+
+/// Circuit breaker states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CircuitState {
+    /// Normal operation — requests pass through.
+    Closed = 0,
+    /// Circuit tripped — requests are rejected immediately.
+    Open = 1,
+    /// Cooldown expired — allow one probe request to test recovery.
+    HalfOpen = 2,
+}
+
+impl CircuitState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Closed,
+            1 => Self::Open,
+            2 => Self::HalfOpen,
+            _ => Self::Closed,
+        }
+    }
+}
+
+/// Auto-disable a provider/tool after N consecutive failures.
+///
+/// State machine: Closed → (threshold failures) → Open → (cooldown) → HalfOpen
+///   - HalfOpen + success → Closed
+///   - HalfOpen + failure → Open
+pub struct CircuitBreaker {
+    failure_count: std::sync::atomic::AtomicU32,
+    threshold: u32,
+    state: std::sync::atomic::AtomicU8,
+    last_failure: std::sync::Mutex<Option<std::time::Instant>>,
+    cooldown: std::time::Duration,
+}
+
+impl CircuitBreaker {
+    pub fn new(threshold: u32, cooldown: std::time::Duration) -> Self {
+        Self {
+            failure_count: std::sync::atomic::AtomicU32::new(0),
+            threshold,
+            state: std::sync::atomic::AtomicU8::new(CircuitState::Closed as u8),
+            last_failure: std::sync::Mutex::new(None),
+            cooldown,
+        }
+    }
+
+    /// Check whether a request should be allowed through.
+    /// Returns `Ok(())` if the circuit is closed or half-open (probe allowed).
+    /// Returns `Err` if the circuit is open.
+    pub fn check(&self) -> Result<()> {
+        let state = CircuitState::from_u8(self.state.load(std::sync::atomic::Ordering::SeqCst));
+        match state {
+            CircuitState::Closed => Ok(()),
+            CircuitState::HalfOpen => Ok(()), // allow probe
+            CircuitState::Open => {
+                // Check if cooldown has expired → transition to HalfOpen
+                let last = self.last_failure.lock().unwrap();
+                if let Some(instant) = *last {
+                    if instant.elapsed() >= self.cooldown {
+                        drop(last);
+                        self.state.store(
+                            CircuitState::HalfOpen as u8,
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        return Ok(());
+                    }
+                }
+                Err(CaduceusError::Provider(
+                    "Circuit breaker is open — provider temporarily disabled".into(),
+                ))
+            }
+        }
+    }
+
+    /// Record a successful request. Resets the circuit to Closed.
+    pub fn record_success(&self) {
+        self.failure_count
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.state.store(
+            CircuitState::Closed as u8,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// Record a failed request. Increments failure count and may trip the circuit.
+    pub fn record_failure(&self) {
+        let count = self
+            .failure_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        *self.last_failure.lock().unwrap() = Some(std::time::Instant::now());
+
+        if count >= self.threshold {
+            self.state.store(
+                CircuitState::Open as u8,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+    }
+
+    /// Get the current circuit state.
+    pub fn state(&self) -> CircuitState {
+        CircuitState::from_u8(self.state.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Get the current consecutive failure count.
+    pub fn failure_count(&self) -> u32 {
+        self.failure_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Default for CircuitBreaker {
+    fn default() -> Self {
+        Self::new(5, std::time::Duration::from_secs(60))
+    }
+}
+
 // ── Retry helper ──────────────────────────────────────────────────────────────
 
 fn is_retryable_status(status: u16) -> bool {
@@ -2286,5 +2406,46 @@ mod tests {
         let (pid, mid) = resolved.unwrap();
         assert_eq!(pid.0, "copilot");
         assert_eq!(mid.0, "gpt-4o");
+    }
+
+    // ── Circuit breaker tests ──────────────────────────────────────────────
+
+    #[test]
+    fn circuit_breaker_starts_closed() {
+        let cb = CircuitBreaker::default();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(cb.check().is_ok());
+    }
+
+    #[test]
+    fn circuit_breaker_opens_after_threshold() {
+        let cb = CircuitBreaker::new(3, std::time::Duration::from_secs(60));
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        cb.record_failure(); // 3rd failure → opens
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert!(cb.check().is_err());
+    }
+
+    #[test]
+    fn circuit_breaker_success_resets() {
+        let cb = CircuitBreaker::new(3, std::time::Duration::from_secs(60));
+        cb.record_failure();
+        cb.record_failure();
+        cb.record_success();
+        assert_eq!(cb.failure_count(), 0);
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn circuit_breaker_half_open_after_cooldown() {
+        let cb = CircuitBreaker::new(1, std::time::Duration::from_millis(10));
+        cb.record_failure(); // opens immediately
+        assert_eq!(cb.state(), CircuitState::Open);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // After cooldown, check() transitions to HalfOpen
+        assert!(cb.check().is_ok());
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
     }
 }
