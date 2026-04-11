@@ -415,4 +415,42 @@ mod tests {
         assert_eq!(client.status, ServerStatus::Stopped);
         assert!(!client.is_running());
     }
+
+    // ── Additional MCP tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_jsonrpc_error_response() {
+        let json = r#"{
+            "jsonrpc": "2.0",
+            "id": 42,
+            "error": { "code": -32600, "message": "Invalid Request", "data": null }
+        }"#;
+        let resp: JsonRpcResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.id, Some(42));
+        assert!(resp.error.is_some());
+        assert!(resp.result.is_none());
+
+        let err = resp.into_result().unwrap_err();
+        match err {
+            McpError::JsonRpc { code, message } => {
+                assert_eq!(code, -32600);
+                assert_eq!(message, "Invalid Request");
+            }
+            other => panic!("expected JsonRpc error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_jsonrpc_empty_result_error() {
+        let json = r#"{
+            "jsonrpc": "2.0",
+            "id": 5
+        }"#;
+        let resp: JsonRpcResponse = serde_json::from_str(json).unwrap();
+        let err = resp.into_result().unwrap_err();
+        assert!(
+            matches!(err, McpError::EmptyResult),
+            "missing result and error should yield EmptyResult"
+        );
+    }
 }

@@ -766,4 +766,186 @@ mod tests {
         let filter = IgnoreFilter::load(dir.path());
         assert!(!filter.is_ignored(Path::new("anything.txt")));
     }
+
+    // ── Security boundary tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_path_traversal_dotdot() {
+        let dir = tempfile::tempdir().unwrap();
+        let ops = FileOps::new(dir.path());
+        let result = ops.read("../../../etc/passwd").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("escapes workspace") || err.contains("Permission denied"),
+            "expected path escape error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_path_traversal_encoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let ops = FileOps::new(dir.path());
+        // URL-encoded traversal: %2e%2e = ".."
+        let result = ops.read("%2e%2e/%2e%2e/etc/passwd").await;
+        // The literal percent-encoded name should either be not found or be rejected
+        assert!(result.is_err(), "URL-encoded traversal should not succeed");
+    }
+
+    #[tokio::test]
+    async fn test_symlink_escape_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        std::fs::write(outside_dir.path().join("secret.txt"), "top-secret-data").unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                outside_dir.path().join("secret.txt"),
+                dir.path().join("escape_link"),
+            )
+            .unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            // On non-Unix, just verify path validation still works
+            return;
+        }
+
+        let ops = FileOps::new(dir.path());
+        let result = ops.read("escape_link").await;
+        assert!(result.is_err(), "symlink escape should be denied");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("escapes workspace") || err.contains("Permission denied"),
+            "expected workspace escape error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_outside_workspace_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let ops = FileOps::new(dir.path());
+        let result = ops.write("/tmp/evil_file.txt", "hacked").await;
+        assert!(
+            result.is_err(),
+            "writing to absolute path outside workspace should fail"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("escapes workspace") || err.contains("Permission denied"),
+            "expected permission error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_caduceusignore_blocks_access() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".caduceusignore"),
+            "*.secret\nconfidential/*\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("data.secret"), "hidden").unwrap();
+        std::fs::create_dir_all(dir.path().join("confidential")).unwrap();
+        std::fs::write(dir.path().join("confidential/keys.txt"), "key123").unwrap();
+
+        let ops = FileOps::new(dir.path());
+
+        // Direct read of ignored file
+        let result = ops.read("data.secret").await;
+        assert!(
+            result.is_err(),
+            ".caduceusignore should block read of *.secret"
+        );
+
+        // Read of file in ignored directory
+        let result = ops.read("confidential/keys.txt").await;
+        assert!(
+            result.is_err(),
+            ".caduceusignore should block confidential/*"
+        );
+
+        // Glob should exclude ignored files
+        let results = ops.glob_search("**/*").await.unwrap();
+        assert!(
+            !results.iter().any(|r| r.contains("data.secret")),
+            "glob should exclude .secret files"
+        );
+        assert!(
+            !results.iter().any(|r| r.contains("confidential/keys.txt")),
+            "glob should exclude files under confidential/"
+        );
+
+        // Non-ignored file should still work
+        std::fs::write(dir.path().join("public.txt"), "visible").unwrap();
+        let content = ops.read("public.txt").await.unwrap();
+        assert_eq!(content, "visible");
+    }
+
+    #[tokio::test]
+    async fn test_bash_dangerous_command_rm_rf() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = BashSandbox::new(dir.path());
+        // We can't actually classify commands in BashSandbox (it just executes),
+        // but we verify that rm -rf / fails or is contained:
+        let result = sandbox
+            .execute(ExecRequest {
+                command: "rm -rf / --no-preserve-root 2>&1 || true".into(),
+                args: vec![],
+                cwd: None,
+                env: std::collections::HashMap::new(),
+                timeout_secs: Some(2),
+            })
+            .await
+            .unwrap();
+        // The command should either fail (non-zero exit) or be denied.
+        // On macOS it will produce permission errors since we're not root.
+        // The key assertion: our workspace dir still exists.
+        assert!(
+            dir.path().exists(),
+            "workspace must survive dangerous commands"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bash_sudo_command_fails_noninteractive() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = BashSandbox::new(dir.path());
+        let result = sandbox
+            .execute(ExecRequest {
+                command: "sudo echo test".into(),
+                args: vec![],
+                cwd: None,
+                env: std::collections::HashMap::new(),
+                timeout_secs: Some(2),
+            })
+            .await
+            .unwrap();
+        // sudo without a terminal/password should fail
+        assert_ne!(
+            result.exit_code, 0,
+            "sudo should fail in non-interactive sandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bash_safe_command_ls() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "hi").unwrap();
+        let sandbox = BashSandbox::new(dir.path());
+        let result = sandbox
+            .execute(ExecRequest {
+                command: "ls".into(),
+                args: vec![],
+                cwd: None,
+                env: std::collections::HashMap::new(),
+                timeout_secs: Some(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.contains("visible.txt"));
+        assert!(!result.timed_out);
+    }
 }

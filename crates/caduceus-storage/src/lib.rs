@@ -1805,4 +1805,113 @@ mod tests {
         assert!(matches!(events[1].event_type, TraceEventType::ToolExec));
         assert_eq!(events[0].duration_ms, Some(150));
     }
+
+    // ── Concurrent access tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_concurrent_session_writes() {
+        let (_dir, storage) = temp_storage();
+        let storage = std::sync::Arc::new(storage);
+
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let s = storage.clone();
+            handles.push(tokio::spawn(async move {
+                let state = SessionState::new(
+                    format!("/workspace/project-{i}"),
+                    ProviderId::new("anthropic"),
+                    ModelId::new("claude-sonnet-4-6"),
+                );
+                s.create_session(&state).await.unwrap();
+                state.id
+            }));
+        }
+
+        let mut ids = Vec::new();
+        for handle in handles {
+            ids.push(handle.await.unwrap());
+        }
+
+        // All 10 sessions should exist and be distinct
+        assert_eq!(ids.len(), 10);
+        let unique: std::collections::HashSet<String> =
+            ids.iter().map(|id| id.to_string()).collect();
+        assert_eq!(unique.len(), 10, "all session IDs should be unique");
+
+        // Verify each session is loadable
+        for id in &ids {
+            let loaded = storage.load_session(id).await.unwrap();
+            assert!(loaded.is_some(), "session {} should be loadable", id);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_message_inserts() {
+        let (_dir, storage) = temp_storage();
+        let state = sample_state();
+        storage.create_session(&state).await.unwrap();
+
+        let storage = std::sync::Arc::new(storage);
+        let session_id = state.id.clone();
+        let mut handles = Vec::new();
+
+        for i in 0..20 {
+            let s = storage.clone();
+            let sid = session_id.clone();
+            handles.push(tokio::spawn(async move {
+                let msg = LlmMessage::user(format!("message-{i}"));
+                s.save_message(&sid, &msg, Some(i as u32)).await.unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let messages = storage.list_messages(&session_id).await.unwrap();
+        assert_eq!(
+            messages.len(),
+            20,
+            "all 20 concurrent message inserts should succeed"
+        );
+
+        // Verify all messages are present (order may vary due to concurrency)
+        let contents: Vec<String> = messages
+            .iter()
+            .filter_map(|m| {
+                m.message.content.first().and_then(|c| match c {
+                    ContentBlock::Text(t) => Some(t.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+        for i in 0..20 {
+            assert!(
+                contents.iter().any(|c| c == &format!("message-{i}")),
+                "message-{i} should be present"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_not_found_error() {
+        let (_dir, storage) = temp_storage();
+        let bogus_id = SessionId::new();
+
+        // load_session returns None for nonexistent session
+        let result = storage.load_session(&bogus_id).await.unwrap();
+        assert!(
+            result.is_none(),
+            "loading nonexistent session should return None, not panic"
+        );
+
+        // resume_session returns SessionNotFound error
+        let result = storage.resume_session(&bogus_id).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, CaduceusError::SessionNotFound(_)),
+            "expected SessionNotFound, got: {err}"
+        );
+    }
 }

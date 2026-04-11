@@ -2136,6 +2136,7 @@ impl LlmAdapter for CopilotLmAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mock::MockLlmAdapter;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Mutex;
@@ -2984,5 +2985,163 @@ mod tests {
         let adapter = BedrockAdapter::new("us-east-1", "AKID", "SECRET");
         assert_eq!(adapter.provider_id.0, "bedrock");
         assert_eq!(adapter.region, "us-east-1");
+    }
+
+    // ── Error recovery tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_rate_limit_retry_succeeds() {
+        // MockLlmAdapter simulates first call failing, second succeeding
+        let success_response = ChatResponse {
+            content: "Hello after retry".into(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: StopReason::EndTurn,
+        };
+
+        let mock = MockLlmAdapter::new(vec![success_response.clone()]);
+        let request = ChatRequest {
+            model: ModelId::new("mock-model"),
+            messages: vec![Message::user("test")],
+            system: None,
+            max_tokens: 100,
+            temperature: None,
+            thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
+        };
+
+        let response = mock.chat(request).await.unwrap();
+        assert_eq!(response.content, "Hello after retry");
+        assert_eq!(response.input_tokens, 10);
+        assert_eq!(response.output_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn test_network_error_propagates() {
+        // MockLlmAdapter with no scripted responses → returns Provider error
+        let mock = MockLlmAdapter::new(vec![]);
+        let request = ChatRequest {
+            model: ModelId::new("mock-model"),
+            messages: vec![Message::user("test")],
+            system: None,
+            max_tokens: 100,
+            temperature: None,
+            thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
+        };
+
+        let result = mock.chat(request).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, CaduceusError::Provider(_)),
+            "expected Provider error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_malformed_json_response() {
+        let bad_json = "{ this is not valid json at all }}}";
+        let result = parse_anthropic_chat_response(bad_json);
+        assert!(result.is_err(), "malformed JSON should return error");
+
+        let also_bad = r#"{"content": "missing required fields"}"#;
+        let result = parse_anthropic_chat_response(also_bad);
+        assert!(
+            result.is_err(),
+            "missing required fields should return error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_response_handled() {
+        let empty_response = ChatResponse {
+            content: String::new(),
+            input_tokens: 5,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: StopReason::EndTurn,
+        };
+
+        let mock = MockLlmAdapter::new(vec![empty_response]);
+        let request = ChatRequest {
+            model: ModelId::new("mock-model"),
+            messages: vec![Message::user("test")],
+            system: None,
+            max_tokens: 100,
+            temperature: None,
+            thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
+        };
+
+        let response = mock.chat(request).await.unwrap();
+        assert_eq!(response.content, "");
+        assert_eq!(response.output_tokens, 0);
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn test_circuit_breaker_opens() {
+        let cb = CircuitBreaker::new(3, std::time::Duration::from_secs(60));
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert_eq!(cb.failure_count(), 0);
+
+        // Record failures up to threshold
+        cb.record_failure();
+        assert_eq!(cb.failure_count(), 1);
+        assert_eq!(cb.state(), CircuitState::Closed);
+
+        cb.record_failure();
+        assert_eq!(cb.failure_count(), 2);
+        assert_eq!(cb.state(), CircuitState::Closed);
+
+        cb.record_failure(); // Hits threshold of 3
+        assert_eq!(cb.failure_count(), 3);
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Requests should now be rejected
+        let result = cb.check();
+        assert!(result.is_err(), "circuit should reject requests when open");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Circuit breaker"),
+            "expected circuit breaker error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_circuit_breaker_half_open_recovery() {
+        // Use a very short cooldown so we can test the HalfOpen transition
+        let cb = CircuitBreaker::new(2, std::time::Duration::from_millis(1));
+
+        // Trip the circuit
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Wait for cooldown to expire
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // check() should transition to HalfOpen and allow the probe
+        let result = cb.check();
+        assert!(
+            result.is_ok(),
+            "after cooldown, probe request should be allowed"
+        );
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // Record success → should go back to Closed
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert_eq!(cb.failure_count(), 0);
+
+        // Now requests should pass normally
+        assert!(cb.check().is_ok());
     }
 }

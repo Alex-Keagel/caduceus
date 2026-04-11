@@ -272,4 +272,37 @@ mod tests {
         mgr.add_server(dummy_config("srv5"), false).await.unwrap();
         mgr.shutdown_all().await; // should not panic
     }
+
+    // ── Additional manager tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_tool_not_found_error() {
+        let mgr = McpServerManager::new();
+        // No servers registered, so any tool call should fail
+        let result = mgr
+            .call_tool("nonexistent_tool", serde_json::json!({}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, McpError::ToolNotFound(_)),
+            "expected ToolNotFound error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_server_disconnect_handled() {
+        let mgr = McpServerManager::new();
+        // Add a server but don't connect it
+        mgr.add_server(dummy_config("disconnected"), false)
+            .await
+            .unwrap();
+
+        // Calling a tool should fail since server isn't running
+        let result = mgr.call_tool("any_tool", serde_json::json!({})).await;
+        assert!(
+            result.is_err(),
+            "calling tool on disconnected server should error"
+        );
+    }
 }

@@ -874,4 +874,113 @@ mod tests {
         assert_eq!(sink.text(), "hello");
         assert_eq!(sink.fragments.len(), 1);
     }
+
+    // ── Additional CRDT tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_concurrent_insert_same_position() {
+        // Two replicas insert at position 0. Both buffers should converge.
+        let mut replica_a = Buffer::new();
+        let mut replica_b = Buffer::new();
+
+        let op_a = replica_a.insert(0, "X", ReplicaId::HUMAN);
+        let op_b = replica_b.insert(0, "Y", ReplicaId::FIRST_AGENT);
+
+        replica_a.apply_remote(op_b.clone());
+        replica_b.apply_remote(op_a.clone());
+
+        // Both must converge to the same text
+        assert_eq!(
+            replica_a.text(),
+            replica_b.text(),
+            "concurrent inserts at same position must converge"
+        );
+        assert_eq!(replica_a.len(), 2);
+        // The actual order depends on FragmentId ordering (higher replica_id wins left position)
+        let text = replica_a.text();
+        assert!(
+            text == "YX" || text == "XY",
+            "text should be XY or YX, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_insert_delete_commutativity() {
+        // Apply insert then delete vs delete then insert should yield same result
+        let mut buffer_ab = Buffer::new();
+        let mut buffer_ba = Buffer::new();
+
+        // Create identical base state
+        let base_insert = Operation::Insert {
+            id: FragmentId::new(LamportTimestamp(1), ReplicaId::HOST),
+            after_id: None,
+            text: "hello".into(),
+        };
+        buffer_ab.apply_remote(base_insert.clone());
+        buffer_ba.apply_remote(base_insert);
+
+        assert_eq!(buffer_ab.text(), "hello");
+        assert_eq!(buffer_ba.text(), "hello");
+
+        // Operation A: insert "X" at position 5
+        let op_a = buffer_ab.insert(5, "X", ReplicaId::HUMAN);
+        // Operation B: delete "llo" (positions 2..5)
+        let op_b = buffer_ab.delete(2, 3, ReplicaId::FIRST_AGENT);
+
+        // Apply in opposite order on buffer_ba
+        buffer_ba.apply_remote(op_b.clone());
+        buffer_ba.apply_remote(op_a.clone());
+
+        // Both buffers should converge
+        assert_eq!(
+            buffer_ab.text(),
+            buffer_ba.text(),
+            "insert+delete must commute: ab={}, ba={}",
+            buffer_ab.text(),
+            buffer_ba.text()
+        );
+    }
+
+    #[test]
+    fn test_undo_redo_roundtrip() {
+        let mut buffer = Buffer::new();
+        let insert = buffer.insert(0, "hello world", ReplicaId::HOST);
+        assert_eq!(buffer.text(), "hello world");
+
+        // Delete "world"
+        let delete = buffer.delete(6, 5, ReplicaId::HUMAN);
+        assert_eq!(buffer.text(), "hello ");
+
+        // Undo the delete → should restore "world"
+        let _undo_del = buffer.undo(delete.id().clone(), ReplicaId::FIRST_AGENT);
+        assert_eq!(buffer.text(), "hello world");
+
+        // Undo the insert → should hide all inserted text
+        let _undo_ins = buffer.undo(insert.id().clone(), ReplicaId::HUMAN);
+        assert_eq!(buffer.text(), "", "undoing the insert should hide all text");
+        assert!(
+            buffer.is_empty(),
+            "buffer should be empty after undoing insert"
+        );
+    }
+
+    #[test]
+    fn test_large_document_performance() {
+        use std::time::Instant;
+        let mut buffer = Buffer::new();
+        let start = Instant::now();
+
+        for i in 0..10_000 {
+            buffer.insert(buffer.len(), "x", ReplicaId((i % 4) as u16));
+        }
+
+        let elapsed = start.elapsed();
+        assert_eq!(buffer.len(), 10_000);
+        assert_eq!(buffer.text().len(), 10_000);
+        assert!(
+            elapsed.as_secs() < 5,
+            "10,000 inserts should complete in <5s, took {:?}",
+            elapsed
+        );
+    }
 }
