@@ -4,14 +4,31 @@ import Chat, { type ChatHandle } from "./components/Chat";
 import GitPanel from "./components/GitPanel";
 import StatusBar from "./components/StatusBar";
 import CommandPalette from "./components/CommandPalette";
+import BuddySprite from "./components/BuddySprite";
+import CardTerminal from "./components/CardTerminal";
+import ContextQualityBadge from "./components/ContextQualityBadge";
+import ContextViewer from "./components/ContextViewer";
+import ContextVisualizer from "./components/ContextVisualizer";
+import DesignMode from "./components/DesignMode";
+import DiffViewer from "./components/DiffViewer";
+import ImageRenderer from "./components/ImageRenderer";
+import InlineDiffReview from "./components/InlineDiffReview";
 import MarketplacePanel from "./components/MarketplacePanel";
+import MarketplaceCard from "./components/MarketplaceCard";
+import ModelPicker from "./components/ModelPicker";
 import KanbanBoard from "./components/KanbanBoard";
 import KeybindingSettings from "./components/KeybindingSettings";
+import SessionBrowser from "./components/SessionBrowser";
+import SyntaxHighlighter from "./components/SyntaxHighlighter";
 import ThemePicker from "./components/ThemePicker";
 import SplitPane from "./components/SplitPane";
 import AgentsWindow, { type AgentWindowTab } from "./components/AgentsWindow";
 import DesktopNotifications from "./components/DesktopNotifications";
+import VimMode from "./components/VimMode";
+import VoiceInput from "./components/VoiceInput";
+import OnboardingTour, { HelpPanel, ContextualHelpOverlay } from "./components/OnboardingTour";
 import { useKeybindings } from "./hooks/useKeybindings";
+import { useOnboarding } from "./hooks/useOnboarding";
 import { applyTheme, getTheme, loadStoredTheme, type ThemeName } from "./theme";
 import type {
   KanbanBoard as KanbanBoardData,
@@ -31,12 +48,27 @@ interface AgentWorkspace {
   status: AgentWindowTab["status"];
 }
 
+interface DesignAnnotation {
+  id: string;
+  type: "arrow" | "box" | "text" | "highlight";
+  x: number;
+  y: number;
+  width?: number;
+  height?: number;
+  text?: string;
+  color: string;
+}
+
 interface AppState {
   workspaces: AgentWorkspace[];
   activeWorkspaceId: string;
   commandPaletteOpen: boolean;
   marketplaceOpen: boolean;
   kanbanOpen: boolean;
+  contextViewerOpen: boolean;
+  sessionBrowserOpen: boolean;
+  diffViewerOpen: boolean;
+  designModeEnabled: boolean;
   gitPanelOpen: boolean;
   chatOpen: boolean;
   keybindingSettingsOpen: boolean;
@@ -59,6 +91,10 @@ type AppAction =
   | { type: "TOGGLE_COMMAND_PALETTE" }
   | { type: "CLOSE_COMMAND_PALETTE" }
   | { type: "TOGGLE_MARKETPLACE" }
+  | { type: "TOGGLE_CONTEXT_VIEWER" }
+  | { type: "TOGGLE_SESSION_BROWSER" }
+  | { type: "TOGGLE_DIFF_VIEWER" }
+  | { type: "TOGGLE_DESIGN_MODE" }
   | { type: "TOGGLE_GIT_PANEL" }
   | { type: "TOGGLE_CHAT" }
   | { type: "TOGGLE_KEYBINDING_SETTINGS" }
@@ -102,6 +138,10 @@ const initialState: AppState = {
   commandPaletteOpen: false,
   marketplaceOpen: false,
   kanbanOpen: false,
+  contextViewerOpen: false,
+  sessionBrowserOpen: false,
+  diffViewerOpen: false,
+  designModeEnabled: false,
   gitPanelOpen: true,
   chatOpen: true,
   keybindingSettingsOpen: false,
@@ -233,6 +273,14 @@ function reducer(state: AppState, action: AppAction): AppState {
       return { ...state, commandPaletteOpen: false };
     case "TOGGLE_MARKETPLACE":
       return { ...state, marketplaceOpen: !state.marketplaceOpen, kanbanOpen: false };
+    case "TOGGLE_CONTEXT_VIEWER":
+      return { ...state, contextViewerOpen: !state.contextViewerOpen };
+    case "TOGGLE_SESSION_BROWSER":
+      return { ...state, sessionBrowserOpen: !state.sessionBrowserOpen };
+    case "TOGGLE_DIFF_VIEWER":
+      return { ...state, diffViewerOpen: !state.diffViewerOpen };
+    case "TOGGLE_DESIGN_MODE":
+      return { ...state, designModeEnabled: !state.designModeEnabled };
     case "TOGGLE_GIT_PANEL":
       return { ...state, gitPanelOpen: !state.gitPanelOpen };
     case "TOGGLE_CHAT":
@@ -263,6 +311,9 @@ function reducer(state: AppState, action: AppAction): AppState {
 function App() {
   const [state, dispatch] = useReducer(reducer, initialState);
   const [themeName, setThemeName] = useState<ThemeName>(loadStoredTheme());
+  const [selectedModelId, setSelectedModelId] = useState("claude-sonnet-4-5");
+  const [designAnnotations, setDesignAnnotations] = useState<DesignAnnotation[]>([]);
+  const { helpOpen, setHelpOpen, helpOverlayOpen, setHelpOverlayOpen } = useOnboarding();
   const chatRef = useRef<ChatHandle>(null);
   const terminalRegionRef = useRef<HTMLDivElement>(null);
 
@@ -273,6 +324,61 @@ function App() {
   const theme = useMemo(() => getTheme(themeName), [themeName]);
   const activeWorkspace = state.workspaces.find((workspace) => workspace.id === state.activeWorkspaceId) ?? state.workspaces[0];
   const activeSession = activeWorkspace?.session ?? null;
+
+  useEffect(() => {
+    if (activeSession?.model_id) {
+      setSelectedModelId(activeSession.model_id);
+    }
+  }, [activeSession?.model_id]);
+
+  const sessionEntries = useMemo(
+    () =>
+      state.workspaces
+        .filter((workspace): workspace is AgentWorkspace & { session: SessionInfo } => workspace.session !== null)
+        .map((workspace, index) => {
+          const parsedDate = Date.parse(workspace.session.id);
+          return {
+            id: workspace.session.id,
+            date: Number.isNaN(parsedDate)
+              ? new Date(Date.now() - index * 60_000).toISOString()
+              : new Date(parsedDate).toISOString(),
+            firstMessage: workspace.title,
+            tokenCount:
+              workspace.session.token_budget.used_input +
+              workspace.session.token_budget.used_output +
+              workspace.session.token_budget.reserved_output,
+            modelId: workspace.session.model_id,
+          };
+        }),
+    [state.workspaces]
+  );
+  const contextScore = activeSession
+    ? Math.max(
+        0,
+        1 -
+          (activeSession.token_budget.used_input +
+            activeSession.token_budget.used_output +
+            activeSession.token_budget.reserved_output) /
+            Math.max(activeSession.token_budget.context_limit, 1)
+      )
+    : 0.85;
+  const buddyMood =
+    state.phase === "Running" || state.phase === "AwaitingPermission"
+      ? "working"
+      : state.phase === "Error"
+        ? "error"
+        : state.phase === "Completed"
+          ? "celebrating"
+          : "idle";
+
+  // Child components used within other components:
+  // - SyntaxHighlighter: used in Chat for code blocks
+  // - MarketplaceCard: used in MarketplacePanel for skill cards
+  // - InlineDiffReview: used in DiffViewer for diff display
+  // - ImageRenderer: used in Chat for image messages
+  // - CardTerminal: used in KanbanBoard for per-card previews
+  // - VimMode: used in Chat input when vim mode enabled
+  // - ContextVisualizer: used in StatusBar for token breakdown
 
   const keybindingActions = useMemo<Record<string, () => void>>(
     () => ({
@@ -380,7 +486,36 @@ function App() {
           <div className="workspace-subtitle">{workspaceSubtitle}</div>
         </div>
         <div className="workspace-toolbar__controls">
+          <ModelPicker value={selectedModelId} onChange={setSelectedModelId} />
           <ThemePicker value={themeName} onChange={setThemeName} />
+          <button
+            type="button"
+            className="workspace-button"
+            onClick={() => dispatch({ type: "TOGGLE_CONTEXT_VIEWER" })}
+          >
+            {state.contextViewerOpen ? "Hide context" : "Open context"}
+          </button>
+          <button
+            type="button"
+            className="workspace-button"
+            onClick={() => dispatch({ type: "TOGGLE_SESSION_BROWSER" })}
+          >
+            {state.sessionBrowserOpen ? "Hide sessions" : "Open sessions"}
+          </button>
+          <button
+            type="button"
+            className="workspace-button"
+            onClick={() => dispatch({ type: "TOGGLE_DIFF_VIEWER" })}
+          >
+            {state.diffViewerOpen ? "Hide diff" : "Open diff"}
+          </button>
+          <button
+            type="button"
+            className="workspace-button"
+            onClick={() => dispatch({ type: "TOGGLE_DESIGN_MODE" })}
+          >
+            {state.designModeEnabled ? "Disable design mode" : "Enable design mode"}
+          </button>
           <button type="button" className="workspace-button" onClick={() => dispatch({ type: "TOGGLE_KANBAN" })}>
             {state.kanbanOpen ? "Back to terminal" : "Open kanban"}
           </button>
@@ -410,6 +545,39 @@ function App() {
       />
 
       <div className="workspace-stage">{workspaceContent}</div>
+
+      {state.contextViewerOpen && activeSession ? (
+        <div style={{ padding: "0 20px 20px" }}>
+          <ContextViewer tokenBudget={activeSession.token_budget} />
+        </div>
+      ) : null}
+
+      {state.sessionBrowserOpen ? (
+        <div style={{ padding: "0 20px 20px" }}>
+          <SessionBrowser
+            sessions={sessionEntries}
+            activeSessionId={activeSession?.id}
+            onResume={(sessionId) => {
+              const workspace = state.workspaces.find((item) => item.session?.id === sessionId);
+              if (workspace) {
+                dispatch({ type: "SET_ACTIVE_WORKSPACE", workspaceId: workspace.id });
+              }
+            }}
+            onDelete={(sessionId) => {
+              const workspace = state.workspaces.find((item) => item.session?.id === sessionId);
+              if (workspace) {
+                dispatch({ type: "CLOSE_WORKSPACE", workspaceId: workspace.id });
+              }
+            }}
+          />
+        </div>
+      ) : null}
+
+      {state.diffViewerOpen ? (
+        <div style={{ padding: "0 20px 20px" }}>
+          <DiffViewer diffs={[]} />
+        </div>
+      ) : null}
     </main>
   );
 
@@ -424,6 +592,9 @@ function App() {
         onPhaseChange={(phase) => dispatch({ type: "SET_WORKSPACE_PHASE", workspaceId: activeWorkspace.id, phase })}
         onTokenUsage={(usage) => dispatch({ type: "SET_TOKEN_USAGE", usage })}
       />
+      <div style={{ padding: "0 16px 16px" }}>
+        <VoiceInput onTranscript={(text) => chatRef.current?.sendRaw(text)} enabled={true} />
+      </div>
     </aside>
   ) : null;
 
@@ -450,7 +621,34 @@ function App() {
   return (
     <div className="app-layout">
       <DesktopNotifications />
-      <div className="app-layout__content">{shellContent}</div>
+      <div className="app-layout__content" style={{ position: "relative" }}>
+        {shellContent}
+        <DesignMode
+          enabled={state.designModeEnabled}
+          annotations={designAnnotations}
+          onAddAnnotation={(annotation) => {
+            setDesignAnnotations((current) => [...current, annotation]);
+          }}
+          onRemoveAnnotation={(annotationId) => {
+            setDesignAnnotations((current) => current.filter((annotation) => annotation.id !== annotationId));
+          }}
+        />
+      </div>
+
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 12,
+          padding: "8px 16px 0",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <BuddySprite mood={buddyMood} size={32} />
+          <ContextQualityBadge score={contextScore} />
+        </div>
+      </div>
 
       <StatusBar
         session={activeSession}
@@ -477,6 +675,16 @@ function App() {
           }}
         />
       ) : null}
+
+      <OnboardingTour />
+      <HelpPanel
+        open={helpOpen}
+        onClose={() => setHelpOpen(false)}
+      />
+      <ContextualHelpOverlay
+        enabled={helpOverlayOpen}
+        onClose={() => setHelpOverlayOpen(false)}
+      />
     </div>
   );
 }
