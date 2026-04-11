@@ -9,6 +9,7 @@ import type {
   CaduceusConfig,
   PtyDataPayload,
   AgentEvent,
+  KanbanBoard,
   MarketplaceSearchResult,
   McpServerInfo,
 } from "../types";
@@ -80,6 +81,21 @@ export async function gitDiff(projectRoot: string, staged: boolean): Promise<str
 
 export async function gitCommit(projectRoot: string, message: string): Promise<string> {
   return invoke("git_commit", { projectRoot, message });
+}
+
+
+export async function kanbanLoad(projectRoot: string): Promise<KanbanBoard> {
+  return invoke("kanban_load", { projectRoot });
+}
+
+export async function kanbanAddCard(
+  projectRoot: string,
+  title: string,
+  description?: string
+): Promise<KanbanBoard> {
+  return invoke("kanban_add_card", {
+    request: { project_root: projectRoot, title, description: description ?? null },
+  });
 }
 
 // ── Config commands ───────────────────────────────────────────────────────────

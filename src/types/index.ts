@@ -34,8 +34,20 @@ export interface TokenBudget {
 export interface TokenUsage {
   input_tokens: number;
   output_tokens: number;
-  cached_tokens: number;
+  cached_tokens?: number;
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
 }
+
+export type KanbanTokenUsage = TokenUsage;
+
+export type CardStatus =
+  | "Todo"
+  | "Running"
+  | "NeedsReview"
+  | "Done"
+  | { Blocked: string }
+  | { Failed: string };
 
 export interface GitStatusEntry {
   path: string;
@@ -47,6 +59,37 @@ export interface DiffSummary {
   insertions: number;
   deletions: number;
   patch: string;
+}
+
+export interface KanbanColumn {
+  id: string;
+  name: string;
+  card_ids: string[];
+  wip_limit: number | null;
+}
+
+export interface KanbanCard {
+  id: string;
+  title: string;
+  description: string;
+  column_id: string;
+  status: CardStatus;
+  worktree_branch: string | null;
+  agent_session_id: string | null;
+  dependencies: string[];
+  auto_commit: boolean;
+  auto_pr: boolean;
+  token_usage: KanbanTokenUsage;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface KanbanBoard {
+  id: string;
+  name: string;
+  columns: KanbanColumn[];
+  cards: KanbanCard[];
+  created_at: string;
 }
 
 export interface ProjectScanResult {
