@@ -968,6 +968,75 @@ impl Default for ChaosEngine {
     }
 }
 
+// ── #221: PoC Runner ──────────────────────────────────────────────────────────
+
+pub struct PocRunner {
+    pub timeout_secs: u64,
+    pub max_output_bytes: usize,
+    pub allowed_extensions: Vec<String>,
+}
+
+impl Default for PocRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PocRunner {
+    pub fn new() -> Self {
+        Self {
+            timeout_secs: 30,
+            max_output_bytes: 1024 * 1024,
+            allowed_extensions: vec![".js".to_string(), ".py".to_string(), ".sh".to_string()],
+        }
+    }
+
+    pub fn validate_path(
+        &self,
+        file_path: &str,
+        workspace: &str,
+    ) -> std::result::Result<String, String> {
+        let path = Path::new(file_path);
+        let workspace_path = Path::new(workspace);
+        let canonical_workspace = workspace_path
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_path.to_path_buf());
+        let full_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            workspace_path.join(path)
+        };
+        let canonical = full_path
+            .canonicalize()
+            .map_err(|e| format!("Path not found: {e}"))?;
+        if !canonical.starts_with(&canonical_workspace) {
+            return Err("Path escapes workspace".to_string());
+        }
+        if !self.is_allowed_extension(file_path) {
+            return Err(format!("Extension not allowed: {file_path}"));
+        }
+        Ok(canonical.to_string_lossy().to_string())
+    }
+
+    pub fn is_allowed_extension(&self, path: &str) -> bool {
+        self.allowed_extensions
+            .iter()
+            .any(|ext| path.ends_with(ext.as_str()))
+    }
+
+    pub fn build_command(&self, path: &str) -> std::result::Result<(String, Vec<String>), String> {
+        if path.ends_with(".py") {
+            Ok(("python3".to_string(), vec![path.to_string()]))
+        } else if path.ends_with(".js") {
+            Ok(("node".to_string(), vec![path.to_string()]))
+        } else if path.ends_with(".sh") {
+            Ok(("bash".to_string(), vec![path.to_string()]))
+        } else {
+            Err(format!("Unsupported extension for: {path}"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1672,5 +1741,77 @@ mod tests {
             probability: 0.5,
         });
         assert_eq!(engine.list_rules().len(), 2);
+    }
+
+    // ── #221: PocRunner tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn poc_runner_defaults() {
+        let runner = PocRunner::new();
+        assert_eq!(runner.timeout_secs, 30);
+        assert_eq!(runner.max_output_bytes, 1024 * 1024);
+        assert_eq!(runner.allowed_extensions.len(), 3);
+    }
+
+    #[test]
+    fn poc_runner_allowed_extensions() {
+        let runner = PocRunner::new();
+        assert!(runner.is_allowed_extension("exploit.py"));
+        assert!(runner.is_allowed_extension("poc.js"));
+        assert!(runner.is_allowed_extension("run.sh"));
+        assert!(!runner.is_allowed_extension("malware.exe"));
+        assert!(!runner.is_allowed_extension("script.rb"));
+    }
+
+    #[test]
+    fn poc_runner_build_command_python() {
+        let runner = PocRunner::new();
+        let (prog, args) = runner.build_command("/workspace/poc.py").unwrap();
+        assert_eq!(prog, "python3");
+        assert_eq!(args, vec!["/workspace/poc.py"]);
+    }
+
+    #[test]
+    fn poc_runner_build_command_js() {
+        let runner = PocRunner::new();
+        let (prog, args) = runner.build_command("test.js").unwrap();
+        assert_eq!(prog, "node");
+        assert_eq!(args, vec!["test.js"]);
+    }
+
+    #[test]
+    fn poc_runner_build_command_sh() {
+        let runner = PocRunner::new();
+        let (prog, args) = runner.build_command("run.sh").unwrap();
+        assert_eq!(prog, "bash");
+        assert_eq!(args, vec!["run.sh"]);
+    }
+
+    #[test]
+    fn poc_runner_build_command_unsupported_extension() {
+        let runner = PocRunner::new();
+        let result = runner.build_command("exploit.rb");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unsupported extension"));
+    }
+
+    #[test]
+    fn poc_runner_validate_path_escapes_workspace() {
+        let runner = PocRunner::new();
+        // Use a real directory (current dir) as workspace, and try to escape with ../
+        let workspace = std::env::current_dir().unwrap();
+        let result = runner.validate_path("../../../etc/passwd", &workspace.to_string_lossy());
+        // Either the path doesn't exist or it escapes the workspace
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn poc_runner_validate_path_disallowed_extension() {
+        let runner = PocRunner::new();
+        let workspace = std::env::current_dir().unwrap();
+        // Cargo.toml exists but .toml is not allowed
+        let result = runner.validate_path("Cargo.toml", &workspace.to_string_lossy());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Extension not allowed"));
     }
 }
