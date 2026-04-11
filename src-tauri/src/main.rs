@@ -303,8 +303,9 @@ async fn session_create(
     state: State<'_, AppState>,
     request: CreateSessionRequest,
 ) -> Result<SessionInfo, String> {
+    let project_root = resolve_under_workspace(&state.workspace_root, &request.project_root)?;
     let session = SessionState::new(
-        normalize_path(&request.project_root),
+        project_root,
         ProviderId::new(request.provider_id),
         ModelId::new(request.model_id),
     );
@@ -370,6 +371,10 @@ async fn agent_turn(
         .await
         .map_err(|e| e.to_string())?;
 
+    session.project_root = resolve_under_workspace(
+        &state.workspace_root,
+        &session.project_root.to_string_lossy(),
+    )?;
     let config = load_config(&state)?;
     let provider = build_provider(&config, &session.provider_id)?;
     let tools = default_registry_with_root(&session.project_root);
@@ -463,21 +468,35 @@ async fn terminal_exec(
     state: State<'_, AppState>,
     request: TerminalExecRequest,
 ) -> Result<TerminalExecResponse, String> {
+    ensure_terminal_ipc_enabled()?;
     let session_cwd = match parse_session_id(&request.session_id) {
         Ok(session_id) => state
             .storage
             .load_session(&session_id)
             .await
             .map_err(|e| e.to_string())?
-            .map(|session| session.project_root.to_string_lossy().to_string()),
+            .map(|session| {
+                resolve_under_workspace(
+                    &state.workspace_root,
+                    &session.project_root.to_string_lossy(),
+                )
+                .map(|path| path.to_string_lossy().to_string())
+            })
+            .transpose()?,
         Err(_) => None,
     };
+    let cwd = request
+        .cwd
+        .or(session_cwd)
+        .map(|path| resolve_under_workspace(&state.workspace_root, &path))
+        .transpose()?
+        .map(|path| path.to_string_lossy().to_string());
     let sandbox = BashSandbox::new(&state.workspace_root);
     let result = sandbox
         .execute(ExecRequest {
             command: request.command,
             args: Vec::new(),
-            cwd: request.cwd.or(session_cwd),
+            cwd,
             env: HashMap::new(),
             timeout_secs: Some(30),
         })
@@ -497,7 +516,8 @@ async fn project_scan(
     path: String,
 ) -> Result<ProjectScanResponse, String> {
     let config = load_config(&state)?;
-    let project = ProjectScanner::new(normalize_path(&path), config.max_context_tokens)
+    let scan_root = resolve_under_workspace(&state.workspace_root, &path)?;
+    let project = ProjectScanner::new(scan_root, config.max_context_tokens)
         .scan()
         .map_err(|e| e.to_string())?;
     Ok(ProjectScanResponse {
@@ -519,7 +539,9 @@ async fn project_scan(
 
 #[tauri::command]
 async fn git_status(project_root: String) -> Result<Vec<GitStatusEntry>, String> {
-    let repo = open_git_repo(&project_root)?;
+    let workspace_root = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_root = resolve_under_workspace(&workspace_root, &project_root)?;
+    let repo = open_git_repo(&project_root.to_string_lossy())?;
     Ok(repo
         .status()
         .map_err(|e| e.to_string())?
@@ -544,7 +566,9 @@ async fn git_status(project_root: String) -> Result<Vec<GitStatusEntry>, String>
 
 #[tauri::command]
 async fn git_diff(project_root: String, staged: bool) -> Result<String, String> {
-    let repo = open_git_repo(&project_root)?;
+    let workspace_root = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_root = resolve_under_workspace(&workspace_root, &project_root)?;
+    let repo = open_git_repo(&project_root.to_string_lossy())?;
     repo.diff(staged).map_err(|e| e.to_string())
 }
 
@@ -699,6 +723,7 @@ async fn pty_create(
     state: State<'_, AppState>,
     request: PtyCreateRequest,
 ) -> Result<PtyCreateResponse, String> {
+    ensure_terminal_ipc_enabled()?;
     let pty_id = state
         .pty_manager
         .create_pty(&app, request.cols, request.rows)?;
@@ -707,11 +732,13 @@ async fn pty_create(
 
 #[tauri::command]
 async fn pty_write(state: State<'_, AppState>, request: PtyWriteRequest) -> Result<(), String> {
+    ensure_terminal_ipc_enabled()?;
     state.pty_manager.write_pty(&request.pty_id, &request.data)
 }
 
 #[tauri::command]
 async fn pty_resize(state: State<'_, AppState>, request: PtyResizeRequest) -> Result<(), String> {
+    ensure_terminal_ipc_enabled()?;
     state
         .pty_manager
         .resize_pty(&request.pty_id, request.cols, request.rows)
@@ -719,6 +746,7 @@ async fn pty_resize(state: State<'_, AppState>, request: PtyResizeRequest) -> Re
 
 #[tauri::command]
 async fn pty_close(state: State<'_, AppState>, request: PtyCloseRequest) -> Result<(), String> {
+    ensure_terminal_ipc_enabled()?;
     state.pty_manager.close_pty(&request.pty_id)
 }
 
@@ -788,6 +816,39 @@ fn normalize_path(path: &str) -> PathBuf {
     } else {
         candidate
     }
+}
+
+fn resolve_under_workspace(workspace_root: &Path, path: &str) -> Result<PathBuf, String> {
+    let root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let candidate = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        root.join(path)
+    };
+    let normalized = normalize_path(&candidate.to_string_lossy());
+    if normalized.exists() {
+        let canonical = normalized.canonicalize().unwrap_or(normalized);
+        if !canonical.starts_with(&root) {
+            return Err("path escapes the application workspace".to_string());
+        }
+        return Ok(canonical);
+    }
+
+    let parent = normalized.parent().unwrap_or(&normalized);
+    if parent.exists() {
+        let canonical_parent = parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
+        if !canonical_parent.starts_with(&root) {
+            return Err("path escapes the application workspace".to_string());
+        }
+    } else if !normalized.starts_with(&root) {
+        return Err("path escapes the application workspace".to_string());
+    }
+
+    Ok(normalized)
 }
 
 fn matches_catalog_entry(name: &str, description: &str, triggers: &[&str], query: &str) -> bool {
@@ -982,6 +1043,18 @@ fn default_base_url(provider_key: &str) -> Option<String> {
 
 fn is_local_base_url(url: &str) -> bool {
     url.contains("127.0.0.1") || url.contains("localhost")
+}
+
+fn ensure_terminal_ipc_enabled() -> Result<(), String> {
+    if cfg!(debug_assertions)
+        || env::var("CADUCEUS_ENABLE_TERMINAL_IPC").is_ok_and(|value| value == "1")
+    {
+        return Ok(());
+    }
+    Err(
+        "terminal IPC is disabled by default; set CADUCEUS_ENABLE_TERMINAL_IPC=1 to enable it"
+            .to_string(),
+    )
 }
 
 fn open_git_repo(project_root: &str) -> Result<GitRepo, String> {

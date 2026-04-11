@@ -121,23 +121,29 @@ struct McpServerEntry {
 /// Frontmatter is delimited by `---` on its own lines at the start of the file.
 fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
     let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
+    let after_open = if let Some(rest) = trimmed.strip_prefix("---\n") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("---\r\n") {
+        rest
+    } else {
         return (None, content);
-    }
-    // Skip the opening `---` line
-    let after_open = match trimmed.strip_prefix("---") {
-        Some(rest) => rest.trim_start_matches(['\r', '\n']),
-        None => return (None, content),
     };
 
-    if let Some(end_pos) = after_open.find("\n---") {
-        let yaml = &after_open[..end_pos];
-        let body_start = end_pos + 4; // skip "\n---"
-        let body = after_open[body_start..].trim_start_matches(['\r', '\n']);
-        (Some(yaml), body)
-    } else {
-        (None, content)
+    let mut offset = 0usize;
+    for line in after_open.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']) == "---" {
+            let yaml = after_open[..offset].trim_end_matches(['\r', '\n']);
+            let body = after_open[offset + line.len()..].trim_start_matches(['\r', '\n']);
+            return (Some(yaml), body);
+        }
+        offset += line.len();
     }
+
+    if after_open.trim_end_matches(['\r', '\n']) == "---" {
+        return (Some(""), "");
+    }
+
+    (None, content)
 }
 
 // ── InstructionLoader ──────────────────────────────────────────────────────────
