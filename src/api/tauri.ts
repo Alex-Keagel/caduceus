@@ -162,3 +162,85 @@ export async function listenPtyData(handler: (payload: PtyDataPayload) => void):
 export async function listenAgentEvent(handler: (event: AgentEvent) => void): Promise<UnlistenFn> {
   return listen<AgentEvent>("agent:event", (event) => handler(event.payload));
 }
+
+// ── Wave 2 Feature APIs ──────────────────────────────────────────
+
+export async function securityScan(projectRoot: string): Promise<unknown[]> {
+  return invoke("security_scan", { projectRoot });
+}
+
+export async function securityScanDiff(projectRoot: string): Promise<unknown[]> {
+  return invoke("security_scan_diff", { projectRoot });
+}
+
+export async function depScan(projectRoot: string): Promise<unknown[]> {
+  return invoke("dep_scan", { projectRoot });
+}
+
+export async function securityReport(projectRoot: string): Promise<string> {
+  return invoke("security_report", { projectRoot });
+}
+
+export async function contextCompact(sessionId: string): Promise<string> {
+  return invoke("context_compact", { sessionId });
+}
+
+export async function contextHealth(): Promise<Record<string, unknown>> {
+  return invoke("context_health");
+}
+
+export async function pluginList(): Promise<unknown[]> {
+  return invoke("plugin_list");
+}
+
+export async function pluginInstall(name: string): Promise<string> {
+  return invoke("plugin_install", { name });
+}
+
+export async function pluginToggle(name: string, enabled: boolean): Promise<void> {
+  return invoke("plugin_toggle", { name, enabled });
+}
+
+export async function policyEvaluate(toolName: string, args: Record<string, unknown>): Promise<string> {
+  return invoke("policy_evaluate", { toolName, args });
+}
+
+export async function trustScore(agentId: string): Promise<Record<string, unknown>> {
+  return invoke("trust_score", { agentId });
+}
+
+export async function replayList(sessionId: string): Promise<unknown[]> {
+  return invoke("replay_list", { sessionId });
+}
+
+export async function replayStep(sessionId: string, direction: string): Promise<Record<string, unknown>> {
+  return invoke("replay_step", { sessionId, direction });
+}
+
+export async function skillEvolveStatus(): Promise<Record<string, unknown>> {
+  return invoke("skill_evolve_status");
+}
+
+export async function skillSync(direction: string): Promise<unknown[]> {
+  return invoke("skill_sync", { direction });
+}
+
+export async function dagStatus(): Promise<Record<string, unknown>> {
+  return invoke("dag_status");
+}
+
+export async function federatedSearch(query: string): Promise<unknown[]> {
+  return invoke("federated_search", { query });
+}
+
+export async function governanceStatus(): Promise<Record<string, unknown>> {
+  return invoke("governance_status");
+}
+
+export async function trajectoryExport(sessionId: string): Promise<string> {
+  return invoke("trajectory_export", { sessionId });
+}
+
+export async function benchmarkStatus(): Promise<Record<string, unknown>> {
+  return invoke("benchmark_status");
+}
