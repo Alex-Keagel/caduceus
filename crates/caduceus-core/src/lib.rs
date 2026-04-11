@@ -7,6 +7,10 @@ use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod keybindings;
+
+pub use keybindings::{resolve_platform_shortcut, Keybinding, KeybindingConfig, KeybindingPreset};
+
 // ── ID newtypes ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

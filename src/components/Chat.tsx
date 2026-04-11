@@ -1,5 +1,12 @@
-import { useState, useRef, useEffect } from "react";
-import { agentTurn, kanbanAddCard, kanbanLoad, permissionRespond, sessionCreate } from "../api/tauri";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
+import {
+  agentAbort,
+  agentTurn,
+  kanbanAddCard,
+  kanbanLoad,
+  permissionRespond,
+  sessionCreate,
+} from "../api/tauri";
 import { listenAgentEvent } from "../api/tauri";
 import type { KanbanBoard, SessionInfo, SessionPhase, TokenUsage, ChatMessage, ToolCallBlock, PermissionRequest } from "../types";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -11,6 +18,13 @@ interface ChatProps {
   onTokenUsage?: (usage: TokenUsage) => void;
   onOpenKanban?: (board: KanbanBoard) => void;
   onKanbanUpdated?: (board: KanbanBoard) => void;
+}
+
+export interface ChatHandle {
+  focusInput: () => void;
+  sendMessage: () => void;
+  sendRaw: (value: string) => void;
+  cancelAgent: () => Promise<void>;
 }
 
 const RISK_COLORS: Record<string, string> = {
@@ -143,7 +157,10 @@ function ToolCallView({ tc, onToggle }: { tc: ToolCallBlock; onToggle: () => voi
   );
 }
 
-export default function Chat({ session, onSessionCreated, onPhaseChange, onTokenUsage, onOpenKanban, onKanbanUpdated }: ChatProps) {
+const Chat = forwardRef<ChatHandle, ChatProps>(function Chat(
+  { session, onSessionCreated, onPhaseChange, onTokenUsage, onOpenKanban, onKanbanUpdated }: ChatProps,
+  ref
+) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -153,6 +170,7 @@ export default function Chat({ session, onSessionCreated, onPhaseChange, onToken
   const [pendingPermission, setPendingPermission] = useState<PermissionRequest | null>(null);
 
   const bottomRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const streamingTextRef = useRef("");
   const streamingToolCallsRef = useRef<Map<string, ToolCallBlock>>(new Map());
 
@@ -297,9 +315,9 @@ export default function Chat({ session, onSessionCreated, onPhaseChange, onToken
     return false;
   };
 
-  const handleSend = async () => {
-    if (!input.trim() || !session || loading) return;
-    const userInput = input;
+  const sendInput = async (messageValue: string, clearInput = false) => {
+    if (!messageValue.trim() || !session || loading) return;
+    const userInput = messageValue;
     const userMessage: ChatMessage = {
       id: `${Date.now()}`,
       role: "User",
@@ -307,7 +325,9 @@ export default function Chat({ session, onSessionCreated, onPhaseChange, onToken
       timestamp: new Date().toISOString(),
     };
     setMessages((m) => [...m, userMessage]);
-    setInput("");
+    if (clearInput) {
+      setInput("");
+    }
     setLoading(true);
 
     try {
@@ -338,13 +358,35 @@ export default function Chat({ session, onSessionCreated, onPhaseChange, onToken
     }
   };
 
+  const handleSend = async () => {
+    await sendInput(input, true);
+  };
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      focusInput: () => inputRef.current?.focus(),
+      sendMessage: () => {
+        void handleSend();
+      },
+      sendRaw: (value: string) => {
+        void sendInput(value, false);
+      },
+      cancelAgent: async () => {
+        if (!session) return;
+        await agentAbort(session.id);
+      },
+    }),
+    [handleSend, session]
+  );
+
   const handlePermission = async (requestId: string, allow: boolean) => {
     await permissionRespond(requestId, allow);
     setPendingPermission(null);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
       e.preventDefault();
       handleSend();
     }
@@ -525,6 +567,7 @@ export default function Chat({ session, onSessionCreated, onPhaseChange, onToken
       {session && (
         <div style={{ padding: 8, borderTop: "1px solid #313244" }}>
           <textarea
+            ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
@@ -547,7 +590,7 @@ export default function Chat({ session, onSessionCreated, onPhaseChange, onToken
       )}
     </div>
   );
-}
+});
 
 function MessageBubble({
   message,
@@ -588,3 +631,5 @@ function MessageBubble({
     </div>
   );
 }
+
+export default Chat;

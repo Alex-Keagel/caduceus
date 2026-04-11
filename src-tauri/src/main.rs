@@ -2,8 +2,8 @@
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use caduceus_core::{
-    CaduceusConfig, LlmMessage, ModelId, ProviderId, SessionId, SessionPhase, SessionState,
-    SessionStorage,
+    CaduceusConfig, KeybindingConfig, KeybindingPreset, LlmMessage, ModelId, ProviderId, SessionId,
+    SessionPhase, SessionState, SessionStorage,
 };
 use caduceus_git::{CheckpointManager, FileStatus, GitRepo};
 use caduceus_marketplace::{recommend, BuiltinCatalog, ProjectContext};
@@ -32,6 +32,7 @@ use uuid::Uuid;
 const DEFAULT_SYSTEM_PROMPT: &str = "You are Caduceus, a helpful desktop coding assistant.";
 const DEFAULT_CONFIG_RELATIVE_PATH: &str = ".caduceus/config.json";
 const DEFAULT_DB_RELATIVE_PATH: &str = ".caduceus/db.sqlite";
+const DEFAULT_KEYBINDINGS_RELATIVE_PATH: &str = ".caduceus/keybindings.json";
 
 pub struct AppState {
     pub storage: Arc<SqliteStorage>,
@@ -887,6 +888,21 @@ async fn config_get(state: State<'_, AppState>) -> Result<CaduceusConfig, String
 }
 
 #[tauri::command]
+async fn keybindings_get() -> Result<KeybindingConfig, String> {
+    load_keybindings()
+}
+
+#[tauri::command]
+async fn keybindings_set(config: KeybindingConfig) -> Result<(), String> {
+    save_keybindings(&config)
+}
+
+#[tauri::command]
+async fn keybindings_presets() -> Result<Vec<KeybindingPreset>, String> {
+    Ok(KeybindingPreset::all())
+}
+
+#[tauri::command]
 async fn pty_create(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -943,6 +959,9 @@ fn main() {
             mcp_status,
             mcp_add,
             config_get,
+            keybindings_get,
+            keybindings_set,
+            keybindings_presets,
             pty_create,
             pty_write,
             pty_resize,
@@ -978,6 +997,26 @@ fn build_app_state(workspace_root: PathBuf) -> Result<AppState, String> {
 fn home_path(relative: &str) -> Result<PathBuf, String> {
     let home = env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
     Ok(Path::new(&home).join(relative))
+}
+
+fn load_keybindings() -> Result<KeybindingConfig, String> {
+    let path = home_path(DEFAULT_KEYBINDINGS_RELATIVE_PATH)?;
+    if !path.exists() {
+        return Ok(KeybindingConfig::default());
+    }
+
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    serde_json::from_str::<KeybindingConfig>(&content).map_err(|e| e.to_string())
+}
+
+fn save_keybindings(config: &KeybindingConfig) -> Result<(), String> {
+    let path = home_path(DEFAULT_KEYBINDINGS_RELATIVE_PATH)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let content = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
+    std::fs::write(path, content).map_err(|e| e.to_string())
 }
 
 fn normalize_path(path: &str) -> PathBuf {

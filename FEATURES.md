@@ -410,8 +410,9 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 | **Cline (Research)** | Plan & Act modes, checkpointing, browser automation, @mentions, .caduceusignore, Memory Bank | Orchestration, Workers, Sandbox, Omniscience | 8 |
 | **Cursor (Research)** | Agents Window, background/cloud agents, automations, BugBot, design mode, self-verification, multi-repo | Orchestration, Workers, Multiplayer | 8 |
 | **Cline Kanban (Research)** | Kanban board, dependency chains, per-card terminals, inline diff review, AI decomposition, auto-commit/PR | Orchestration, Sandbox, Multiplayer | 6 |
+| **MS Agent Governance Toolkit** | Policy engine, trust scoring, MCP security scanner, kill switch, circuit breakers, SLO monitoring, error budgets, secret scanning, privilege rings, OWASP compliance, governance attestation, replay debugging, agent identity, chaos engineering | Governance | 14 |
 
-> **Note:** Some features draw from multiple sources; the count reflects primary attribution. Claurst is the dominant contributor as the most feature-rich source repo. Cline, Cursor, and Kanban features were identified through competitive research analysis.
+> **Note:** Some features draw from multiple sources; the count reflects primary attribution. Claurst is the dominant contributor as the most feature-rich source repo. Cline, Cursor, and Kanban features were identified through competitive research analysis. MS Agent Governance Toolkit features were identified through analysis of Microsoft's open-source agent governance framework.
 
 ---
 
