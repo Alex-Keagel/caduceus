@@ -1,4 +1,7 @@
+pub mod headless;
 pub mod instructions;
+pub mod mentions;
+pub mod modes;
 pub mod workers;
 
 use caduceus_core::{
@@ -211,6 +214,7 @@ pub enum SlashCommand {
     Skills,
     Effort(String),
     Config(String),
+    Mode(String),
     Exit,
     Unknown(String),
 }
@@ -249,6 +253,7 @@ impl SlashCommand {
             "provider" => Self::Provider(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
             "effort" => Self::Effort(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
             "config" => Self::Config(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
+            "mode" => Self::Mode(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
             other => Self::Unknown(other.to_string()),
         };
         Some(cmd)
@@ -283,6 +288,10 @@ impl SlashCommand {
                 "Set query config (model=X temp=0.5 tokens=8192)".to_string()
             }
             Self::Config(args) => format!("Set query config: {args}"),
+            Self::Mode(mode) if mode.is_empty() => {
+                "Set agent mode (plan/act/research/autopilot/architect/debug/review)".to_string()
+            }
+            Self::Mode(mode) => format!("Switch agent mode to {mode}"),
             Self::Exit => "Exit the current session".to_string(),
             Self::Unknown(command) => format!("Unknown slash command: {command}"),
         }
@@ -536,6 +545,7 @@ pub struct AgentHarness {
     cancellation_token: Option<CancellationToken>,
     effort_level: Option<EffortLevel>,
     query_config: Option<QueryConfig>,
+    mode: Option<modes::AgentMode>,
 }
 
 impl AgentHarness {
@@ -557,6 +567,7 @@ impl AgentHarness {
             cancellation_token: None,
             effort_level: None,
             query_config: None,
+            mode: None,
         }
     }
 
@@ -590,6 +601,11 @@ impl AgentHarness {
         self
     }
 
+    pub fn with_mode(mut self, mode: modes::AgentMode) -> Self {
+        self.mode = Some(mode);
+        self
+    }
+
     /// Load workspace instructions and merge them into the system prompt.
     pub fn with_instructions(mut self, workspace_root: impl Into<std::path::PathBuf>) -> Self {
         let loader = instructions::InstructionLoader::new(workspace_root);
@@ -620,9 +636,21 @@ impl AgentHarness {
         Ok(())
     }
 
-    /// Build the effective system prompt incorporating effort level.
+    /// Build the effective system prompt incorporating effort level and mode.
     fn effective_system_prompt(&self) -> String {
         let mut prompt = self.system_prompt.clone();
+
+        // Prepend mode-specific instructions
+        if let Some(ref mode) = self.mode {
+            let mode_config = mode.config();
+            prompt = format!(
+                "<agent_mode mode=\"{}\">\n{}\n</agent_mode>\n\n{}",
+                mode.name(),
+                mode_config.system_prompt_prefix,
+                prompt
+            );
+        }
+
         if let Some(ref effort) = self.effort_level {
             prompt = format!(
                 "{}\n\n<effort_level>\n{}\n</effort_level>",
@@ -1433,5 +1461,62 @@ mod tests {
             AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
                 .with_max_tool_rounds(10);
         assert_eq!(harness.max_tool_rounds, 10);
+    }
+
+    // ── Mode slash command ─────────────────────────────────────────────────────
+
+    #[test]
+    fn slash_command_mode_parse() {
+        assert!(matches!(
+            SlashCommand::parse("/mode plan"),
+            Some(SlashCommand::Mode(ref m)) if m == "plan"
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/mode autopilot"),
+            Some(SlashCommand::Mode(ref m)) if m == "autopilot"
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/mode"),
+            Some(SlashCommand::Mode(ref m)) if m.is_empty()
+        ));
+    }
+
+    #[test]
+    fn slash_command_mode_description() {
+        assert!(SlashCommand::Mode("plan".into())
+            .description()
+            .contains("plan"));
+        assert!(SlashCommand::Mode(String::new())
+            .description()
+            .contains("agent mode"));
+    }
+
+    // ── Mode integration with harness ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn harness_with_mode_prepends_prompt() {
+        let adapter =
+            Arc::new(MockLlmAdapter::new(vec![]).with_stream_chunks(vec![make_final_stream("ok")]));
+        let harness = AgentHarness::new(
+            adapter.clone(),
+            caduceus_tools::ToolRegistry::new(),
+            4096,
+            "base prompt",
+        )
+        .with_mode(modes::AgentMode::Plan);
+
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+        harness
+            .run(&mut state, &mut history, "hello")
+            .await
+            .unwrap();
+
+        let requests = adapter.recorded_requests();
+        assert_eq!(requests.len(), 1);
+        // Mode prefix should appear in the system prompt
+        let system = requests[0].system.as_ref().unwrap();
+        assert!(system.contains("PLAN mode"));
+        assert!(system.contains("base prompt"));
     }
 }
