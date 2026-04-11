@@ -17,6 +17,7 @@ caduceus-orchestrator = { path = "../crates/caduceus-orchestrator" }
 caduceus-telemetry = { path = "../crates/caduceus-telemetry" }
 caduceus-omniscience = { path = "../crates/caduceus-omniscience" }
 caduceus-crdt = { path = "../crates/caduceus-crdt" }
+caduceus-marketplace = { path = "../crates/caduceus-marketplace" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

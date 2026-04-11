@@ -9,6 +9,8 @@ import type {
   CaduceusConfig,
   PtyDataPayload,
   AgentEvent,
+  MarketplaceSearchResult,
+  McpServerInfo,
 } from "../types";
 
 // ── Session commands ──────────────────────────────────────────────────────────
@@ -91,6 +93,28 @@ export async function configSetProvider(
   apiKey: string
 ): Promise<void> {
   return invoke("config_set_provider", { providerId, apiKey });
+}
+
+// ── Marketplace commands ──────────────────────────────────────────────────────
+
+export async function marketplaceSearch(query: string): Promise<MarketplaceSearchResult> {
+  return invoke("marketplace_search", { query });
+}
+
+export async function marketplaceInstall(name: string): Promise<string> {
+  return invoke("marketplace_install", { name });
+}
+
+export async function marketplaceRecommend(): Promise<MarketplaceSearchResult> {
+  return invoke("marketplace_recommend");
+}
+
+export async function mcpStatus(): Promise<McpServerInfo[]> {
+  return invoke("mcp_status");
+}
+
+export async function mcpAdd(name: string): Promise<string> {
+  return invoke("mcp_add", { name });
 }
 
 // ── PTY commands ──────────────────────────────────────────────────────────────
