@@ -349,6 +349,8 @@ impl Coordinator {
             max_tokens: 4096,
             temperature: None,
             thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
         };
 
         let raw = match provider.chat(req).await {
@@ -436,6 +438,8 @@ impl Coordinator {
             max_tokens: 4096,
             temperature: None,
             thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
         };
 
         provider
@@ -514,6 +518,8 @@ async fn run_task(
         max_tokens: 4096,
         temperature: None,
         thinking_mode: false,
+        tool_choice: None,
+        response_format: None,
     };
 
     provider

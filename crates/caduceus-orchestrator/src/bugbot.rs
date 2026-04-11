@@ -240,6 +240,8 @@ impl BugBot {
             max_tokens: 1024,
             temperature: Some(0.1),
             thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
         };
 
         self.provider.chat(request).await.ok().map(|r| r.content)
@@ -253,6 +255,8 @@ impl BugBot {
             max_tokens: 4096,
             temperature: Some(0.1),
             thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
         };
 
         let response = self.provider.chat(request).await?;

@@ -42,6 +42,10 @@ pub enum MessageContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    Image {
+        base64: String,
+        media_type: String,
+    },
 }
 
 impl Message {
@@ -112,11 +116,70 @@ impl MessageContentBlock {
         }
     }
 
+    pub fn image(base64: impl Into<String>, media_type: impl Into<String>) -> Self {
+        Self::Image {
+            base64: base64.into(),
+            media_type: media_type.into(),
+        }
+    }
+
     fn text_value(&self) -> String {
         match self {
             Self::Text { text, .. } => text.clone(),
+            Self::Image { .. } => String::new(),
         }
     }
+}
+
+// ── Model filter ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelFilter {
+    pub allowed: Option<Vec<String>>,
+    pub denied: Option<Vec<String>>,
+}
+
+impl ModelFilter {
+    pub fn check(&self, model: &ModelId) -> Result<()> {
+        if let Some(denied) = &self.denied {
+            if denied.iter().any(|d| d == &model.0) {
+                return Err(CaduceusError::Provider(format!(
+                    "Model '{}' is denied by filter",
+                    model.0
+                )));
+            }
+        }
+        if let Some(allowed) = &self.allowed {
+            if !allowed.iter().any(|a| a == &model.0) {
+                return Err(CaduceusError::Provider(format!(
+                    "Model '{}' is not in the allowed list",
+                    model.0
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+// ── Tool choice ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    Auto,
+    None,
+    Required,
+    Specific(String),
+}
+
+// ── Response format ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseFormat {
+    Text,
+    JsonObject,
+    JsonSchema(serde_json::Value),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +192,10 @@ pub struct ChatRequest {
     /// When true, prepend "Think step by step" to system prompt and use higher max_tokens.
     #[serde(default)]
     pub thinking_mode: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ResponseFormat>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -612,6 +679,7 @@ impl AnthropicAdapter {
                     MessageContentBlock::Text { text, .. } => {
                         MessageContentBlock::text_with_cache(text, CacheControl::ephemeral())
                     }
+                    other => other,
                 });
             }
         }
@@ -621,6 +689,27 @@ impl AnthropicAdapter {
 
         if let Some(temp) = request.temperature {
             body["temperature"] = serde_json::json!(temp);
+        }
+
+        if let Some(ref tc) = request.tool_choice {
+            body["tool_choice"] = match tc {
+                ToolChoice::Auto => serde_json::json!({"type": "auto"}),
+                ToolChoice::None => serde_json::json!({"type": "none"}),
+                ToolChoice::Required => serde_json::json!({"type": "any"}),
+                ToolChoice::Specific(name) => serde_json::json!({"type": "tool", "name": name}),
+            };
+        }
+
+        if let Some(ResponseFormat::JsonObject) = &request.response_format {
+            let current_system = body.get("system").cloned();
+            let json_prefix = "You must respond with valid JSON only.";
+            if let Some(serde_json::Value::Array(blocks)) = current_system {
+                let mut new_blocks = vec![serde_json::json!({"type": "text", "text": json_prefix})];
+                new_blocks.extend(blocks);
+                body["system"] = serde_json::Value::Array(new_blocks);
+            } else {
+                body["system"] = serde_json::json!([{"type": "text", "text": json_prefix}]);
+            }
         }
 
         body
@@ -645,6 +734,16 @@ fn anthropic_content_blocks(blocks: &[MessageContentBlock]) -> Vec<serde_json::V
                     });
                 }
                 value
+            }
+            MessageContentBlock::Image { base64, media_type } => {
+                serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": base64,
+                    }
+                })
             }
         })
         .collect()
@@ -939,10 +1038,35 @@ fn build_openai_request_body(
     }
 
     for msg in &request.messages {
-        messages.push(serde_json::json!({
-            "role": msg.role,
-            "content": msg.content_text(),
-        }));
+        let blocks = msg.content_blocks();
+        let has_images = blocks
+            .iter()
+            .any(|b| matches!(b, MessageContentBlock::Image { .. }));
+        if has_images {
+            let parts: Vec<serde_json::Value> = blocks
+                .iter()
+                .map(|block| match block {
+                    MessageContentBlock::Text { text, .. } => {
+                        serde_json::json!({"type": "text", "text": text})
+                    }
+                    MessageContentBlock::Image { base64, media_type } => {
+                        serde_json::json!({
+                            "type": "image_url",
+                            "image_url": {"url": format!("data:{media_type};base64,{base64}")}
+                        })
+                    }
+                })
+                .collect();
+            messages.push(serde_json::json!({
+                "role": msg.role,
+                "content": parts,
+            }));
+        } else {
+            messages.push(serde_json::json!({
+                "role": msg.role,
+                "content": msg.content_text(),
+            }));
+        }
     }
 
     let mut body = serde_json::json!({
@@ -961,6 +1085,27 @@ fn build_openai_request_body(
 
     if stream {
         body["stream_options"] = serde_json::json!({"include_usage": true});
+    }
+
+    if let Some(ref tc) = request.tool_choice {
+        body["tool_choice"] = match tc {
+            ToolChoice::Auto => serde_json::json!("auto"),
+            ToolChoice::None => serde_json::json!("none"),
+            ToolChoice::Required => serde_json::json!("required"),
+            ToolChoice::Specific(name) => {
+                serde_json::json!({"type": "function", "function": {"name": name}})
+            }
+        };
+    }
+
+    if let Some(ref rf) = request.response_format {
+        body["response_format"] = match rf {
+            ResponseFormat::Text => serde_json::json!({"type": "text"}),
+            ResponseFormat::JsonObject => serde_json::json!({"type": "json_object"}),
+            ResponseFormat::JsonSchema(schema) => {
+                serde_json::json!({"type": "json_schema", "json_schema": schema})
+            }
+        };
     }
 
     body
@@ -1264,6 +1409,9 @@ impl GeminiAdapter {
                     .iter()
                     .map(|block| match block {
                         MessageContentBlock::Text { text, .. } => serde_json::json!({ "text": text }),
+                        MessageContentBlock::Image { base64, media_type } => serde_json::json!({
+                            "inline_data": {"mime_type": media_type, "data": base64}
+                        }),
                     })
                     .collect::<Vec<_>>(),
             }));
@@ -1487,6 +1635,195 @@ impl LlmAdapter for AzureOpenAiAdapter {
     }
 }
 
+// ── AWS Bedrock adapter ──────────────────────────────────────────────────────────
+
+pub struct BedrockAdapter {
+    provider_id: ProviderId,
+    region: String,
+    access_key_id: String,
+    secret_access_key: String,
+    client: reqwest::Client,
+}
+
+impl BedrockAdapter {
+    pub fn new(
+        region: impl Into<String>,
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider_id: ProviderId::new("bedrock"),
+            region: region.into(),
+            access_key_id: access_key_id.into(),
+            secret_access_key: secret_access_key.into(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    pub fn from_env() -> std::result::Result<Self, String> {
+        let region =
+            std::env::var("AWS_REGION").map_err(|_| "AWS_REGION env var not set".to_string())?;
+        let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
+            .map_err(|_| "AWS_ACCESS_KEY_ID env var not set".to_string())?;
+        let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+            .map_err(|_| "AWS_SECRET_ACCESS_KEY env var not set".to_string())?;
+        Ok(Self::new(region, access_key_id, secret_access_key))
+    }
+
+    fn sign_request(
+        &self,
+        method: &str,
+        url: &str,
+        body: &[u8],
+        datetime: &str,
+        date: &str,
+    ) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::{Digest, Sha256};
+        type HmacSha256 = Hmac<Sha256>;
+
+        let parsed =
+            url::Url::parse(url).unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
+        let host = parsed.host_str().unwrap_or("localhost");
+        let path = parsed.path();
+
+        let body_hash = hex::encode(Sha256::digest(body));
+
+        let canonical_headers =
+            format!("host:{host}\nx-amz-content-sha256:{body_hash}\nx-amz-date:{datetime}\n");
+        let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+
+        let canonical_request =
+            format!("{method}\n{path}\n\n{canonical_headers}\n{signed_headers}\n{body_hash}");
+
+        let credential_scope = format!("{date}/{}/bedrock/aws4_request", self.region);
+        let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
+        let string_to_sign =
+            format!("AWS4-HMAC-SHA256\n{datetime}\n{credential_scope}\n{canonical_request_hash}");
+
+        fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+            let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key");
+            mac.update(data);
+            mac.finalize().into_bytes().to_vec()
+        }
+
+        let k_date = hmac_sha256(
+            format!("AWS4{}", self.secret_access_key).as_bytes(),
+            date.as_bytes(),
+        );
+        let k_region = hmac_sha256(&k_date, self.region.as_bytes());
+        let k_service = hmac_sha256(&k_region, b"bedrock");
+        let k_signing = hmac_sha256(&k_service, b"aws4_request");
+        let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
+
+        format!(
+            "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
+            self.access_key_id
+        )
+    }
+}
+
+#[async_trait]
+impl LlmAdapter for BedrockAdapter {
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let messages: Vec<serde_json::Value> = request
+            .messages
+            .iter()
+            .filter(|m| m.role != "system")
+            .map(|m| {
+                let content_blocks = anthropic_content_blocks(&m.content_blocks());
+                serde_json::json!({
+                    "role": m.role,
+                    "content": content_blocks,
+                })
+            })
+            .collect();
+
+        let mut body = serde_json::json!({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": request.max_tokens,
+            "messages": messages,
+        });
+
+        if let Some(ref system) = request.system {
+            body["system"] = serde_json::json!(system);
+        }
+        if let Some(temp) = request.temperature {
+            body["temperature"] = serde_json::json!(temp);
+        }
+
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| {
+            CaduceusError::Provider(format!("Failed to serialize Bedrock request: {e}"))
+        })?;
+
+        let url = format!(
+            "https://bedrock-runtime.{}.amazonaws.com/model/{}/invoke",
+            self.region, request.model.0
+        );
+
+        let now = chrono::Utc::now();
+        let datetime = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let date = now.format("%Y%m%d").to_string();
+
+        let authorization = self.sign_request("POST", &url, &body_bytes, &datetime, &date);
+        let body_hash = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(&body_bytes))
+        };
+
+        let client = self.client.clone();
+        let retry = RetryConfig::default();
+
+        let resp = send_with_retry(
+            &client,
+            || {
+                client
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .header("x-amz-date", &datetime)
+                    .header("x-amz-content-sha256", &body_hash)
+                    .header("authorization", &authorization)
+                    .body(body_bytes.clone())
+            },
+            &retry,
+        )
+        .await?;
+
+        let resp_body = resp
+            .text()
+            .await
+            .map_err(|e| CaduceusError::Provider(format!("Failed to read response: {e}")))?;
+
+        parse_anthropic_chat_response(&resp_body)
+    }
+
+    async fn stream(&self, request: ChatRequest) -> Result<StreamResult> {
+        // Bedrock streaming simplified: use non-streaming invoke
+        let response = self.chat(request).await?;
+        let chunk = StreamChunk {
+            delta: response.content,
+            is_final: true,
+            input_tokens: Some(response.input_tokens),
+            output_tokens: Some(response.output_tokens),
+            cache_read_tokens: Some(response.cache_read_tokens),
+            cache_creation_tokens: Some(response.cache_creation_tokens),
+        };
+        Ok(Box::pin(futures::stream::once(async { Ok(chunk) })))
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelId>> {
+        Ok(vec![
+            ModelId::new("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            ModelId::new("anthropic.claude-3-haiku-20240307-v1:0"),
+            ModelId::new("anthropic.claude-3-opus-20240229-v1:0"),
+        ])
+    }
+}
+
 // ── Provider connector ───────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -1551,6 +1888,8 @@ where
             max_tokens: 8,
             temperature: Some(0.0),
             thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
         };
 
         match provider_id.0.as_str() {
@@ -2082,6 +2421,8 @@ mod tests {
             max_tokens: 1024,
             temperature: Some(0.7),
             thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
         };
 
         let body = adapter.build_request_body(&request, false);
@@ -2103,6 +2444,8 @@ mod tests {
             max_tokens: 1024,
             temperature: None,
             thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
         };
 
         let body = adapter.build_request_body(&request, true);
@@ -2210,6 +2553,8 @@ mod tests {
             max_tokens: 128,
             temperature: Some(0.2),
             thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
         };
 
         let body = adapter.build_request_body(&request, true);
@@ -2266,6 +2611,8 @@ mod tests {
             max_tokens: 32,
             temperature: None,
             thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
         };
 
         let mut stream = adapter.stream(request).await.unwrap();
@@ -2330,6 +2677,8 @@ mod tests {
             max_tokens: 100,
             temperature: None,
             thinking_mode: true,
+            tool_choice: None,
+            response_format: None,
         };
         assert!(req.thinking_mode);
         let json = serde_json::to_string(&req).unwrap();
@@ -2363,6 +2712,8 @@ mod tests {
             max_tokens: 1024,
             temperature: Some(0.5),
             thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
         };
 
         let body = adapter.build_request_body(&request, true);
@@ -2388,6 +2739,8 @@ mod tests {
             max_tokens: 64,
             temperature: None,
             thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
         };
 
         let resp = adapter.chat(request).await.unwrap();
@@ -2447,5 +2800,189 @@ mod tests {
         // After cooldown, check() transitions to HalfOpen
         assert!(cb.check().is_ok());
         assert_eq!(cb.state(), CircuitState::HalfOpen);
+    }
+
+    // ── Vision tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_image_content_block() {
+        let block = MessageContentBlock::image("aGVsbG8=", "image/jpeg");
+        match &block {
+            MessageContentBlock::Image { base64, media_type } => {
+                assert_eq!(base64, "aGVsbG8=");
+                assert_eq!(media_type, "image/jpeg");
+            }
+            _ => panic!("Expected Image variant"),
+        }
+        assert_eq!(block.text_value(), "");
+    }
+
+    #[test]
+    fn test_anthropic_image_request_body() {
+        let adapter = AnthropicAdapter::new("test-key");
+        let msg = Message::user("describe this").with_content_blocks(vec![
+            MessageContentBlock::text("describe this"),
+            MessageContentBlock::image("aGVsbG8=", "image/jpeg"),
+        ]);
+        let request = ChatRequest {
+            model: ModelId::new("claude-sonnet-4-5"),
+            messages: vec![msg],
+            system: None,
+            max_tokens: 1024,
+            temperature: None,
+            thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
+        };
+        let body = adapter.build_request_body(&request, false);
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(content[1]["source"]["data"], "aGVsbG8=");
+    }
+
+    #[test]
+    fn test_openai_image_request_body() {
+        let msg = Message::user("describe this").with_content_blocks(vec![
+            MessageContentBlock::text("describe this"),
+            MessageContentBlock::image("aGVsbG8=", "image/png"),
+        ]);
+        let request = ChatRequest {
+            model: ModelId::new("gpt-4o"),
+            messages: vec![msg],
+            system: None,
+            max_tokens: 1024,
+            temperature: None,
+            thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
+        };
+        let body = build_openai_request_body(&request, false, true);
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert!(content[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+    }
+
+    // ── Model filter tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_model_filter_allowed_list() {
+        let filter = ModelFilter {
+            allowed: Some(vec!["gpt-4".into(), "gpt-4o".into()]),
+            denied: None,
+        };
+        assert!(filter.check(&ModelId::new("gpt-4")).is_ok());
+        assert!(filter.check(&ModelId::new("gpt-4o")).is_ok());
+        assert!(filter.check(&ModelId::new("gpt-3.5")).is_err());
+    }
+
+    #[test]
+    fn test_model_filter_denied_list() {
+        let filter = ModelFilter {
+            allowed: None,
+            denied: Some(vec!["gpt-3.5".into()]),
+        };
+        assert!(filter.check(&ModelId::new("gpt-4")).is_ok());
+        assert!(filter.check(&ModelId::new("gpt-3.5")).is_err());
+    }
+
+    // ── Tool choice tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_tool_choice_anthropic_body() {
+        let adapter = AnthropicAdapter::new("test-key");
+        let request = ChatRequest {
+            model: ModelId::new("claude-sonnet-4-5"),
+            messages: vec![Message::user("Hello")],
+            system: None,
+            max_tokens: 1024,
+            temperature: None,
+            thinking_mode: false,
+            tool_choice: Some(ToolChoice::Required),
+            response_format: None,
+        };
+        let body = adapter.build_request_body(&request, false);
+        assert_eq!(body["tool_choice"]["type"], "any");
+
+        let request2 = ChatRequest {
+            model: ModelId::new("claude-sonnet-4-5"),
+            messages: vec![Message::user("Hello")],
+            system: None,
+            max_tokens: 1024,
+            temperature: None,
+            thinking_mode: false,
+            tool_choice: Some(ToolChoice::Specific("my_tool".into())),
+            response_format: None,
+        };
+        let body2 = adapter.build_request_body(&request2, false);
+        assert_eq!(body2["tool_choice"]["type"], "tool");
+        assert_eq!(body2["tool_choice"]["name"], "my_tool");
+    }
+
+    #[test]
+    fn test_tool_choice_openai_body() {
+        let request = ChatRequest {
+            model: ModelId::new("gpt-4"),
+            messages: vec![Message::user("Hello")],
+            system: None,
+            max_tokens: 1024,
+            temperature: None,
+            thinking_mode: false,
+            tool_choice: Some(ToolChoice::Required),
+            response_format: None,
+        };
+        let body = build_openai_request_body(&request, false, true);
+        assert_eq!(body["tool_choice"], "required");
+
+        let request2 = ChatRequest {
+            model: ModelId::new("gpt-4"),
+            messages: vec![Message::user("Hello")],
+            system: None,
+            max_tokens: 1024,
+            temperature: None,
+            thinking_mode: false,
+            tool_choice: Some(ToolChoice::Specific("my_func".into())),
+            response_format: None,
+        };
+        let body2 = build_openai_request_body(&request2, false, true);
+        assert_eq!(body2["tool_choice"]["type"], "function");
+        assert_eq!(body2["tool_choice"]["function"]["name"], "my_func");
+    }
+
+    // ── Response format tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_response_format_openai() {
+        let request = ChatRequest {
+            model: ModelId::new("gpt-4"),
+            messages: vec![Message::user("Hello")],
+            system: None,
+            max_tokens: 1024,
+            temperature: None,
+            thinking_mode: false,
+            tool_choice: None,
+            response_format: Some(ResponseFormat::JsonObject),
+        };
+        let body = build_openai_request_body(&request, false, true);
+        assert_eq!(body["response_format"]["type"], "json_object");
+    }
+
+    // ── Bedrock adapter tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_bedrock_adapter_construction() {
+        let result = BedrockAdapter::from_env();
+        // Without env vars set, this should fail
+        assert!(result.is_err());
+
+        let adapter = BedrockAdapter::new("us-east-1", "AKID", "SECRET");
+        assert_eq!(adapter.provider_id.0, "bedrock");
+        assert_eq!(adapter.region, "us-east-1");
     }
 }
