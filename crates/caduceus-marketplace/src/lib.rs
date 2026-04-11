@@ -262,4 +262,94 @@ mod tests {
         uninstall("my-plugin", &target).unwrap();
         assert!(!target.join("my-plugin").exists());
     }
+
+    // ── Additional marketplace tests ─────────────────────────────────────
+
+    #[test]
+    fn test_recommend_rust_project() {
+        let ctx = ProjectContext {
+            languages: vec!["rust".to_string()],
+            frameworks: vec!["tokio".to_string(), "serde".to_string()],
+        };
+        let recs = recommend(&ctx, None, 10);
+        assert!(
+            !recs.skills.is_empty(),
+            "Rust project should get skill recommendations"
+        );
+        assert!(
+            !recs.agents.is_empty(),
+            "Rust project should get agent recommendations"
+        );
+
+        // Verify scores are in descending order
+        for window in recs.skills.windows(2) {
+            assert!(
+                window[0].score >= window[1].score,
+                "skills should be sorted by score descending"
+            );
+        }
+        for window in recs.agents.windows(2) {
+            assert!(
+                window[0].score >= window[1].score,
+                "agents should be sorted by score descending"
+            );
+        }
+    }
+
+    #[test]
+    fn test_recommend_with_prompt() {
+        let ctx = ProjectContext::default();
+        let recs = recommend(&ctx, Some("add authentication and authorization"), 10);
+        assert!(
+            !recs.skills.is_empty(),
+            "prompt should trigger recommendations"
+        );
+
+        let skill_names: Vec<_> = recs.skills.iter().map(|r| r.skill.name).collect();
+        // "authentication and authorization" should surface security-related skills
+        assert!(
+            skill_names
+                .iter()
+                .any(|n| n.contains("security") || n.contains("auth")),
+            "expected security/auth-related skill in recommendations, got: {:?}",
+            skill_names
+        );
+    }
+
+    #[test]
+    fn test_skill_search_fuzzy() {
+        let mut registry = MarketplaceRegistry::new();
+        registry.register_skill(SkillEntry {
+            name: "authentication-setup".to_string(),
+            version: "1.0".to_string(),
+            description: "Set up authentication flows including OAuth and JWT".to_string(),
+            categories: vec![Category::Security],
+            triggers: vec!["auth setup".to_string(), "add authentication".to_string()],
+            tools: vec![],
+        });
+        registry.register_skill(SkillEntry {
+            name: "database-migration".to_string(),
+            version: "1.0".to_string(),
+            description: "Manage database schema migrations".to_string(),
+            categories: vec![],
+            triggers: vec!["migrate db".to_string()],
+            tools: vec![],
+        });
+
+        // Partial match should find the skill
+        let results = registry.search_skills("auth");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "authentication-setup");
+
+        // Search by description keyword
+        let results = registry.search_skills("OAuth");
+        assert_eq!(results.len(), 1, "search should match description text");
+
+        // No match
+        let results = registry.search_skills("zzz_nonexistent");
+        assert!(
+            results.is_empty(),
+            "non-matching search should return empty"
+        );
+    }
 }

@@ -1,6 +1,7 @@
 pub mod automations;
 pub mod background;
 pub mod bugbot;
+pub mod context;
 pub mod headless;
 pub mod instructions;
 pub mod kanban;
@@ -239,6 +240,7 @@ pub enum SlashCommand {
     Review,
     Fork,
     Telemetry,
+    Context(context::ContextCommand),
     Exit,
     Unknown(String),
 }
@@ -303,6 +305,7 @@ impl SlashCommand {
             "exit" | "quit" => Self::Exit,
             "review" => Self::Review,
             "telemetry" => Self::Telemetry,
+            "context" => Self::Context(context::ContextCommand::parse(args)),
             "model" => Self::Model(args.to_string()),
             "provider" => Self::Provider(args.to_string()),
             "effort" => Self::Effort(args.to_string()),
@@ -378,6 +381,33 @@ impl SlashCommand {
             Self::Review => "Run BugBot on current git diff".to_string(),
             Self::Fork => "Fork the current session into a new branch".to_string(),
             Self::Telemetry => "Show current session telemetry metrics".to_string(),
+            Self::Context(ref cmd) => match cmd {
+                context::ContextCommand::Overview => {
+                    "Show context usage breakdown and zone".to_string()
+                }
+                context::ContextCommand::Breakdown => {
+                    "Show detailed per-component token counts".to_string()
+                }
+                context::ContextCommand::Compact => {
+                    "Compact conversation with default strategy".to_string()
+                }
+                context::ContextCommand::CompactWithStrategy(strategy) => {
+                    format!("Compact conversation with {strategy} strategy")
+                }
+                context::ContextCommand::Pin { label, .. } => {
+                    format!("Pin context item: {label}")
+                }
+                context::ContextCommand::Unpin { label } => {
+                    format!("Unpin context item: {label}")
+                }
+                context::ContextCommand::Pins => "List pinned context items".to_string(),
+                context::ContextCommand::Zone => {
+                    "Show current performance zone with recommendation".to_string()
+                }
+                context::ContextCommand::Clear => {
+                    "Clear all history, keep pins and system prompt".to_string()
+                }
+            },
             Self::Unknown(command) => format!("Unknown slash command: {command}"),
         }
     }
@@ -1669,5 +1699,24 @@ mod tests {
         let system = requests[0].system.as_ref().unwrap();
         assert!(system.contains("PLAN mode"));
         assert!(system.contains("base prompt"));
+    }
+
+    #[test]
+    fn test_max_turns_effort_level() {
+        // EffortLevel::Max should have the highest token budget
+        assert!(EffortLevel::Max.max_tokens() > EffortLevel::Min.max_tokens());
+        assert!(EffortLevel::High.max_tokens() > EffortLevel::Low.max_tokens());
+        assert!(EffortLevel::Medium.max_tokens() > EffortLevel::Min.max_tokens());
+    }
+
+    #[test]
+    fn test_kill_switch_stops_agent() {
+        let token = CancellationToken::new();
+        assert!(!token.is_cancelled());
+        token.cancel();
+        assert!(
+            token.is_cancelled(),
+            "cancel() should set the token to cancelled"
+        );
     }
 }

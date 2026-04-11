@@ -410,4 +410,45 @@ mod tests {
         let result = resolver.resolve("No mentions here").unwrap();
         assert!(result.is_none());
     }
+
+    // ── Mention resolution tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_mention_file_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.rs"), "fn main() {}").unwrap();
+
+        let resolver = MentionResolver::new(dir.path());
+        let result = resolver.resolve("Check @file:test.rs").unwrap();
+        assert!(result.is_some(), "file mention should resolve");
+        let ctx = result.unwrap();
+        assert!(
+            ctx.contains("fn main()"),
+            "resolved content should contain file content"
+        );
+        assert!(
+            ctx.contains("file_mention"),
+            "should have file_mention wrapper"
+        );
+    }
+
+    #[test]
+    fn test_mention_git_diff() {
+        // Running in the real repo, so git diff should work
+        let resolver = MentionResolver::new(".");
+        let result = resolver.resolve("Show me @git:diff please").unwrap();
+        assert!(result.is_some());
+        let ctx = result.unwrap();
+        assert!(ctx.contains("git_diff"), "should contain git_diff wrapper");
+    }
+
+    #[test]
+    fn test_slash_command_unknown() {
+        // Unknown mentions return None
+        let result = Mention::parse("@unknown:command");
+        assert!(result.is_none(), "unknown mention type should return None");
+
+        let result = Mention::parse("/unknown_command");
+        assert!(result.is_none(), "slash commands are not mentions");
+    }
 }

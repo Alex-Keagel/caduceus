@@ -630,6 +630,20 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 | 174 | Per-card terminal | Mini-terminal preview per card with status, messages, token usage | Multiplayer | P2 | `caduceus-app` |
 | 175 | Inline diff review | Worktree diff view per card; line-click comments feed back to agent | Multiplayer | P2 | `caduceus-app` |
 
+### 5.5 Context Management
+
+| # | Feature | Description | Layer | Priority | Crate | Status |
+|---|---------|-------------|-------|----------|-------|--------|
+| 176 | Context visualization (`/context`) | ASCII + React breakdown of context window usage by component with zone indicator | Presentation | P1 | `caduceus-orchestrator` | ✅ |
+| 177 | Performance zones (Green/Yellow/Orange/Red/Critical) | Color-coded zones based on context fill percentage with automatic recommendations | Orchestration | P1 | `caduceus-orchestrator` | ✅ |
+| 178 | Manual compaction with strategy selection | `/context compact --strategy summarize\|truncate\|hybrid\|smart` | Orchestration | P1 | `caduceus-orchestrator` | ✅ |
+| 179 | Auto-compaction at configurable threshold | Trigger compaction when context usage exceeds threshold (default 85%) | Orchestration | P1 | `caduceus-orchestrator` | ✅ |
+| 180 | Pinned context (survives compaction) | `/context pin <label> <content>` to mark content as must-preserve across compaction | Orchestration | P1 | `caduceus-orchestrator` | ✅ |
+| 181 | PreCompact hooks | `CompactionStart`/`CompactionEnd` hook events for user-registered pre-compact handlers | Orchestration | P1 | `caduceus-permissions` | ✅ |
+| 182 | Context-aware retrieval (RAG-based) | When context is tight (Yellow+), use vector search to inject only relevant code chunks | Omniscience | P1 | `caduceus-omniscience` | ✅ |
+| 183 | Sliding window + summarization hybrid | Default compaction: summarize old turns, keep recent N verbatim | Orchestration | P1 | `caduceus-orchestrator` | ✅ |
+| 184 | `.caduceusignore` integration | Glob-based file exclusion from context injection and indexing | Sandbox | P2 | `caduceus-runtime` | 📋 |
+
 ---
 
-*Generated for Caduceus — 190 features across 7 layers, synthesized from 8 source repositories and 3 competitive research analyses.*
+*Generated for Caduceus — 199 features across 7 layers, synthesized from 8 source repositories and 3 competitive research analyses.*

@@ -3809,4 +3809,147 @@ mod tests {
         assert!(result.content.contains("0.0%"));
         assert!(result.content.contains("low"));
     }
+
+    // ── Tool edge case tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_read_empty_file() {
+        let root = test_workspace("read-empty");
+        let registry = default_registry_with_root(&root);
+        std::fs::write(root.join("empty.txt"), "").unwrap();
+
+        let result = registry
+            .execute("read_file", json!({"path": "empty.txt"}))
+            .await
+            .unwrap();
+        assert!(!result.is_error, "reading empty file should succeed");
+        // Content may contain line numbers or be empty — just shouldn't error
+        // The actual content representation depends on line numbering logic
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_write_creates_parent_dirs() {
+        let root = test_workspace("write-parents");
+        let registry = default_registry_with_root(&root);
+
+        let result = registry
+            .execute(
+                "write_file",
+                json!({"path": "deep/nested/dir/file.txt", "content": "deep content"}),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "write should create parent dirs");
+
+        let content = std::fs::read_to_string(root.join("deep/nested/dir/file.txt")).unwrap();
+        assert_eq!(content, "deep content");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_edit_nonexistent_file_error() {
+        let root = test_workspace("edit-nonexist");
+        let registry = default_registry_with_root(&root);
+
+        let result = registry
+            .execute(
+                "edit_file",
+                json!({"path": "does_not_exist.txt", "old_str": "old", "new_str": "new"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.is_error,
+            "editing nonexistent file should return error"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_grep_no_matches() {
+        let root = test_workspace("grep-nomatch");
+        let registry = default_registry_with_root(&root);
+        std::fs::write(root.join("sample.txt"), "hello world").unwrap();
+
+        let result = registry
+            .execute("grep_search", json!({"pattern": "zzz_nonexistent_pattern"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "grep with no matches should succeed, not error"
+        );
+        // Content should be empty or indicate no matches
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_glob_no_matches() {
+        let root = test_workspace("glob-nomatch");
+        let registry = default_registry_with_root(&root);
+        std::fs::write(root.join("hello.txt"), "data").unwrap();
+
+        let result = registry
+            .execute("glob_search", json!({"pattern": "**/*.zzz"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "glob with no matches should succeed with empty results"
+        );
+        // The content should indicate no matches
+        assert!(
+            result.content.contains("No matches")
+                || result.content.is_empty()
+                || result.content.contains("0"),
+            "expected empty/no-match result, got: {}",
+            &result.content[..result.content.len().min(200)]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_bash_timeout_enforced() {
+        let root = test_workspace("bash-timeout");
+        let registry = default_registry_with_root(&root);
+
+        let result = registry
+            .execute("bash", json!({"command": "sleep 100", "timeout": 1}))
+            .await
+            .unwrap();
+        // The bash tool should return a result indicating timeout
+        assert!(
+            result.content.contains("timed out")
+                || result.content.contains("timeout")
+                || result.is_error,
+            "sleep 100 with 1s timeout should indicate timeout, got: {}",
+            &result.content[..result.content.len().min(300)]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_tool_unknown_name_error() {
+        let registry = default_registry_with_root(std::env::current_dir().unwrap());
+        let result = registry
+            .execute("nonexistent_tool_xyz", json!({"foo": "bar"}))
+            .await;
+        assert!(result.is_err(), "unknown tool should return error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Unknown tool"),
+            "expected 'Unknown tool' in error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_web_search_invalid_query() {
+        let tool = WebSearchTool::new(Duration::from_secs(5));
+        let result = tool.call(json!({"query": ""})).await.unwrap();
+        assert!(
+            result.is_error,
+            "empty query should be handled gracefully as an error"
+        );
+    }
 }

@@ -496,4 +496,49 @@ mod tests {
         assert_eq!(format!("{}", AgentMode::Plan), "plan");
         assert_eq!(format!("{}", AgentMode::Autopilot), "autopilot");
     }
+
+    // ── Orchestrator mode tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_mode_plan_denies_writes() {
+        let config = AgentMode::Plan.config();
+        assert_eq!(config.tool_access, ToolAccess::ReadOnly);
+        assert!(!config.tool_access.is_tool_allowed("write_file"));
+        assert!(!config.tool_access.is_tool_allowed("edit_file"));
+        assert!(!config.tool_access.is_tool_allowed("bash"));
+        assert!(config.intercept_writes, "Plan mode should intercept writes");
+    }
+
+    #[test]
+    fn test_mode_research_readonly() {
+        let config = AgentMode::Research.config();
+        assert_eq!(config.tool_access, ToolAccess::ReadOnly);
+        // Research should allow read tools
+        assert!(config.tool_access.is_tool_allowed("read_file"));
+        assert!(config.tool_access.is_tool_allowed("glob_search"));
+        assert!(config.tool_access.is_tool_allowed("grep_search"));
+        assert!(config.tool_access.is_tool_allowed("list_files"));
+        // But not write tools
+        assert!(!config.tool_access.is_tool_allowed("write_file"));
+        assert!(!config.tool_access.is_tool_allowed("bash"));
+        assert!(!config.tool_access.is_tool_allowed("edit_file"));
+    }
+
+    #[test]
+    fn test_mode_autopilot_skips_approval() {
+        let config = AgentMode::Autopilot.config();
+        assert!(
+            !config.approval_required,
+            "Autopilot should not require approval"
+        );
+        assert_eq!(config.tool_access, ToolAccess::All);
+        assert!(
+            !config.intercept_writes,
+            "Autopilot should not intercept writes"
+        );
+        // All tools should be allowed
+        assert!(config.tool_access.is_tool_allowed("write_file"));
+        assert!(config.tool_access.is_tool_allowed("bash"));
+        assert!(config.tool_access.is_tool_allowed("read_file"));
+    }
 }
