@@ -12,6 +12,7 @@ members = [
     "crates/caduceus-telemetry",
     "crates/caduceus-omniscience",
     "crates/caduceus-crdt",
+    "crates/caduceus-mcp",
     "src-tauri",
 ]
 resolver = "2"
