@@ -341,6 +341,84 @@ impl FileOps {
     }
 }
 
+// ── File watching ──────────────────────────────────────────────────────────────
+
+use notify::{Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
+
+#[derive(Debug, Clone)]
+pub enum FileEvent {
+    Created(PathBuf),
+    Modified(PathBuf),
+    Deleted(PathBuf),
+}
+
+pub struct FileWatcher {
+    _watcher: RecommendedWatcher,
+    rx: tokio::sync::mpsc::UnboundedReceiver<FileEvent>,
+}
+
+impl FileWatcher {
+    pub fn new(watch_path: impl Into<PathBuf>) -> Result<Self> {
+        let path = watch_path.into();
+        let (std_tx, std_rx) = std::sync::mpsc::channel::<notify::Result<NotifyEvent>>();
+        let (tokio_tx, tokio_rx) = tokio::sync::mpsc::unbounded_channel::<FileEvent>();
+
+        let mut watcher = notify::recommended_watcher(std_tx).map_err(|e| CaduceusError::Tool {
+            tool: "file_watcher".into(),
+            message: e.to_string(),
+        })?;
+        watcher
+            .watch(&path, RecursiveMode::Recursive)
+            .map_err(|e| CaduceusError::Tool {
+                tool: "file_watcher".into(),
+                message: e.to_string(),
+            })?;
+
+        std::thread::spawn(move || {
+            let debounce = std::time::Duration::from_millis(500);
+            let mut pending: Vec<FileEvent> = Vec::new();
+
+            loop {
+                match std_rx.recv_timeout(debounce) {
+                    Ok(Ok(NotifyEvent { kind, paths, .. })) => {
+                        for p in paths {
+                            let fe = match &kind {
+                                notify::EventKind::Create(_) => FileEvent::Created(p),
+                                notify::EventKind::Modify(_) => FileEvent::Modified(p),
+                                notify::EventKind::Remove(_) => FileEvent::Deleted(p),
+                                _ => continue,
+                            };
+                            pending.push(fe);
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        for event in pending.drain(..) {
+                            if tokio_tx.send(event).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Ok(Err(_)) => {}
+                }
+            }
+        });
+
+        Ok(Self {
+            _watcher: watcher,
+            rx: tokio_rx,
+        })
+    }
+
+    pub async fn next(&mut self) -> Option<FileEvent> {
+        self.rx.recv().await
+    }
+
+    pub fn try_next(&mut self) -> Option<FileEvent> {
+        self.rx.try_recv().ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,5 +547,23 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results[0].contains("a.txt:1:"));
         assert!(results[1].contains("a.txt:3:"));
+    }
+
+    #[tokio::test]
+    async fn file_watcher_detects_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut watcher = FileWatcher::new(dir.path()).unwrap();
+        // Give watcher time to start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Write a file
+        let file_path = dir.path().join("watched.txt");
+        tokio::fs::write(&file_path, "hello").await.unwrap();
+
+        // Wait for the debounce period + some margin
+        let event = tokio::time::timeout(std::time::Duration::from_secs(3), watcher.next()).await;
+        assert!(event.is_ok(), "Should receive a file event");
+        let event = event.unwrap();
+        assert!(event.is_some(), "Event should not be None");
     }
 }

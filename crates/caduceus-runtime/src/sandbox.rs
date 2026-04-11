@@ -20,6 +20,7 @@ pub struct SandboxConfig {
     pub timeout_secs: u64,
     pub env_vars: HashMap<String, String>,
     pub cwd: Option<String>,
+    pub lifetime_timeout_secs: Option<u64>,
 }
 
 impl Default for SandboxConfig {
@@ -29,6 +30,7 @@ impl Default for SandboxConfig {
             timeout_secs: 300,
             env_vars: HashMap::new(),
             cwd: None,
+            lifetime_timeout_secs: None,
         }
     }
 }
@@ -295,6 +297,8 @@ impl SandboxProvider for E2BSandboxProvider {
             client: self.client.clone(),
             api_url: self.api_url.clone(),
             api_key: self.api_key.clone(),
+            started_at: std::time::Instant::now(),
+            lifetime_timeout_secs: config.lifetime_timeout_secs,
         }))
     }
 }
@@ -304,6 +308,8 @@ pub struct E2BSandbox {
     client: Client,
     api_url: String,
     api_key: String,
+    started_at: std::time::Instant,
+    lifetime_timeout_secs: Option<u64>,
 }
 
 impl E2BSandbox {
@@ -328,6 +334,16 @@ impl E2BSandbox {
 #[async_trait]
 impl Sandbox for E2BSandbox {
     async fn exec(&self, command: &str, timeout_secs: u64) -> Result<ExecResult> {
+        // Enforce lifetime timeout
+        if let Some(limit) = self.lifetime_timeout_secs {
+            if self.started_at.elapsed().as_secs() > limit {
+                return Err(CaduceusError::Tool {
+                    tool: "sandbox".into(),
+                    message: format!("Sandbox lifetime exceeded: {}s limit expired", limit),
+                });
+            }
+        }
+
         let response = self
             .req(
                 self.client
@@ -464,6 +480,104 @@ impl Sandbox for E2BSandbox {
 
     fn id(&self) -> &str {
         &self.id
+    }
+}
+
+// ── Sandbox lifecycle (pause/resume/snapshot/status) ──────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SandboxStatus {
+    Running,
+    Paused,
+    Stopped,
+    Error(String),
+}
+
+#[async_trait]
+pub trait SandboxLifecycle: Send + Sync {
+    async fn pause(&self) -> Result<()>;
+    async fn resume(&self) -> Result<()>;
+    async fn snapshot(&self) -> Result<String>;
+    async fn status(&self) -> Result<SandboxStatus>;
+}
+
+#[async_trait]
+impl SandboxLifecycle for E2BSandbox {
+    async fn pause(&self) -> Result<()> {
+        let response = self
+            .req(
+                self.client
+                    .post(format!("{}/sandboxes/{}/pause", self.api_url, self.id)),
+            )
+            .send()
+            .await
+            .map_err(|e| CaduceusError::Other(e.into()))?;
+        Self::ensure_success(response, "pause").await?;
+        Ok(())
+    }
+
+    async fn resume(&self) -> Result<()> {
+        let response = self
+            .req(
+                self.client
+                    .post(format!("{}/sandboxes/{}/resume", self.api_url, self.id)),
+            )
+            .send()
+            .await
+            .map_err(|e| CaduceusError::Other(e.into()))?;
+        Self::ensure_success(response, "resume").await?;
+        Ok(())
+    }
+
+    async fn snapshot(&self) -> Result<String> {
+        let response = self
+            .req(
+                self.client
+                    .post(format!("{}/sandboxes/{}/snapshot", self.api_url, self.id)),
+            )
+            .send()
+            .await
+            .map_err(|e| CaduceusError::Other(e.into()))?;
+        let response = Self::ensure_success(response, "snapshot").await?;
+        let payload = response
+            .json::<Value>()
+            .await
+            .map_err(|e| CaduceusError::Other(e.into()))?;
+        let snapshot_id = payload
+            .get("snapshotId")
+            .or_else(|| payload.get("snapshot_id"))
+            .or_else(|| payload.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Ok(snapshot_id)
+    }
+
+    async fn status(&self) -> Result<SandboxStatus> {
+        let response = self
+            .req(
+                self.client
+                    .get(format!("{}/sandboxes/{}", self.api_url, self.id)),
+            )
+            .send()
+            .await
+            .map_err(|e| CaduceusError::Other(e.into()))?;
+        let response = Self::ensure_success(response, "status").await?;
+        let payload = response
+            .json::<Value>()
+            .await
+            .map_err(|e| CaduceusError::Other(e.into()))?;
+        let status_str = payload
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("running");
+        let status = match status_str {
+            "paused" => SandboxStatus::Paused,
+            "stopped" | "destroyed" => SandboxStatus::Stopped,
+            s if s.starts_with("error") => SandboxStatus::Error(s.to_string()),
+            _ => SandboxStatus::Running,
+        };
+        Ok(status)
     }
 }
 

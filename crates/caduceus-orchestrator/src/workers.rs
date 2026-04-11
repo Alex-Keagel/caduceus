@@ -350,6 +350,7 @@ impl Coordinator {
             system: Some(coordinator_system_prompt()),
             max_tokens: 4096,
             temperature: None,
+            thinking_mode: false,
         };
 
         let raw = match provider.chat(req).await {
@@ -436,6 +437,7 @@ impl Coordinator {
             system: Some(coordinator_system_prompt()),
             max_tokens: 4096,
             temperature: None,
+            thinking_mode: false,
         };
 
         provider
@@ -513,6 +515,7 @@ async fn run_task(
         system: Some(system),
         max_tokens: 4096,
         temperature: None,
+        thinking_mode: false,
     };
 
     provider
