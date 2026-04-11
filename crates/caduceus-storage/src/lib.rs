@@ -1,16 +1,19 @@
 use caduceus_core::{
-    AuditDecision, AuditEntry, CaduceusError, ContentBlock, LlmMessage, ModelId, ProviderId,
-    Result, Role, SessionId, SessionPhase, SessionState, SessionStorage, TokenBudget, ToolCallId,
+    AuditDecision, AuditEntry, AuthStore, CaduceusError, ContentBlock, LlmMessage, ModelId,
+    ProviderId, Result, Role, SessionId, SessionPhase, SessionState, SessionStorage, TokenBudget,
+    ToolCallId,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
 
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 const BOOTSTRAP_SCHEMA_VERSION: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -85,6 +88,27 @@ const MIGRATIONS: [&str; CURRENT_SCHEMA_VERSION as usize] = [
     ALTER TABLE sessions ADD COLUMN used_output INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE sessions ADD COLUMN reserved_output INTEGER NOT NULL DEFAULT 8192;
     "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS memory (
+        id TEXT PRIMARY KEY,
+        scope TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        source TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(scope, key)
+    );
+
+    CREATE TABLE IF NOT EXISTS auth_keys (
+        provider_id TEXT PRIMARY KEY,
+        api_key TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_memory_scope_key ON memory(scope, key);
+    "#,
 ];
 
 #[derive(Debug, Clone)]
@@ -118,6 +142,33 @@ pub struct StoredCost {
     pub output_tokens: u32,
     pub cost_usd: f64,
     pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscriptLine {
+    pub role: String,
+    pub content: serde_json::Value,
+    pub tokens: Option<u32>,
+    pub timestamp: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResumedSession {
+    pub state: SessionState,
+    pub messages: Vec<StoredMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRecord {
+    pub id: String,
+    pub scope: String,
+    pub key: String,
+    pub value: String,
+    pub source: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug)]
@@ -164,6 +215,7 @@ impl SqliteStorage {
             conn: Mutex::new(conn),
         };
         storage.migrate()?;
+        storage.recover_crashed_sessions()?;
         Ok(storage)
     }
 
@@ -512,6 +564,174 @@ impl SqliteStorage {
         })
     }
 
+    pub async fn export_transcript(
+        &self,
+        session_id: &SessionId,
+        path: impl AsRef<Path>,
+    ) -> Result<()> {
+        let messages = self.list_messages(session_id).await?;
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let mut file = fs::File::create(path)?;
+        for message in messages {
+            let line = TranscriptLine {
+                role: role_to_str(message.message.role).to_string(),
+                content: serde_json::to_value(&message.message.content)?,
+                tokens: message.tokens,
+                timestamp: message.timestamp,
+                tool_call_id: extract_tool_call_id(&message.message.content),
+            };
+            serde_json::to_writer(&mut file, &line)?;
+            file.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+
+    pub async fn resume_session(&self, session_id: &SessionId) -> Result<ResumedSession> {
+        let state = self
+            .load_session(session_id)
+            .await?
+            .ok_or_else(|| CaduceusError::SessionNotFound(session_id.clone()))?;
+        let messages = self.list_messages(session_id).await?;
+        Ok(ResumedSession { state, messages })
+    }
+
+    pub fn recover_crashed_sessions(&self) -> Result<Vec<SessionId>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT id FROM sessions WHERE phase = 'running'")
+                .map_err(storage_error)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(storage_error)?;
+
+            let ids = rows
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(storage_error)?;
+            let mut recovered = Vec::new();
+            let now = Utc::now().to_rfc3339();
+
+            for id in ids {
+                conn.execute(
+                    "UPDATE sessions SET phase = 'error', updated_at = ?2 WHERE id = ?1",
+                    params![id, now],
+                )
+                .map_err(storage_error)?;
+                conn.execute(
+                    "INSERT INTO messages (session_id, role, content, tokens, timestamp)
+                     VALUES (?1, 'system', ?2, NULL, ?3)",
+                    params![
+                        id,
+                        serde_json::to_string(&vec![ContentBlock::Text(
+                            "Recovered crashed session: previous run ended unexpectedly.".into()
+                        )])?,
+                        now
+                    ],
+                )
+                .map_err(storage_error)?;
+                recovered.push(parse_session_id(&id)?);
+            }
+
+            Ok(recovered)
+        })
+    }
+
+    pub async fn set_memory(
+        &self,
+        scope: &str,
+        key: &str,
+        value: &str,
+        source: &str,
+    ) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO memory (id, scope, key, value, source, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 ON CONFLICT(scope, key) DO UPDATE SET
+                     value = excluded.value,
+                     source = excluded.source,
+                     updated_at = excluded.updated_at",
+                params![id, scope, key, value, source, now],
+            )
+            .map_err(storage_error)?;
+            Ok(())
+        })
+    }
+
+    pub async fn get_memory(&self, scope: &str, key: &str) -> Result<Option<MemoryRecord>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT id, scope, key, value, source, created_at, updated_at
+                 FROM memory WHERE scope = ?1 AND key = ?2",
+                params![scope, key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?
+            .map(memory_record_from_row)
+            .transpose()
+        })
+    }
+
+    pub async fn list_memories(&self, scope: Option<&str>) -> Result<Vec<MemoryRecord>> {
+        self.with_connection(|conn| {
+            let sql = if scope.is_some() {
+                "SELECT id, scope, key, value, source, created_at, updated_at
+                 FROM memory WHERE scope = ?1 ORDER BY updated_at DESC, key ASC"
+            } else {
+                "SELECT id, scope, key, value, source, created_at, updated_at
+                 FROM memory ORDER BY updated_at DESC, key ASC"
+            };
+            let mut stmt = conn.prepare(sql).map_err(storage_error)?;
+            let mut rows = if let Some(scope) = scope {
+                stmt.query(params![scope]).map_err(storage_error)?
+            } else {
+                stmt.query([]).map_err(storage_error)?
+            };
+            let mut results = Vec::new();
+            while let Some(row) = rows.next().map_err(storage_error)? {
+                results.push(memory_record_from_row((
+                    row.get(0).map_err(storage_error)?,
+                    row.get(1).map_err(storage_error)?,
+                    row.get(2).map_err(storage_error)?,
+                    row.get(3).map_err(storage_error)?,
+                    row.get(4).map_err(storage_error)?,
+                    row.get(5).map_err(storage_error)?,
+                    row.get(6).map_err(storage_error)?,
+                ))?);
+            }
+            Ok(results)
+        })
+    }
+
+    pub async fn delete_memory(&self, scope: &str, key: &str) -> Result<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM memory WHERE scope = ?1 AND key = ?2",
+                params![scope, key],
+            )
+            .map_err(storage_error)?;
+            Ok(())
+        })
+    }
+
     fn load_session_row(conn: &Connection, id: &SessionId) -> Result<Option<SessionRow>> {
         conn.query_row(
             "SELECT id, phase, project_root, provider_id, model_id, turn_count, created_at, updated_at,
@@ -675,6 +895,48 @@ impl SessionStorage for SqliteStorage {
     }
 }
 
+#[async_trait::async_trait]
+impl AuthStore for SqliteStorage {
+    async fn get_api_key(&self, provider_id: &ProviderId) -> Result<Option<String>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT api_key FROM auth_keys WHERE provider_id = ?1",
+                params![provider_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)
+        })
+    }
+
+    async fn set_api_key(&self, provider_id: &ProviderId, key: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO auth_keys (provider_id, api_key, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?3)
+                 ON CONFLICT(provider_id) DO UPDATE SET
+                    api_key = excluded.api_key,
+                    updated_at = excluded.updated_at",
+                params![provider_id.0, key, now],
+            )
+            .map_err(storage_error)?;
+            Ok(())
+        })
+    }
+
+    async fn delete_api_key(&self, provider_id: &ProviderId) -> Result<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM auth_keys WHERE provider_id = ?1",
+                params![provider_id.0],
+            )
+            .map_err(storage_error)?;
+            Ok(())
+        })
+    }
+}
+
 #[derive(Debug)]
 struct PersistedSession {
     id: String,
@@ -724,6 +986,29 @@ fn session_from_row(row: SessionRow) -> Result<SessionState> {
         turn_count: transpose_u32(Some(row.turn_count))?.unwrap_or_default(),
         created_at: parse_timestamp(&row.created_at)?,
         updated_at: parse_timestamp(&row.updated_at)?,
+    })
+}
+
+fn extract_tool_call_id(blocks: &[ContentBlock]) -> Option<String> {
+    blocks.iter().find_map(|block| match block {
+        ContentBlock::ToolUse { id, .. } => Some(id.0.clone()),
+        ContentBlock::ToolResult { tool_call_id, .. } => Some(tool_call_id.0.clone()),
+        ContentBlock::Text(_) => None,
+    })
+}
+
+fn memory_record_from_row(
+    row: (String, String, String, String, String, String, String),
+) -> Result<MemoryRecord> {
+    let (id, scope, key, value, source, created_at, updated_at) = row;
+    Ok(MemoryRecord {
+        id,
+        scope,
+        key,
+        value,
+        source,
+        created_at: parse_timestamp(&created_at)?,
+        updated_at: parse_timestamp(&updated_at)?,
     })
 }
 

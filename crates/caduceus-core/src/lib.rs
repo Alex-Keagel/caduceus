@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -322,6 +324,20 @@ impl TokenBudget {
     pub fn needs_compaction(&self) -> bool {
         self.fill_fraction() > 0.85
     }
+
+    /// Return the current warning level based on context utilization.
+    pub fn warning_level(&self) -> WarningLevel {
+        let frac = self.fill_fraction();
+        if frac >= 0.95 {
+            WarningLevel::Critical95
+        } else if frac >= 0.85 {
+            WarningLevel::Warning85
+        } else if frac >= 0.70 {
+            WarningLevel::Warning70
+        } else {
+            WarningLevel::None
+        }
+    }
 }
 
 // ── Tool types ─────────────────────────────────────────────────────────────────
@@ -526,6 +542,243 @@ pub trait AuthStore: Send + Sync {
     async fn delete_api_key(&self, provider_id: &ProviderId) -> Result<()>;
 }
 
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+// ── P0: Directory Conventions ──────────────────────────────────────────────────
+
+/// Standardized paths for Caduceus configuration, storage, and cache.
+pub struct CaduceusPaths;
+
+impl CaduceusPaths {
+    fn home_dir() -> PathBuf {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    pub fn config_dir() -> PathBuf {
+        Self::home_dir().join(".caduceus")
+    }
+
+    pub fn config_file() -> PathBuf {
+        Self::config_dir().join("config.toml")
+    }
+
+    pub fn db_file() -> PathBuf {
+        Self::config_dir().join("db.sqlite")
+    }
+
+    pub fn cache_dir() -> PathBuf {
+        Self::config_dir().join("cache")
+    }
+
+    pub fn logs_dir() -> PathBuf {
+        Self::config_dir().join("logs")
+    }
+
+    pub fn project_config_file(workspace_root: &Path) -> PathBuf {
+        workspace_root.join(".caduceus").join("config.toml")
+    }
+
+    /// Create all standard directories if they don't exist.
+    pub fn ensure_dirs() -> std::io::Result<()> {
+        std::fs::create_dir_all(Self::config_dir())?;
+        std::fs::create_dir_all(Self::cache_dir())?;
+        std::fs::create_dir_all(Self::logs_dir())?;
+        Ok(())
+    }
+}
+
+// ── P0: Configuration Layering ─────────────────────────────────────────────────
+
+/// Partial config for layered merging. All fields are optional so partial
+/// TOML files can be deserialized without providing every field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PartialConfig {
+    pub default_provider: Option<String>,
+    pub default_model: Option<String>,
+    pub storage_path: Option<String>,
+    pub log_level: Option<String>,
+    pub max_context_tokens: Option<u32>,
+    pub providers: Option<HashMap<String, ProviderConfig>>,
+    pub permissions: Option<PermissionDefaults>,
+}
+
+/// Loads and merges configuration from multiple sources in priority order:
+/// 1. CLI overrides
+/// 2. Environment variables
+/// 3. Project config (.caduceus/config.toml in workspace root)
+/// 4. Global config (~/.caduceus/config.toml)
+/// 5. Defaults
+pub struct ConfigLoader {
+    cli_overrides: HashMap<String, String>,
+    workspace_root: Option<PathBuf>,
+}
+
+impl ConfigLoader {
+    pub fn new() -> Self {
+        Self {
+            cli_overrides: HashMap::new(),
+            workspace_root: None,
+        }
+    }
+
+    pub fn with_cli_overrides(mut self, overrides: HashMap<String, String>) -> Self {
+        self.cli_overrides = overrides;
+        self
+    }
+
+    pub fn with_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.workspace_root = Some(root.into());
+        self
+    }
+
+    fn load_toml_file(path: &Path) -> Option<PartialConfig> {
+        let content = std::fs::read_to_string(path).ok()?;
+        toml::from_str(&content).ok()
+    }
+
+    fn load_env() -> PartialConfig {
+        PartialConfig {
+            default_provider: std::env::var("CADUCEUS_PROVIDER").ok(),
+            default_model: std::env::var("CADUCEUS_MODEL").ok(),
+            storage_path: std::env::var("CADUCEUS_STORAGE_PATH").ok(),
+            log_level: std::env::var("CADUCEUS_LOG_LEVEL").ok(),
+            max_context_tokens: std::env::var("CADUCEUS_MAX_CONTEXT_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            providers: None,
+            permissions: None,
+        }
+    }
+
+    fn cli_to_partial(overrides: &HashMap<String, String>) -> PartialConfig {
+        PartialConfig {
+            default_provider: overrides.get("provider").cloned(),
+            default_model: overrides.get("model").cloned(),
+            storage_path: overrides.get("storage_path").cloned(),
+            log_level: overrides.get("log_level").cloned(),
+            max_context_tokens: overrides
+                .get("max_context_tokens")
+                .and_then(|v| v.parse().ok()),
+            providers: None,
+            permissions: None,
+        }
+    }
+
+    fn merge_partial(base: &mut CaduceusConfig, partial: &PartialConfig) {
+        if let Some(ref p) = partial.default_provider {
+            base.default_provider = ProviderId::new(p);
+        }
+        if let Some(ref m) = partial.default_model {
+            base.default_model = ModelId::new(m);
+        }
+        if let Some(ref s) = partial.storage_path {
+            base.storage_path = PathBuf::from(s);
+        }
+        if let Some(ref l) = partial.log_level {
+            base.log_level.clone_from(l);
+        }
+        if let Some(t) = partial.max_context_tokens {
+            base.max_context_tokens = t;
+        }
+        if let Some(ref providers) = partial.providers {
+            for (k, v) in providers {
+                base.providers.insert(k.clone(), v.clone());
+            }
+        }
+        if let Some(ref perms) = partial.permissions {
+            base.permissions = perms.clone();
+        }
+    }
+
+    /// Load and merge config from all sources. Priority: CLI > env > project > global > defaults.
+    pub fn load(&self) -> CaduceusConfig {
+        let mut config = CaduceusConfig::default();
+
+        // Layer 5: defaults (already set)
+
+        // Layer 4: global config
+        let global_path = CaduceusPaths::config_file();
+        if let Some(global) = Self::load_toml_file(&global_path) {
+            Self::merge_partial(&mut config, &global);
+        }
+
+        // Layer 3: project config
+        if let Some(ref root) = self.workspace_root {
+            let project_path = CaduceusPaths::project_config_file(root);
+            if let Some(project) = Self::load_toml_file(&project_path) {
+                Self::merge_partial(&mut config, &project);
+            }
+        }
+
+        // Layer 2: environment variables
+        let env_config = Self::load_env();
+        Self::merge_partial(&mut config, &env_config);
+
+        // Layer 1: CLI overrides (highest priority)
+        let cli_config = Self::cli_to_partial(&self.cli_overrides);
+        Self::merge_partial(&mut config, &cli_config);
+
+        config
+    }
+}
+
+impl Default for ConfigLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── P0: Cancellation Token ─────────────────────────────────────────────────────
+
+/// Thread-safe cancellation token wrapping an `Arc<AtomicBool>`.
+#[derive(Debug, Clone)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Signal cancellation.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// Check if cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Return `Err(CaduceusError::Cancelled)` if cancellation has been requested.
+    pub fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            Err(CaduceusError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── P1: Token Warning Levels ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WarningLevel {
+    None,
+    Warning70,
+    Warning85,
+    Critical95,
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -615,5 +868,150 @@ mod tests {
         assert_eq!(config.default_provider.0, "anthropic");
         assert_eq!(config.max_context_tokens, 200_000);
         assert!(config.permissions.fs_read);
+    }
+
+    // ── P0: CaduceusPaths tests ────────────────────────────────────────────────
+
+    #[test]
+    fn caduceus_paths_structure() {
+        let config_dir = CaduceusPaths::config_dir();
+        assert!(config_dir.ends_with(".caduceus"));
+        assert!(CaduceusPaths::config_file().ends_with("config.toml"));
+        assert!(CaduceusPaths::db_file().ends_with("db.sqlite"));
+        assert!(CaduceusPaths::cache_dir().ends_with("cache"));
+        assert!(CaduceusPaths::logs_dir().ends_with("logs"));
+    }
+
+    #[test]
+    fn caduceus_paths_project_config() {
+        let root = PathBuf::from("/workspace/my-project");
+        let project_config = CaduceusPaths::project_config_file(&root);
+        assert_eq!(
+            project_config,
+            PathBuf::from("/workspace/my-project/.caduceus/config.toml")
+        );
+    }
+
+    // ── P0: ConfigLoader tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn config_loader_defaults_without_files() {
+        let loader = ConfigLoader::new();
+        let config = loader.load();
+        assert_eq!(config.default_provider.0, "anthropic");
+        assert_eq!(config.default_model.0, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn config_loader_cli_overrides() {
+        let mut overrides = HashMap::new();
+        overrides.insert("provider".into(), "openai".into());
+        overrides.insert("model".into(), "gpt-4".into());
+        overrides.insert("max_context_tokens".into(), "100000".into());
+
+        let loader = ConfigLoader::new().with_cli_overrides(overrides);
+        let config = loader.load();
+        assert_eq!(config.default_provider.0, "openai");
+        assert_eq!(config.default_model.0, "gpt-4");
+        assert_eq!(config.max_context_tokens, 100_000);
+    }
+
+    #[test]
+    fn config_loader_merge_partial() {
+        let partial = PartialConfig {
+            default_provider: Some("openai".into()),
+            log_level: Some("debug".into()),
+            ..Default::default()
+        };
+        let mut config = CaduceusConfig::default();
+        ConfigLoader::merge_partial(&mut config, &partial);
+        assert_eq!(config.default_provider.0, "openai");
+        assert_eq!(config.log_level, "debug");
+        // Unset fields should keep defaults
+        assert_eq!(config.default_model.0, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn partial_config_toml_roundtrip() {
+        let toml_str = r#"
+default_provider = "openai"
+default_model = "gpt-4"
+log_level = "debug"
+"#;
+        let partial: PartialConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(partial.default_provider.as_deref(), Some("openai"));
+        assert_eq!(partial.default_model.as_deref(), Some("gpt-4"));
+        assert!(partial.max_context_tokens.is_none());
+    }
+
+    // ── P0: CancellationToken tests ────────────────────────────────────────────
+
+    #[test]
+    fn cancellation_token_default_not_cancelled() {
+        let token = CancellationToken::new();
+        assert!(!token.is_cancelled());
+        assert!(token.check().is_ok());
+    }
+
+    #[test]
+    fn cancellation_token_cancel() {
+        let token = CancellationToken::new();
+        token.cancel();
+        assert!(token.is_cancelled());
+        assert!(token.check().is_err());
+    }
+
+    #[test]
+    fn cancellation_token_shared_across_clones() {
+        let token = CancellationToken::new();
+        let clone = token.clone();
+        token.cancel();
+        assert!(clone.is_cancelled());
+    }
+
+    // ── P1: Token Warning Levels tests ─────────────────────────────────────────
+
+    #[test]
+    fn token_budget_warning_none() {
+        let budget = TokenBudget {
+            context_limit: 1000,
+            used_input: 100,
+            used_output: 50,
+            reserved_output: 100,
+        };
+        assert_eq!(budget.warning_level(), WarningLevel::None);
+    }
+
+    #[test]
+    fn token_budget_warning_70() {
+        let budget = TokenBudget {
+            context_limit: 1000,
+            used_input: 600,
+            used_output: 100,
+            reserved_output: 100,
+        };
+        assert_eq!(budget.warning_level(), WarningLevel::Warning70);
+    }
+
+    #[test]
+    fn token_budget_warning_85() {
+        let budget = TokenBudget {
+            context_limit: 1000,
+            used_input: 750,
+            used_output: 100,
+            reserved_output: 100,
+        };
+        assert_eq!(budget.warning_level(), WarningLevel::Warning85);
+    }
+
+    #[test]
+    fn token_budget_warning_critical_95() {
+        let budget = TokenBudget {
+            context_limit: 1000,
+            used_input: 900,
+            used_output: 60,
+            reserved_output: 100,
+        };
+        assert_eq!(budget.warning_level(), WarningLevel::Critical95);
     }
 }

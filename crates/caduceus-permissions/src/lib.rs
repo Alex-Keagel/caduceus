@@ -99,6 +99,7 @@ pub struct PermissionEnforcer {
     granted_capabilities: HashSet<Capability>,
     session_grants: std::collections::HashMap<String, HashSet<Capability>>,
     audit: AuditLog,
+    mode: PermissionMode,
 }
 
 impl PermissionEnforcer {
@@ -115,6 +116,7 @@ impl PermissionEnforcer {
             granted_capabilities: granted,
             session_grants: std::collections::HashMap::new(),
             audit: AuditLog::new(),
+            mode: PermissionMode::Default,
         }
     }
 
@@ -124,6 +126,39 @@ impl PermissionEnforcer {
         capability: &Capability,
         resource: &str,
     ) -> Result<()> {
+        // Permission mode short-circuits
+        match &self.mode {
+            PermissionMode::Bypass => {
+                self.audit.record(AuditEntry {
+                    session_id: session_id.clone(),
+                    capability: capability.clone(),
+                    resource: resource.to_string(),
+                    decision: PermissionDecision::Allowed,
+                    timestamp: Utc::now(),
+                });
+                return Ok(());
+            }
+            PermissionMode::Plan => {
+                if matches!(
+                    capability,
+                    Capability::FsWrite | Capability::ProcessExec | Capability::GitMutate
+                ) {
+                    self.audit.record(AuditEntry {
+                        session_id: session_id.clone(),
+                        capability: capability.clone(),
+                        resource: resource.to_string(),
+                        decision: PermissionDecision::Denied,
+                        timestamp: Utc::now(),
+                    });
+                    return Err(CaduceusError::PermissionDenied {
+                        capability: capability.to_string(),
+                        tool: resource.to_string(),
+                    });
+                }
+            }
+            PermissionMode::Default => { /* fall through to existing logic */ }
+        }
+
         // FsEscape: check path is within workspace
         if matches!(capability, Capability::FsRead | Capability::FsWrite) {
             let path = Path::new(resource);
@@ -187,6 +222,121 @@ impl PermissionEnforcer {
     pub fn audit_log(&self) -> &AuditLog {
         &self.audit
     }
+
+    pub fn set_mode(&mut self, mode: PermissionMode) {
+        self.mode = mode;
+    }
+
+    pub fn mode(&self) -> &PermissionMode {
+        &self.mode
+    }
+}
+
+// ── Hook system ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum HookEvent {
+    SessionStart,
+    SessionEnd,
+    TurnStart,
+    TurnEnd,
+    ToolCallStart { tool: String },
+    ToolCallEnd { tool: String, result: String },
+    LlmRequestStart,
+    LlmResponseEnd,
+    PermissionGranted { capability: String },
+    PermissionDenied { capability: String },
+    ErrorOccurred { error: String },
+    FileRead { path: String },
+    FileWrite { path: String },
+    BashExec { command: String },
+    BashComplete { exit_code: i32 },
+    CompactionStart,
+    CompactionEnd,
+}
+
+// Use discriminant-only equality so any ToolCallStart matches any other ToolCallStart for registration
+impl PartialEq for HookEvent {
+    fn eq(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+}
+impl Eq for HookEvent {}
+impl std::hash::Hash for HookEvent {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+    }
+}
+
+impl HookEvent {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            HookEvent::SessionStart => "SessionStart",
+            HookEvent::SessionEnd => "SessionEnd",
+            HookEvent::TurnStart => "TurnStart",
+            HookEvent::TurnEnd => "TurnEnd",
+            HookEvent::ToolCallStart { .. } => "ToolCallStart",
+            HookEvent::ToolCallEnd { .. } => "ToolCallEnd",
+            HookEvent::LlmRequestStart => "LlmRequestStart",
+            HookEvent::LlmResponseEnd => "LlmResponseEnd",
+            HookEvent::PermissionGranted { .. } => "PermissionGranted",
+            HookEvent::PermissionDenied { .. } => "PermissionDenied",
+            HookEvent::ErrorOccurred { .. } => "ErrorOccurred",
+            HookEvent::FileRead { .. } => "FileRead",
+            HookEvent::FileWrite { .. } => "FileWrite",
+            HookEvent::BashExec { .. } => "BashExec",
+            HookEvent::BashComplete { .. } => "BashComplete",
+            HookEvent::CompactionStart => "CompactionStart",
+            HookEvent::CompactionEnd => "CompactionEnd",
+        }
+    }
+}
+
+pub type HookHandler = Box<dyn Fn(&HookEvent, &serde_json::Value) -> Result<()> + Send + Sync>;
+
+pub struct HookRegistry {
+    hooks: std::collections::HashMap<HookEvent, Vec<HookHandler>>,
+}
+
+impl HookRegistry {
+    pub fn new() -> Self {
+        Self {
+            hooks: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn register(&mut self, event: HookEvent, handler: HookHandler) {
+        self.hooks.entry(event).or_default().push(handler);
+    }
+
+    pub fn emit(&self, event: &HookEvent, context: &serde_json::Value) -> Result<()> {
+        if let Some(handlers) = self.hooks.get(event) {
+            for handler in handlers {
+                handler(event, context)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn emit_async(&self, event: &HookEvent, context: &serde_json::Value) -> Result<()> {
+        self.emit(event, context)
+    }
+}
+
+impl Default for HookRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Permission modes ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PermissionMode {
+    #[default]
+    Default,
+    Plan,
+    Bypass,
 }
 
 #[cfg(test)]
@@ -215,5 +365,134 @@ mod tests {
         // may be ok if /etc/passwd doesn't exist under /workspace, or err
         // just verify it runs without panic
         let _ = result;
+    }
+
+    // ── Hook system tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn hook_registry_emit_calls_handlers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+
+        let mut registry = HookRegistry::new();
+        registry.register(
+            HookEvent::SessionStart,
+            Box::new(move |_event, _ctx| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        );
+
+        registry
+            .emit(&HookEvent::SessionStart, &serde_json::json!({}))
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        registry
+            .emit(&HookEvent::SessionStart, &serde_json::json!({}))
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn hook_registry_discriminant_matching() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+
+        let mut registry = HookRegistry::new();
+        registry.register(
+            HookEvent::ToolCallStart {
+                tool: String::new(),
+            },
+            Box::new(move |_event, _ctx| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        );
+
+        // Different tool name but same discriminant should trigger handler
+        registry
+            .emit(
+                &HookEvent::ToolCallStart {
+                    tool: "bash".into(),
+                },
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn hook_event_kind_strings() {
+        assert_eq!(HookEvent::SessionStart.kind(), "SessionStart");
+        assert_eq!(
+            HookEvent::ToolCallStart { tool: "x".into() }.kind(),
+            "ToolCallStart"
+        );
+        assert_eq!(HookEvent::CompactionEnd.kind(), "CompactionEnd");
+    }
+
+    #[test]
+    fn hook_registry_no_handlers_is_ok() {
+        let registry = HookRegistry::new();
+        let result = registry.emit(&HookEvent::TurnStart, &serde_json::json!({}));
+        assert!(result.is_ok());
+    }
+
+    // ── Permission mode tests ──────────────────────────────────────────────
+
+    #[test]
+    fn permission_mode_default_allows_reads() {
+        let mut enforcer = PermissionEnforcer::new("/workspace");
+        assert_eq!(*enforcer.mode(), PermissionMode::Default);
+        let sid = SessionId::new();
+        assert!(enforcer.check(&sid, &Capability::FsRead, "file.rs").is_ok());
+    }
+
+    #[test]
+    fn permission_mode_bypass_allows_everything() {
+        let mut enforcer = PermissionEnforcer::new("/workspace");
+        enforcer.set_mode(PermissionMode::Bypass);
+        let sid = SessionId::new();
+        // Even GitMutate (not in default grants) is allowed in bypass
+        assert!(enforcer.check(&sid, &Capability::GitMutate, "repo").is_ok());
+        assert!(enforcer
+            .check(&sid, &Capability::FsEscape, "/etc/passwd")
+            .is_ok());
+    }
+
+    #[test]
+    fn permission_mode_plan_denies_writes() {
+        let mut enforcer = PermissionEnforcer::new("/workspace");
+        enforcer.set_mode(PermissionMode::Plan);
+        let sid = SessionId::new();
+        // Reads are still allowed
+        assert!(enforcer.check(&sid, &Capability::FsRead, "file.rs").is_ok());
+        // Writes, exec, and git mutate are denied
+        assert!(enforcer
+            .check(&sid, &Capability::FsWrite, "file.rs")
+            .is_err());
+        assert!(enforcer
+            .check(&sid, &Capability::ProcessExec, "ls")
+            .is_err());
+        assert!(enforcer
+            .check(&sid, &Capability::GitMutate, "repo")
+            .is_err());
+    }
+
+    #[test]
+    fn permission_mode_plan_allows_network() {
+        let mut enforcer = PermissionEnforcer::new("/workspace");
+        enforcer.set_mode(PermissionMode::Plan);
+        let sid = SessionId::new();
+        assert!(enforcer
+            .check(&sid, &Capability::NetworkHttp, "https://example.com")
+            .is_ok());
     }
 }

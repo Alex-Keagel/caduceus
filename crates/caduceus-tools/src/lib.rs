@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -58,6 +60,76 @@ impl ToolRegistry {
 
     pub async fn call(&self, name: &str, input: Value) -> Result<ToolResult> {
         self.execute(name, input).await
+    }
+
+    pub async fn execute_parallel(&self, tools: Vec<(String, Value)>) -> Vec<Result<ToolResult>> {
+        self.execute_parallel_with_limit(tools, 4).await
+    }
+
+    pub async fn execute_parallel_with_limit(
+        &self,
+        tools: Vec<(String, Value)>,
+        concurrency_limit: usize,
+    ) -> Vec<Result<ToolResult>> {
+        let limit = concurrency_limit.max(1);
+        let semaphore = Arc::new(Semaphore::new(limit));
+        let mut join_set = JoinSet::new();
+
+        for (idx, (name, input)) in tools.into_iter().enumerate() {
+            let tool = self.get(&name);
+            let semaphore = semaphore.clone();
+            join_set.spawn(async move {
+                let permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .map_err(|err| CaduceusError::Tool {
+                        tool: name.clone(),
+                        message: format!("failed to acquire parallel execution permit: {err}"),
+                    });
+
+                let result = match permit {
+                    Ok(_permit) => match tool {
+                        Some(tool) => tool.call(input).await,
+                        None => Err(CaduceusError::Tool {
+                            tool: name.clone(),
+                            message: format!("Unknown tool: {name}"),
+                        }),
+                    },
+                    Err(err) => Err(err),
+                };
+                (idx, result)
+            });
+        }
+
+        let total = join_set.len();
+        let mut results: Vec<Option<Result<ToolResult>>> =
+            std::iter::repeat_with(|| None).take(total).collect();
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok((idx, result)) => results[idx] = Some(result),
+                Err(err) => {
+                    let message = format!("parallel tool task failed: {err}");
+                    if let Some(slot) = results.iter_mut().find(|slot| slot.is_none()) {
+                        *slot = Some(Err(CaduceusError::Tool {
+                            tool: "parallel".into(),
+                            message,
+                        }));
+                    }
+                }
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| {
+                    Err(CaduceusError::Tool {
+                        tool: "parallel".into(),
+                        message: "parallel execution result missing".into(),
+                    })
+                })
+            })
+            .collect()
     }
 }
 
@@ -440,6 +512,346 @@ impl Tool for EditFileTool {
             "path": path,
             "replacements": replacements
         })))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ApplyPatchTool {
+    workspace_root: PathBuf,
+}
+
+impl ApplyPatchTool {
+    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace_root: canonical_or_self(workspace_root.into()),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplyPatchInput {
+    patch: String,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedPatch {
+    files: Vec<PatchFile>,
+}
+
+#[derive(Debug, Clone)]
+struct PatchFile {
+    old_path: Option<String>,
+    new_path: Option<String>,
+    hunks: Vec<PatchHunk>,
+}
+
+#[derive(Debug, Clone)]
+struct PatchHunk {
+    old_start: usize,
+    lines: Vec<PatchLine>,
+}
+
+#[derive(Debug, Clone)]
+enum PatchLine {
+    Context(String),
+    Add(String),
+    Remove(String),
+}
+
+#[derive(Debug, Clone)]
+struct PendingWrite {
+    path: PathBuf,
+    content: Option<String>,
+}
+
+fn parse_patch_path(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed == "/dev/null" {
+        return None;
+    }
+    let trimmed = trimmed
+        .strip_prefix("a/")
+        .or_else(|| trimmed.strip_prefix("b/"))
+        .unwrap_or(trimmed);
+    Some(trimmed.to_string())
+}
+
+fn parse_hunk_header(line: &str) -> std::result::Result<(usize, usize), String> {
+    let Some(rest) = line.strip_prefix("@@ -") else {
+        return Err(format!("invalid hunk header: {line}"));
+    };
+    let Some((old_range, remainder)) = rest.split_once(" +") else {
+        return Err(format!("invalid hunk header: {line}"));
+    };
+    let Some((new_range, _)) = remainder.split_once(" @@") else {
+        return Err(format!("invalid hunk header: {line}"));
+    };
+    let old_start = old_range
+        .split(',')
+        .next()
+        .unwrap_or("0")
+        .parse::<usize>()
+        .map_err(|err| format!("invalid old hunk start in `{line}`: {err}"))?;
+    let _new_start = new_range
+        .split(',')
+        .next()
+        .unwrap_or("0")
+        .parse::<usize>()
+        .map_err(|err| format!("invalid new hunk start in `{line}`: {err}"))?;
+    Ok((old_start, _new_start))
+}
+
+fn parse_unified_diff(patch: &str) -> std::result::Result<ParsedPatch, String> {
+    let mut files = Vec::new();
+    let mut lines = patch.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        if line.starts_with("diff --git ") || line.starts_with("index ") || line.is_empty() {
+            continue;
+        }
+        if !line.starts_with("--- ") {
+            return Err(format!("expected file header, found `{line}`"));
+        }
+
+        let old_path = parse_patch_path(line.trim_start_matches("--- ").trim());
+        let new_line = lines
+            .next()
+            .ok_or_else(|| "patch ended before new file path".to_string())?;
+        if !new_line.starts_with("+++ ") {
+            return Err(format!("expected new file path, found `{new_line}`"));
+        }
+        let new_path = parse_patch_path(new_line.trim_start_matches("+++ ").trim());
+        let mut hunks = Vec::new();
+
+        while let Some(next) = lines.peek().copied() {
+            if next.starts_with("--- ") {
+                break;
+            }
+            if next.starts_with("diff --git ") || next.starts_with("index ") || next.is_empty() {
+                lines.next();
+                continue;
+            }
+            if !next.starts_with("@@ ") {
+                return Err(format!("expected hunk header, found `{next}`"));
+            }
+
+            let header = lines.next().unwrap_or_default();
+            let (old_start, _) = parse_hunk_header(header)?;
+            let mut hunk_lines = Vec::new();
+
+            while let Some(hunk_line) = lines.peek().copied() {
+                if hunk_line.starts_with("@@ ")
+                    || hunk_line.starts_with("--- ")
+                    || hunk_line.starts_with("diff --git ")
+                {
+                    break;
+                }
+                let hunk_line = lines.next().unwrap_or_default();
+                if hunk_line == r"\ No newline at end of file" {
+                    continue;
+                }
+                let (prefix, body) = hunk_line.split_at(1);
+                let parsed = match prefix {
+                    " " => PatchLine::Context(body.to_string()),
+                    "+" => PatchLine::Add(body.to_string()),
+                    "-" => PatchLine::Remove(body.to_string()),
+                    _ => return Err(format!("invalid hunk line `{hunk_line}`")),
+                };
+                hunk_lines.push(parsed);
+            }
+
+            hunks.push(PatchHunk {
+                old_start,
+                lines: hunk_lines,
+            });
+        }
+
+        files.push(PatchFile {
+            old_path,
+            new_path,
+            hunks,
+        });
+    }
+
+    if files.is_empty() {
+        return Err("patch did not contain any files".into());
+    }
+
+    Ok(ParsedPatch { files })
+}
+
+fn apply_patch_to_content(
+    original: &str,
+    hunks: &[PatchHunk],
+) -> std::result::Result<String, String> {
+    let original_lines: Vec<String> = if original.is_empty() {
+        Vec::new()
+    } else {
+        original.lines().map(ToString::to_string).collect()
+    };
+    let mut output = Vec::new();
+    let mut cursor = 0usize;
+
+    for hunk in hunks {
+        let target = hunk.old_start.saturating_sub(1);
+        if target < cursor || target > original_lines.len() {
+            return Err("hunk start is out of bounds".into());
+        }
+
+        while cursor < target {
+            output.push(original_lines[cursor].clone());
+            cursor += 1;
+        }
+
+        for line in &hunk.lines {
+            match line {
+                PatchLine::Context(expected) => {
+                    let actual = original_lines
+                        .get(cursor)
+                        .ok_or_else(|| format!("missing context line `{expected}`"))?;
+                    if actual != expected {
+                        return Err(format!(
+                            "context mismatch: expected `{expected}`, found `{actual}`"
+                        ));
+                    }
+                    output.push(actual.clone());
+                    cursor += 1;
+                }
+                PatchLine::Remove(expected) => {
+                    let actual = original_lines
+                        .get(cursor)
+                        .ok_or_else(|| format!("missing removal line `{expected}`"))?;
+                    if actual != expected {
+                        return Err(format!(
+                            "removal mismatch: expected `{expected}`, found `{actual}`"
+                        ));
+                    }
+                    cursor += 1;
+                }
+                PatchLine::Add(value) => output.push(value.clone()),
+            }
+        }
+    }
+
+    while cursor < original_lines.len() {
+        output.push(original_lines[cursor].clone());
+        cursor += 1;
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn apply_unified_diff(workspace_root: &Path, patch: &str) -> std::result::Result<Value, String> {
+    let parsed = parse_unified_diff(patch)?;
+    let mut writes = Vec::new();
+    let mut files_created = 0usize;
+    let mut files_deleted = 0usize;
+    let mut files_updated = 0usize;
+    let mut hunk_count = 0usize;
+
+    for file in parsed.files {
+        hunk_count += file.hunks.len();
+        match (&file.old_path, &file.new_path) {
+            (None, Some(new_path)) => {
+                let path = resolve_workspace_path(workspace_root, new_path)
+                    .map_err(|err| err.to_string())?;
+                let content = apply_patch_to_content("", &file.hunks)?;
+                writes.push(PendingWrite {
+                    path,
+                    content: Some(content),
+                });
+                files_created += 1;
+            }
+            (Some(old_path), None) => {
+                let path = resolve_workspace_path(workspace_root, old_path)
+                    .map_err(|err| err.to_string())?;
+                let original = std::fs::read_to_string(&path)
+                    .map_err(|err| format!("failed to read `{old_path}`: {err}"))?;
+                let _ = apply_patch_to_content(&original, &file.hunks)?;
+                writes.push(PendingWrite {
+                    path,
+                    content: None,
+                });
+                files_deleted += 1;
+            }
+            (Some(old_path), Some(new_path)) => {
+                let old_resolved = resolve_workspace_path(workspace_root, old_path)
+                    .map_err(|err| err.to_string())?;
+                let new_resolved = resolve_workspace_path(workspace_root, new_path)
+                    .map_err(|err| err.to_string())?;
+                if old_resolved != new_resolved {
+                    return Err("renames are not supported by apply_patch".into());
+                }
+                let original = std::fs::read_to_string(&old_resolved)
+                    .map_err(|err| format!("failed to read `{old_path}`: {err}"))?;
+                let content = apply_patch_to_content(&original, &file.hunks)?;
+                writes.push(PendingWrite {
+                    path: old_resolved,
+                    content: Some(content),
+                });
+                files_updated += 1;
+            }
+            (None, None) => return Err("patch file must have at least one path".into()),
+        }
+    }
+
+    for write in &writes {
+        if let Some(parent) = write.path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create parent directories: {err}"))?;
+        }
+        match &write.content {
+            Some(content) => {
+                std::fs::write(&write.path, content)
+                    .map_err(|err| format!("failed to write `{}`: {err}", write.path.display()))?;
+            }
+            None => {
+                if write.path.exists() {
+                    std::fs::remove_file(&write.path).map_err(|err| {
+                        format!("failed to delete `{}`: {err}", write.path.display())
+                    })?;
+                }
+            }
+        }
+    }
+
+    Ok(json!({
+        "files_created": files_created,
+        "files_updated": files_updated,
+        "files_deleted": files_deleted,
+        "hunks_applied": hunk_count,
+    }))
+}
+
+#[async_trait]
+impl Tool for ApplyPatchTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "apply_patch".into(),
+            description: "Apply a unified diff patch to workspace files".into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["patch"],
+                "properties": {
+                    "patch": {"type": "string"}
+                },
+                "additionalProperties": false
+            }),
+            required_capability: Some("fs_write".into()),
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let parsed: ApplyPatchInput = match serde_json::from_value::<ApplyPatchInput>(input) {
+            Ok(value) if !value.patch.trim().is_empty() => value,
+            Ok(_) => return Ok(tool_error("'patch' must not be empty")),
+            Err(err) => return Ok(tool_error(format!("invalid input: {err}"))),
+        };
+
+        match apply_unified_diff(&self.workspace_root, &parsed.patch) {
+            Ok(summary) => Ok(json_result(summary)),
+            Err(err) => Ok(tool_error(err)),
+        }
     }
 }
 
@@ -989,6 +1401,7 @@ pub fn default_registry_with_root(workspace_root: impl Into<PathBuf>) -> ToolReg
     registry.register(Arc::new(ReadFileTool::new(&workspace_root)));
     registry.register(Arc::new(WriteFileTool::new(&workspace_root)));
     registry.register(Arc::new(EditFileTool::new(&workspace_root)));
+    registry.register(Arc::new(ApplyPatchTool::new(&workspace_root)));
     registry.register(Arc::new(GlobSearchTool::new(&workspace_root)));
     registry.register(Arc::new(GrepSearchTool::new(&workspace_root)));
     registry.register(Arc::new(ListFilesTool::new(&workspace_root)));
@@ -1027,7 +1440,7 @@ mod tests {
     fn registry_lookup_and_specs() {
         let registry = default_registry_with_root(std::env::current_dir().unwrap());
         assert!(registry.get("bash").is_some());
-        assert_eq!(registry.list_specs().len(), 10);
+        assert_eq!(registry.list_specs().len(), 11);
     }
 
     #[tokio::test]

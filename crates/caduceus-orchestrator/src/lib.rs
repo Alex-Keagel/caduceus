@@ -2,12 +2,15 @@ pub mod instructions;
 pub mod workers;
 
 use caduceus_core::{
-    AgentEvent, CaduceusError, ModelId, ProviderId, Result, SessionId, SessionPhase, SessionState,
-    StopReason, TokenUsage, ToolCallId,
+    AgentEvent, CaduceusError, CancellationToken, ModelId, ProviderId, Result, SessionId,
+    SessionPhase, SessionState, StopReason, TokenUsage, ToolCallId, WarningLevel,
 };
 use caduceus_providers::{ChatRequest, LlmAdapter};
 use caduceus_tools::ToolRegistry;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -43,6 +46,152 @@ impl ConfigLoader {
     }
 }
 
+// ── P1: Effort Levels ──────────────────────────────────────────────────────────
+
+/// Controls the detail level of LLM interactions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EffortLevel {
+    Min,
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl EffortLevel {
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "min" | "minimum" => Some(Self::Min),
+            "low" => Some(Self::Low),
+            "medium" | "med" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "max" | "maximum" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    /// System prompt detail level description.
+    pub fn system_prompt_detail(&self) -> &'static str {
+        match self {
+            Self::Min => "Be extremely concise. One sentence max.",
+            Self::Low => "Be brief. Short paragraphs only.",
+            Self::Medium => "Provide balanced detail with examples when helpful.",
+            Self::High => "Be thorough. Include examples, edge cases, and alternatives.",
+            Self::Max => {
+                "Be exhaustive. Cover every detail, edge case, alternative, and implication."
+            }
+        }
+    }
+
+    /// Suggested max_tokens for this effort level.
+    pub fn max_tokens(&self) -> u32 {
+        match self {
+            Self::Min => 256,
+            Self::Low => 1024,
+            Self::Medium => 4096,
+            Self::High => 8192,
+            Self::Max => 16384,
+        }
+    }
+
+    /// Suggested temperature for this effort level.
+    pub fn temperature(&self) -> f32 {
+        match self {
+            Self::Min => 0.0,
+            Self::Low => 0.2,
+            Self::Medium => 0.5,
+            Self::High => 0.7,
+            Self::Max => 0.8,
+        }
+    }
+}
+
+// ── P1: Query Configuration ────────────────────────────────────────────────────
+
+/// Per-query overrides for model parameters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QueryConfig {
+    pub model: Option<ModelId>,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+}
+
+impl QueryConfig {
+    /// Parse from `/config` command args like `model=gpt-4 temp=0.5 tokens=8192`.
+    pub fn parse(args: &str) -> Self {
+        let mut config = Self::default();
+        for part in args.split_whitespace() {
+            if let Some((key, value)) = part.split_once('=') {
+                match key {
+                    "model" => config.model = Some(ModelId::new(value)),
+                    "temp" | "temperature" => config.temperature = value.parse().ok(),
+                    "tokens" | "max_tokens" => config.max_tokens = value.parse().ok(),
+                    _ => {}
+                }
+            }
+        }
+        config
+    }
+}
+
+// ── P1: Loop Detection ─────────────────────────────────────────────────────────
+
+/// Tracks tool call fingerprints to detect infinite loops.
+pub struct LoopDetector {
+    fingerprints: Vec<u64>,
+    max_history: usize,
+    consecutive_threshold: usize,
+}
+
+impl LoopDetector {
+    pub fn new(max_history: usize, consecutive_threshold: usize) -> Self {
+        Self {
+            fingerprints: Vec::new(),
+            max_history,
+            consecutive_threshold,
+        }
+    }
+
+    /// Record a tool call and return true if a loop is detected.
+    pub fn record(&mut self, tool_name: &str, args: &serde_json::Value) -> bool {
+        let fingerprint = Self::hash_call(tool_name, args);
+        self.fingerprints.push(fingerprint);
+
+        // Keep bounded history
+        if self.fingerprints.len() > self.max_history {
+            self.fingerprints
+                .drain(..self.fingerprints.len() - self.max_history);
+        }
+
+        self.is_looping()
+    }
+
+    fn hash_call(tool_name: &str, args: &serde_json::Value) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        tool_name.hash(&mut hasher);
+        args.to_string().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn is_looping(&self) -> bool {
+        if self.fingerprints.len() < self.consecutive_threshold {
+            return false;
+        }
+        let tail = &self.fingerprints[self.fingerprints.len() - self.consecutive_threshold..];
+        tail.iter().all(|&f| f == tail[0])
+    }
+
+    pub fn reset(&mut self) {
+        self.fingerprints.clear();
+    }
+}
+
+impl Default for LoopDetector {
+    fn default() -> Self {
+        Self::new(20, 3)
+    }
+}
+
 // ── Slash commands ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -60,6 +209,8 @@ pub enum SlashCommand {
     McpAdd(String),
     Agents,
     Skills,
+    Effort(String),
+    Config(String),
     Exit,
     Unknown(String),
 }
@@ -96,6 +247,8 @@ impl SlashCommand {
             "exit" | "quit" => Self::Exit,
             "model" => Self::Model(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
             "provider" => Self::Provider(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
+            "effort" => Self::Effort(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
+            "config" => Self::Config(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
             other => Self::Unknown(other.to_string()),
         };
         Some(cmd)
@@ -122,6 +275,14 @@ impl SlashCommand {
             Self::McpAdd(name) => format!("Add MCP server from registry: {name}"),
             Self::Agents => "List available agents".to_string(),
             Self::Skills => "List available skills".to_string(),
+            Self::Effort(level) if level.is_empty() => {
+                "Set effort level (min/low/medium/high/max)".to_string()
+            }
+            Self::Effort(level) => format!("Set effort level to {level}"),
+            Self::Config(args) if args.is_empty() => {
+                "Set query config (model=X temp=0.5 tokens=8192)".to_string()
+            }
+            Self::Config(args) => format!("Set query config: {args}"),
             Self::Exit => "Exit the current session".to_string(),
             Self::Unknown(command) => format!("Unknown slash command: {command}"),
         }
@@ -369,8 +530,12 @@ pub struct AgentHarness {
     system_prompt: String,
     max_context_tokens: u32,
     max_turns: usize,
+    max_tool_rounds: usize,
     emitter: Option<AgentEventEmitter>,
     instruction_set: Option<instructions::InstructionSet>,
+    cancellation_token: Option<CancellationToken>,
+    effort_level: Option<EffortLevel>,
+    query_config: Option<QueryConfig>,
 }
 
 impl AgentHarness {
@@ -386,8 +551,12 @@ impl AgentHarness {
             system_prompt: system_prompt.into(),
             max_context_tokens,
             max_turns: 50,
+            max_tool_rounds: 25,
             emitter: None,
             instruction_set: None,
+            cancellation_token: None,
+            effort_level: None,
+            query_config: None,
         }
     }
 
@@ -396,8 +565,28 @@ impl AgentHarness {
         self
     }
 
+    pub fn with_max_tool_rounds(mut self, n: usize) -> Self {
+        self.max_tool_rounds = n;
+        self
+    }
+
     pub fn with_emitter(mut self, emitter: AgentEventEmitter) -> Self {
         self.emitter = Some(emitter);
+        self
+    }
+
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
+    }
+
+    pub fn with_effort_level(mut self, level: EffortLevel) -> Self {
+        self.effort_level = Some(level);
+        self
+    }
+
+    pub fn with_query_config(mut self, config: QueryConfig) -> Self {
+        self.query_config = Some(config);
         self
     }
 
@@ -423,6 +612,60 @@ impl AgentHarness {
         self.instruction_set.as_ref()
     }
 
+    /// Check cancellation if a token is set.
+    fn check_cancellation(&self) -> Result<()> {
+        if let Some(ref token) = self.cancellation_token {
+            token.check()?;
+        }
+        Ok(())
+    }
+
+    /// Build the effective system prompt incorporating effort level.
+    fn effective_system_prompt(&self) -> String {
+        let mut prompt = self.system_prompt.clone();
+        if let Some(ref effort) = self.effort_level {
+            prompt = format!(
+                "{}\n\n<effort_level>\n{}\n</effort_level>",
+                prompt,
+                effort.system_prompt_detail()
+            );
+        }
+        prompt
+    }
+
+    /// Resolve effective max_tokens: query_config > effort_level > default.
+    fn effective_max_tokens(&self) -> u32 {
+        if let Some(ref qc) = self.query_config {
+            if let Some(tokens) = qc.max_tokens {
+                return tokens;
+            }
+        }
+        if let Some(ref effort) = self.effort_level {
+            return effort.max_tokens();
+        }
+        4096
+    }
+
+    /// Resolve effective temperature: query_config > effort_level > None.
+    fn effective_temperature(&self) -> Option<f32> {
+        if let Some(ref qc) = self.query_config {
+            if qc.temperature.is_some() {
+                return qc.temperature;
+            }
+        }
+        self.effort_level.map(|e| e.temperature())
+    }
+
+    /// Resolve effective model: query_config > session state.
+    fn effective_model(&self, state: &SessionState) -> ModelId {
+        if let Some(ref qc) = self.query_config {
+            if let Some(ref model) = qc.model {
+                return model.clone();
+            }
+        }
+        state.model_id.clone()
+    }
+
     /// Full agent conversation loop.
     ///
     /// 1. Append user message to conversation history
@@ -437,6 +680,9 @@ impl AgentHarness {
         history: &mut ConversationHistory,
         user_input: &str,
     ) -> Result<String> {
+        // Check cancellation before starting
+        self.check_cancellation()?;
+
         state.phase = SessionPhase::Running;
         if let Some(ref em) = self.emitter {
             em.emit_phase_changed(SessionPhase::Running).await;
@@ -444,26 +690,55 @@ impl AgentHarness {
 
         history.append(caduceus_providers::Message::user(user_input));
 
-        let assembler = ContextAssembler::new(self.max_context_tokens, &self.system_prompt);
+        let system_prompt = self.effective_system_prompt();
+        let assembler = ContextAssembler::new(self.max_context_tokens, &system_prompt);
         let final_text;
 
-        // v1: single-pass (no tool-use loop — that's post-v1 multi-agent)
+        // Check cancellation before LLM call
+        self.check_cancellation()?;
+
+        // Emit token warning if applicable
+        let warning = state.token_budget.warning_level();
+        if warning != WarningLevel::None {
+            if let Some(ref em) = self.emitter {
+                let msg = match warning {
+                    WarningLevel::Warning70 => "Warning: 70% of context budget used",
+                    WarningLevel::Warning85 => "Warning: 85% of context budget used",
+                    WarningLevel::Critical95 => "Critical: 95% of context budget used",
+                    WarningLevel::None => unreachable!(),
+                };
+                em.emit_error(msg).await;
+            }
+        }
+
         {
             let messages = assembler.assemble(history);
 
-            let request = ChatRequest {
-                model: state.model_id.clone(),
+            let mut request = ChatRequest {
+                model: self.effective_model(state),
                 messages,
-                system: Some(self.system_prompt.clone()),
-                max_tokens: 4096,
-                temperature: None,
+                system: Some(system_prompt.clone()),
+                max_tokens: self.effective_max_tokens(),
+                temperature: self.effective_temperature(),
+                thinking_mode: false,
             };
+
+            // Apply thinking mode: prepend chain-of-thought instruction
+            if request.thinking_mode {
+                if let Some(ref sys) = request.system {
+                    request.system = Some(format!("Think step by step.\n\n{}", sys));
+                }
+                request.max_tokens = request.max_tokens.max(8192);
+            }
 
             let mut stream = self.provider.stream(request).await?;
             let mut usage = TokenUsage::default();
             let mut response_content = String::new();
 
             while let Some(chunk) = stream.next().await {
+                // Check cancellation during streaming
+                self.check_cancellation()?;
+
                 let chunk = chunk?;
                 if !chunk.delta.is_empty() {
                     response_content.push_str(&chunk.delta);
@@ -709,6 +984,8 @@ mod tests {
             is_final: true,
             input_tokens: Some(10),
             output_tokens: Some(20),
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
         }]
     }
 
@@ -926,5 +1203,235 @@ mod tests {
             .messages()
             .iter()
             .any(|m| m.content.contains("remembered")));
+    }
+
+    // ── P1: Effort level tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn effort_level_from_str() {
+        assert_eq!(EffortLevel::from_str_loose("min"), Some(EffortLevel::Min));
+        assert_eq!(EffortLevel::from_str_loose("low"), Some(EffortLevel::Low));
+        assert_eq!(
+            EffortLevel::from_str_loose("medium"),
+            Some(EffortLevel::Medium)
+        );
+        assert_eq!(
+            EffortLevel::from_str_loose("med"),
+            Some(EffortLevel::Medium)
+        );
+        assert_eq!(EffortLevel::from_str_loose("high"), Some(EffortLevel::High));
+        assert_eq!(EffortLevel::from_str_loose("max"), Some(EffortLevel::Max));
+        assert_eq!(EffortLevel::from_str_loose("MAX"), Some(EffortLevel::Max));
+        assert_eq!(EffortLevel::from_str_loose("unknown"), None);
+    }
+
+    #[test]
+    fn effort_level_max_tokens_monotonic() {
+        let levels = [
+            EffortLevel::Min,
+            EffortLevel::Low,
+            EffortLevel::Medium,
+            EffortLevel::High,
+            EffortLevel::Max,
+        ];
+        for w in levels.windows(2) {
+            assert!(
+                w[0].max_tokens() <= w[1].max_tokens(),
+                "{:?} should have <= tokens than {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn effort_level_system_prompt_not_empty() {
+        for level in [
+            EffortLevel::Min,
+            EffortLevel::Low,
+            EffortLevel::Medium,
+            EffortLevel::High,
+            EffortLevel::Max,
+        ] {
+            assert!(!level.system_prompt_detail().is_empty());
+        }
+    }
+
+    // ── P1: Query config tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn query_config_parse_full() {
+        let config = QueryConfig::parse("model=gpt-4 temp=0.5 tokens=8192");
+        assert_eq!(config.model.as_ref().unwrap().0, "gpt-4");
+        assert_eq!(config.temperature, Some(0.5));
+        assert_eq!(config.max_tokens, Some(8192));
+    }
+
+    #[test]
+    fn query_config_parse_partial() {
+        let config = QueryConfig::parse("temp=0.2");
+        assert!(config.model.is_none());
+        assert_eq!(config.temperature, Some(0.2));
+        assert!(config.max_tokens.is_none());
+    }
+
+    #[test]
+    fn query_config_parse_empty() {
+        let config = QueryConfig::parse("");
+        assert!(config.model.is_none());
+        assert!(config.temperature.is_none());
+        assert!(config.max_tokens.is_none());
+    }
+
+    // ── P1: Loop detection tests ───────────────────────────────────────────────
+
+    #[test]
+    fn loop_detector_no_false_positive() {
+        let mut detector = LoopDetector::new(20, 3);
+        let args1 = serde_json::json!({"cmd": "ls"});
+        let args2 = serde_json::json!({"cmd": "pwd"});
+        assert!(!detector.record("bash", &args1));
+        assert!(!detector.record("bash", &args2));
+        assert!(!detector.record("bash", &args1));
+    }
+
+    #[test]
+    fn loop_detector_detects_consecutive_duplicates() {
+        let mut detector = LoopDetector::new(20, 3);
+        let args = serde_json::json!({"cmd": "ls"});
+        assert!(!detector.record("bash", &args));
+        assert!(!detector.record("bash", &args));
+        assert!(detector.record("bash", &args)); // 3rd consecutive
+    }
+
+    #[test]
+    fn loop_detector_reset_clears() {
+        let mut detector = LoopDetector::new(20, 3);
+        let args = serde_json::json!({"cmd": "ls"});
+        detector.record("bash", &args);
+        detector.record("bash", &args);
+        detector.reset();
+        assert!(!detector.record("bash", &args)); // Reset, so starts fresh
+    }
+
+    // ── P1: Slash command effort/config ────────────────────────────────────────
+
+    #[test]
+    fn slash_command_effort() {
+        assert!(matches!(
+            SlashCommand::parse("/effort high"),
+            Some(SlashCommand::Effort(ref level)) if level == "high"
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/effort"),
+            Some(SlashCommand::Effort(ref level)) if level.is_empty()
+        ));
+    }
+
+    #[test]
+    fn slash_command_config() {
+        assert!(matches!(
+            SlashCommand::parse("/config model=gpt-4 temp=0.5"),
+            Some(SlashCommand::Config(ref args)) if args == "model=gpt-4 temp=0.5"
+        ));
+    }
+
+    // ── P0: Cancellation in harness ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn harness_cancellation_before_start() {
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let adapter = Arc::new(
+            MockLlmAdapter::new(vec![]).with_stream_chunks(vec![make_final_stream("response")]),
+        );
+        let harness =
+            AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+                .with_cancellation_token(token);
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+        let result = harness.run(&mut state, &mut history, "hello").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Cancelled"));
+    }
+
+    // ── P1: Effort level affects harness ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn harness_with_effort_level() {
+        let adapter =
+            Arc::new(MockLlmAdapter::new(vec![]).with_stream_chunks(vec![make_final_stream("ok")]));
+        let harness = AgentHarness::new(
+            adapter.clone(),
+            caduceus_tools::ToolRegistry::new(),
+            4096,
+            "base system prompt",
+        )
+        .with_effort_level(EffortLevel::Max);
+
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+        harness
+            .run(&mut state, &mut history, "hello")
+            .await
+            .unwrap();
+
+        // Verify the request had high max_tokens from Max effort
+        let requests = adapter.recorded_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].max_tokens, EffortLevel::Max.max_tokens());
+    }
+
+    // ── P1: Query config override ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn harness_with_query_config() {
+        let adapter =
+            Arc::new(MockLlmAdapter::new(vec![]).with_stream_chunks(vec![make_final_stream("ok")]));
+        let qc = QueryConfig {
+            model: Some(ModelId::new("custom-model")),
+            temperature: Some(0.9),
+            max_tokens: Some(2048),
+        };
+        let harness = AgentHarness::new(
+            adapter.clone(),
+            caduceus_tools::ToolRegistry::new(),
+            4096,
+            "system",
+        )
+        .with_query_config(qc);
+
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+        harness
+            .run(&mut state, &mut history, "hello")
+            .await
+            .unwrap();
+
+        let requests = adapter.recorded_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model.0, "custom-model");
+        assert_eq!(requests[0].temperature, Some(0.9));
+        assert_eq!(requests[0].max_tokens, 2048);
+    }
+
+    // ── P1: Tool round limiting (infrastructure) ───────────────────────────────
+
+    #[test]
+    fn harness_default_max_tool_rounds() {
+        let adapter: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let harness =
+            AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+        assert_eq!(harness.max_tool_rounds, 25);
+    }
+
+    #[test]
+    fn harness_custom_max_tool_rounds() {
+        let adapter: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
+        let harness =
+            AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+                .with_max_tool_rounds(10);
+        assert_eq!(harness.max_tool_rounds, 10);
     }
 }

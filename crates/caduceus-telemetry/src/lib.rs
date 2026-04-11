@@ -315,6 +315,83 @@ impl Default for TraceCollector {
     }
 }
 
+// ── Budget enforcement ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetExceeded {
+    pub limit_usd: f64,
+    pub spent_usd: f64,
+    pub attempted_cost: f64,
+}
+
+impl std::fmt::Display for BudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Budget exceeded: ${:.4} spent of ${:.4} limit (attempted ${:.4} more)",
+            self.spent_usd, self.limit_usd, self.attempted_cost
+        )
+    }
+}
+
+pub struct BudgetEnforcer {
+    max_usd: f64,
+    spent_usd: f64,
+}
+
+impl BudgetEnforcer {
+    pub fn new(max_usd: f64) -> Self {
+        Self {
+            max_usd,
+            spent_usd: 0.0,
+        }
+    }
+
+    pub fn set_limit(&mut self, max_usd: f64) {
+        self.max_usd = max_usd;
+    }
+
+    pub fn limit(&self) -> f64 {
+        self.max_usd
+    }
+
+    pub fn spent(&self) -> f64 {
+        self.spent_usd
+    }
+
+    pub fn remaining(&self) -> f64 {
+        (self.max_usd - self.spent_usd).max(0.0)
+    }
+
+    /// Record a cost and check if budget is exceeded. Returns Err if budget would be exceeded.
+    pub fn check_and_record(&mut self, cost: f64) -> std::result::Result<(), BudgetExceeded> {
+        if self.spent_usd + cost > self.max_usd {
+            return Err(BudgetExceeded {
+                limit_usd: self.max_usd,
+                spent_usd: self.spent_usd,
+                attempted_cost: cost,
+            });
+        }
+        self.spent_usd += cost;
+        Ok(())
+    }
+
+    /// Record cost unconditionally (for tracking purposes).
+    pub fn record(&mut self, cost: f64) {
+        self.spent_usd += cost;
+    }
+
+    pub fn reset(&mut self) {
+        self.spent_usd = 0.0;
+    }
+}
+
+impl Default for BudgetEnforcer {
+    fn default() -> Self {
+        Self::new(f64::MAX)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,5 +583,74 @@ mod tests {
         assert_eq!(collector.spans().len(), 3);
         assert_eq!(collector.spans_by_name("llm_call").len(), 2);
         assert_eq!(collector.spans_by_name("tool_exec").len(), 1);
+    }
+
+    // ── BudgetEnforcer tests ──────────────────────────────────────────────
+
+    #[test]
+    fn budget_enforcer_basic() {
+        let mut budget = BudgetEnforcer::new(1.0);
+        assert_eq!(budget.limit(), 1.0);
+        assert_eq!(budget.spent(), 0.0);
+        assert!((budget.remaining() - 1.0).abs() < f64::EPSILON);
+
+        assert!(budget.check_and_record(0.5).is_ok());
+        assert!((budget.spent() - 0.5).abs() < f64::EPSILON);
+        assert!((budget.remaining() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn budget_enforcer_exceeds() {
+        let mut budget = BudgetEnforcer::new(1.0);
+        budget.check_and_record(0.8).unwrap();
+        let err = budget.check_and_record(0.5).unwrap_err();
+        assert!((err.limit_usd - 1.0).abs() < f64::EPSILON);
+        assert!((err.spent_usd - 0.8).abs() < f64::EPSILON);
+        assert!((err.attempted_cost - 0.5).abs() < f64::EPSILON);
+        // Spent should not have increased
+        assert!((budget.spent() - 0.8).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn budget_enforcer_record_unconditional() {
+        let mut budget = BudgetEnforcer::new(1.0);
+        budget.record(2.0);
+        assert!((budget.spent() - 2.0).abs() < f64::EPSILON);
+        assert!((budget.remaining()).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn budget_enforcer_reset() {
+        let mut budget = BudgetEnforcer::new(1.0);
+        budget.check_and_record(0.5).unwrap();
+        budget.reset();
+        assert!((budget.spent()).abs() < f64::EPSILON);
+        assert!((budget.remaining() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn budget_enforcer_set_limit() {
+        let mut budget = BudgetEnforcer::new(1.0);
+        budget.set_limit(5.0);
+        assert!((budget.limit() - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn budget_enforcer_default_is_unlimited() {
+        let budget = BudgetEnforcer::default();
+        assert!(budget.limit() > 1_000_000.0);
+    }
+
+    #[test]
+    fn budget_exceeded_display() {
+        let exceeded = BudgetExceeded {
+            limit_usd: 1.0,
+            spent_usd: 0.8,
+            attempted_cost: 0.5,
+        };
+        let msg = exceeded.to_string();
+        assert!(msg.contains("Budget exceeded"));
+        assert!(msg.contains("0.8000"));
+        assert!(msg.contains("1.0000"));
     }
 }
