@@ -1,6 +1,7 @@
 pub mod automations;
 pub mod background;
 pub mod bugbot;
+pub mod compaction;
 pub mod context;
 pub mod headless;
 pub mod instructions;
@@ -15,8 +16,12 @@ pub use headless::{
 };
 pub use modes::{AgentPersona, PersonaRegistry};
 pub use workers::{
-    Complexity, DecomposedTask, MultiRepoWorkspace, NotificationChannel, NotificationRoute,
-    NotificationRouter, NotificationSeverity, RepoEntry, TaskDecomposer,
+    BusMessage, Complexity, ContextReference, DagTask, DagTaskStatus, DecomposedTask,
+    JitContextLoader, MessageBus, MultiRepoWorkspace, NotificationChannel, NotificationRoute,
+    NotificationRouter, NotificationSeverity, Plugin, PluginAgent, PluginCapability,
+    PluginCapabilityManager, PluginCommand, PluginDefinedTool, PluginExtensions, PluginSkill,
+    PluginSystem, PluginToolRegistry, RefType, RepoEntry, SchedulerStrategy, SharedMemory,
+    SharedMemoryEntry, TaskDag, TaskDecomposer, TaskScheduler, TeamAgent, TeamOrchestrator,
 };
 
 use caduceus_core::{

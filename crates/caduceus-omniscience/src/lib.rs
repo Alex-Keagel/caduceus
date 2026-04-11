@@ -1326,6 +1326,405 @@ impl SemanticIndex {
     }
 }
 
+// ── #117: Cross-Project Index Federation ─────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct IndexedSymbol {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectIndex {
+    pub project_name: String,
+    pub root_path: String,
+    pub file_count: usize,
+    pub last_indexed: u64,
+    pub symbols: Vec<IndexedSymbol>,
+}
+
+#[derive(Debug, Default)]
+pub struct FederatedIndex {
+    indices: HashMap<String, ProjectIndex>,
+}
+
+impl FederatedIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_project(&mut self, index: ProjectIndex) {
+        self.indices.insert(index.project_name.clone(), index);
+    }
+
+    pub fn remove_project(&mut self, name: &str) {
+        self.indices.remove(name);
+    }
+
+    pub fn search_all(&self, query: &str) -> Vec<(&str, Vec<&IndexedSymbol>)> {
+        let q = query.to_lowercase();
+        let mut results: Vec<(&str, Vec<&IndexedSymbol>)> = self
+            .indices
+            .iter()
+            .filter_map(|(name, idx)| {
+                let matches: Vec<&IndexedSymbol> = idx
+                    .symbols
+                    .iter()
+                    .filter(|s| s.name.to_lowercase().contains(&q))
+                    .collect();
+                if matches.is_empty() {
+                    None
+                } else {
+                    Some((name.as_str(), matches))
+                }
+            })
+            .collect();
+        results.sort_by_key(|(name, _)| *name);
+        results
+    }
+
+    pub fn search_project(&self, project: &str, query: &str) -> Vec<&IndexedSymbol> {
+        let q = query.to_lowercase();
+        match self.indices.get(project) {
+            Some(idx) => idx
+                .symbols
+                .iter()
+                .filter(|s| s.name.to_lowercase().contains(&q))
+                .collect(),
+            None => vec![],
+        }
+    }
+
+    pub fn list_projects(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.indices.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
+    pub fn total_symbols(&self) -> usize {
+        self.indices.values().map(|idx| idx.symbols.len()).sum()
+    }
+}
+
+// ── #204: Branch Reflection ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorCategory {
+    CompileError,
+    RuntimeError,
+    TestFailure,
+    Timeout,
+    ResourceExhausted,
+    LogicError,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct ErrorAnalysis {
+    pub category: ErrorCategory,
+    pub root_cause: String,
+    pub affected_files: Vec<String>,
+    pub severity: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlternativeApproach {
+    pub description: String,
+    pub confidence: f64,
+    pub estimated_effort: String,
+}
+
+pub struct BranchReflector;
+
+impl BranchReflector {
+    pub fn classify_error(error: &str) -> ErrorCategory {
+        let lower = error.to_lowercase();
+        if lower.contains("error[e")
+            || lower.contains("error: cannot")
+            || lower.contains("mismatched types")
+            || lower.contains("expected") && lower.contains("found")
+        {
+            ErrorCategory::CompileError
+        } else if lower.contains("panicked")
+            || lower.contains("panic")
+            || lower.contains("segfault")
+            || lower.contains("signal")
+        {
+            ErrorCategory::RuntimeError
+        } else if lower.contains("test failed")
+            || lower.contains("assertion failed")
+            || lower.contains("failures:")
+            || lower.contains("failed test")
+            || lower.contains("test result:")
+        {
+            ErrorCategory::TestFailure
+        } else if lower.contains("timeout")
+            || lower.contains("timed out")
+            || lower.contains("deadline exceeded")
+        {
+            ErrorCategory::Timeout
+        } else if lower.contains("out of memory")
+            || lower.contains("oom")
+            || lower.contains("disk full")
+            || lower.contains("resource exhausted")
+        {
+            ErrorCategory::ResourceExhausted
+        } else if lower.contains("logic")
+            || lower.contains("incorrect result")
+            || lower.contains("wrong output")
+        {
+            ErrorCategory::LogicError
+        } else {
+            ErrorCategory::Unknown
+        }
+    }
+
+    pub fn analyze_error(error_log: &str) -> ErrorAnalysis {
+        let category = Self::classify_error(error_log);
+
+        let root_cause = match &category {
+            ErrorCategory::CompileError => {
+                "Type or syntax error detected in source code".to_string()
+            }
+            ErrorCategory::RuntimeError => "Program panicked or crashed at runtime".to_string(),
+            ErrorCategory::TestFailure => "One or more test assertions failed".to_string(),
+            ErrorCategory::Timeout => "Operation exceeded its time limit".to_string(),
+            ErrorCategory::ResourceExhausted => "System resource limit reached".to_string(),
+            ErrorCategory::LogicError => "Incorrect logic producing wrong results".to_string(),
+            ErrorCategory::Unknown => "Could not determine root cause".to_string(),
+        };
+
+        let severity = match &category {
+            ErrorCategory::CompileError | ErrorCategory::RuntimeError => "high".to_string(),
+            ErrorCategory::TestFailure | ErrorCategory::LogicError => "medium".to_string(),
+            ErrorCategory::Timeout | ErrorCategory::ResourceExhausted => "high".to_string(),
+            ErrorCategory::Unknown => "low".to_string(),
+        };
+
+        // Extract file paths referenced in the error log (lines with "src/" or ".rs")
+        let affected_files: Vec<String> = error_log
+            .lines()
+            .filter_map(|line| {
+                // Look for patterns like "src/foo.rs" or "---> file.rs:42"
+                if let Some(start) = line.find("src/").or_else(|| line.find("-->")) {
+                    let segment = &line[start..];
+                    let path: String = segment
+                        .chars()
+                        .take_while(|c| !c.is_whitespace() && *c != ':' && *c != ')')
+                        .collect();
+                    if path.ends_with(".rs") || path.ends_with(".go") || path.ends_with(".ts") {
+                        return Some(path);
+                    }
+                }
+                None
+            })
+            .collect::<std::collections::HashSet<String>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .tap_sort();
+
+        ErrorAnalysis {
+            category,
+            root_cause,
+            affected_files,
+            severity,
+        }
+    }
+
+    pub fn suggest_alternatives(analysis: &ErrorAnalysis) -> Vec<AlternativeApproach> {
+        match analysis.category {
+            ErrorCategory::CompileError => vec![
+                AlternativeApproach {
+                    description: "Fix type annotations and ensure trait bounds are satisfied"
+                        .to_string(),
+                    confidence: 0.85,
+                    estimated_effort: "low".to_string(),
+                },
+                AlternativeApproach {
+                    description: "Refactor to use concrete types instead of generics".to_string(),
+                    confidence: 0.60,
+                    estimated_effort: "medium".to_string(),
+                },
+            ],
+            ErrorCategory::RuntimeError => vec![
+                AlternativeApproach {
+                    description: "Add bounds checking and handle edge cases explicitly".to_string(),
+                    confidence: 0.80,
+                    estimated_effort: "medium".to_string(),
+                },
+                AlternativeApproach {
+                    description: "Use Result/Option instead of unwrap to propagate errors"
+                        .to_string(),
+                    confidence: 0.90,
+                    estimated_effort: "low".to_string(),
+                },
+            ],
+            ErrorCategory::TestFailure => vec![
+                AlternativeApproach {
+                    description: "Review test expectations against actual implementation behavior"
+                        .to_string(),
+                    confidence: 0.75,
+                    estimated_effort: "low".to_string(),
+                },
+                AlternativeApproach {
+                    description: "Add additional fixtures or mock data to isolate failure"
+                        .to_string(),
+                    confidence: 0.65,
+                    estimated_effort: "medium".to_string(),
+                },
+            ],
+            ErrorCategory::Timeout => vec![
+                AlternativeApproach {
+                    description: "Profile and optimize the critical path".to_string(),
+                    confidence: 0.70,
+                    estimated_effort: "high".to_string(),
+                },
+                AlternativeApproach {
+                    description: "Increase timeout threshold or add caching".to_string(),
+                    confidence: 0.80,
+                    estimated_effort: "low".to_string(),
+                },
+            ],
+            ErrorCategory::ResourceExhausted => vec![
+                AlternativeApproach {
+                    description: "Stream data instead of loading into memory".to_string(),
+                    confidence: 0.75,
+                    estimated_effort: "high".to_string(),
+                },
+                AlternativeApproach {
+                    description: "Add resource limits and backpressure mechanisms".to_string(),
+                    confidence: 0.70,
+                    estimated_effort: "medium".to_string(),
+                },
+            ],
+            ErrorCategory::LogicError => vec![
+                AlternativeApproach {
+                    description: "Add property-based tests to surface edge cases".to_string(),
+                    confidence: 0.65,
+                    estimated_effort: "medium".to_string(),
+                },
+                AlternativeApproach {
+                    description: "Step through logic with a debugger and verify invariants"
+                        .to_string(),
+                    confidence: 0.80,
+                    estimated_effort: "medium".to_string(),
+                },
+            ],
+            ErrorCategory::Unknown => vec![AlternativeApproach {
+                description: "Increase logging verbosity and reproduce the failure".to_string(),
+                confidence: 0.50,
+                estimated_effort: "low".to_string(),
+            }],
+        }
+    }
+}
+
+// Helper trait for in-place sort returning Self
+trait TapSort {
+    fn tap_sort(self) -> Self;
+}
+
+impl TapSort for Vec<String> {
+    fn tap_sort(mut self) -> Self {
+        self.sort_unstable();
+        self
+    }
+}
+
+// ── #205: Autonomous Error Recovery ──────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum RecoveryAction {
+    Retry,
+    RetryWithModification(String),
+    Rollback,
+    SkipAndContinue,
+    Escalate,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveryStrategy {
+    pub name: String,
+    /// Substring pattern to match against an error message
+    pub error_pattern: String,
+    pub action: RecoveryAction,
+    pub max_attempts: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveryAttempt {
+    pub strategy: String,
+    pub success: bool,
+    pub attempt_number: u32,
+}
+
+#[derive(Debug, Default)]
+pub struct ErrorRecoveryEngine {
+    strategies: Vec<RecoveryStrategy>,
+    history: Vec<RecoveryAttempt>,
+}
+
+impl ErrorRecoveryEngine {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_strategy(&mut self, strategy: RecoveryStrategy) {
+        self.strategies.push(strategy);
+    }
+
+    pub fn find_recovery(&self, error: &str) -> Option<&RecoveryStrategy> {
+        let lower = error.to_lowercase();
+        self.strategies
+            .iter()
+            .find(|s| lower.contains(&s.error_pattern.to_lowercase()))
+    }
+
+    pub fn record_attempt(&mut self, strategy: &str, success: bool) {
+        let attempt_number = self
+            .history
+            .iter()
+            .filter(|a| a.strategy == strategy)
+            .count() as u32
+            + 1;
+        self.history.push(RecoveryAttempt {
+            strategy: strategy.to_string(),
+            success,
+            attempt_number,
+        });
+    }
+
+    pub fn success_rate(&self, strategy: &str) -> f64 {
+        let attempts: Vec<&RecoveryAttempt> = self
+            .history
+            .iter()
+            .filter(|a| a.strategy == strategy)
+            .collect();
+        if attempts.is_empty() {
+            return 0.0;
+        }
+        let successes = attempts.iter().filter(|a| a.success).count();
+        successes as f64 / attempts.len() as f64
+    }
+
+    pub fn should_escalate(&self, strategy: &str) -> bool {
+        let max_attempts = self
+            .strategies
+            .iter()
+            .find(|s| s.name == strategy)
+            .map(|s| s.max_attempts)
+            .unwrap_or(3);
+        let failures = self
+            .history
+            .iter()
+            .filter(|a| a.strategy == strategy && !a.success)
+            .count() as u32;
+        failures >= max_attempts
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1803,5 +2202,271 @@ def decorated():
 
         assert_eq!(active.model_name, "unconfigured");
         assert_eq!(active.provider, EmbeddingProvider::Mock);
+    }
+
+    // ── #117: FederatedIndex tests ────────────────────────────────────────────
+
+    fn make_project(name: &str, symbols: Vec<(&str, &str)>) -> ProjectIndex {
+        ProjectIndex {
+            project_name: name.to_string(),
+            root_path: format!("/projects/{name}"),
+            file_count: symbols.len(),
+            last_indexed: 0,
+            symbols: symbols
+                .into_iter()
+                .map(|(sym, kind)| IndexedSymbol {
+                    name: sym.to_string(),
+                    kind: kind.to_string(),
+                    file: format!("src/{sym}.rs"),
+                    line: 1,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn federated_index_empty() {
+        let fi = FederatedIndex::new();
+        assert_eq!(fi.total_symbols(), 0);
+        assert!(fi.list_projects().is_empty());
+    }
+
+    #[test]
+    fn federated_index_add_and_list_projects() {
+        let mut fi = FederatedIndex::new();
+        fi.add_project(make_project("alpha", vec![("Foo", "struct")]));
+        fi.add_project(make_project("beta", vec![("Bar", "fn")]));
+        let projects = fi.list_projects();
+        assert_eq!(projects, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn federated_index_total_symbols() {
+        let mut fi = FederatedIndex::new();
+        fi.add_project(make_project("a", vec![("X", "fn"), ("Y", "fn")]));
+        fi.add_project(make_project("b", vec![("Z", "struct")]));
+        assert_eq!(fi.total_symbols(), 3);
+    }
+
+    #[test]
+    fn federated_index_remove_project() {
+        let mut fi = FederatedIndex::new();
+        fi.add_project(make_project("a", vec![("X", "fn")]));
+        fi.remove_project("a");
+        assert!(fi.list_projects().is_empty());
+        assert_eq!(fi.total_symbols(), 0);
+    }
+
+    #[test]
+    fn federated_index_search_all_finds_across_projects() {
+        let mut fi = FederatedIndex::new();
+        fi.add_project(make_project(
+            "alpha",
+            vec![("FooParser", "struct"), ("BarHelper", "fn")],
+        ));
+        fi.add_project(make_project("beta", vec![("FooBuilder", "struct")]));
+        let results = fi.search_all("foo");
+        assert_eq!(results.len(), 2);
+        // Each project should have one match
+        for (_, syms) in &results {
+            assert!(!syms.is_empty());
+            assert!(syms.iter().all(|s| s.name.to_lowercase().contains("foo")));
+        }
+    }
+
+    #[test]
+    fn federated_index_search_all_empty_when_no_match() {
+        let mut fi = FederatedIndex::new();
+        fi.add_project(make_project("alpha", vec![("FooParser", "struct")]));
+        assert!(fi.search_all("zzznomatch").is_empty());
+    }
+
+    #[test]
+    fn federated_index_search_project() {
+        let mut fi = FederatedIndex::new();
+        fi.add_project(make_project(
+            "alpha",
+            vec![("FooParser", "struct"), ("BarHelper", "fn")],
+        ));
+        let results = fi.search_project("alpha", "foo");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "FooParser");
+    }
+
+    #[test]
+    fn federated_index_search_project_unknown_returns_empty() {
+        let fi = FederatedIndex::new();
+        assert!(fi.search_project("nonexistent", "foo").is_empty());
+    }
+
+    // ── #204: BranchReflector tests ───────────────────────────────────────────
+
+    #[test]
+    fn branch_reflector_classify_compile_error() {
+        assert_eq!(
+            BranchReflector::classify_error("error[E0308]: mismatched types"),
+            ErrorCategory::CompileError
+        );
+    }
+
+    #[test]
+    fn branch_reflector_classify_runtime_error() {
+        assert_eq!(
+            BranchReflector::classify_error("thread 'main' panicked at 'index out of bounds'"),
+            ErrorCategory::RuntimeError
+        );
+    }
+
+    #[test]
+    fn branch_reflector_classify_test_failure() {
+        assert_eq!(
+            BranchReflector::classify_error("test result: FAILED. 1 passed; 2 failed"),
+            ErrorCategory::TestFailure
+        );
+    }
+
+    #[test]
+    fn branch_reflector_classify_timeout() {
+        assert_eq!(
+            BranchReflector::classify_error("operation timed out after 30s"),
+            ErrorCategory::Timeout
+        );
+    }
+
+    #[test]
+    fn branch_reflector_classify_resource_exhausted() {
+        assert_eq!(
+            BranchReflector::classify_error("out of memory: OOM killer invoked"),
+            ErrorCategory::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn branch_reflector_classify_unknown() {
+        assert_eq!(
+            BranchReflector::classify_error("some completely unrelated message"),
+            ErrorCategory::Unknown
+        );
+    }
+
+    #[test]
+    fn branch_reflector_analyze_error_sets_severity() {
+        let analysis = BranchReflector::analyze_error("error[E0308]: mismatched types");
+        assert_eq!(analysis.category, ErrorCategory::CompileError);
+        assert_eq!(analysis.severity, "high");
+        assert!(!analysis.root_cause.is_empty());
+    }
+
+    #[test]
+    fn branch_reflector_suggest_alternatives_non_empty() {
+        let analysis = BranchReflector::analyze_error("error[E0308]: mismatched types");
+        let suggestions = BranchReflector::suggest_alternatives(&analysis);
+        assert!(!suggestions.is_empty());
+        for s in &suggestions {
+            assert!(s.confidence > 0.0 && s.confidence <= 1.0);
+            assert!(!s.description.is_empty());
+            assert!(!s.estimated_effort.is_empty());
+        }
+    }
+
+    #[test]
+    fn branch_reflector_suggest_alternatives_all_categories() {
+        for log in &[
+            "error[E0308]: mismatched types",
+            "thread 'main' panicked",
+            "test failed: assertion_failed",
+            "timed out",
+            "out of memory",
+            "logic error in computation",
+            "some unknown thing",
+        ] {
+            let analysis = BranchReflector::analyze_error(log);
+            let suggestions = BranchReflector::suggest_alternatives(&analysis);
+            assert!(!suggestions.is_empty(), "No suggestions for: {log}");
+        }
+    }
+
+    // ── #205: ErrorRecoveryEngine tests ───────────────────────────────────────
+
+    #[test]
+    fn recovery_engine_empty() {
+        let engine = ErrorRecoveryEngine::new();
+        assert!(engine.find_recovery("some error").is_none());
+        assert_eq!(engine.success_rate("any"), 0.0);
+    }
+
+    #[test]
+    fn recovery_engine_add_and_find_strategy() {
+        let mut engine = ErrorRecoveryEngine::new();
+        engine.add_strategy(RecoveryStrategy {
+            name: "retry-network".to_string(),
+            error_pattern: "connection refused".to_string(),
+            action: RecoveryAction::Retry,
+            max_attempts: 3,
+        });
+        let found = engine.find_recovery("Error: connection refused");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "retry-network");
+    }
+
+    #[test]
+    fn recovery_engine_no_match_returns_none() {
+        let mut engine = ErrorRecoveryEngine::new();
+        engine.add_strategy(RecoveryStrategy {
+            name: "s".to_string(),
+            error_pattern: "specific-error".to_string(),
+            action: RecoveryAction::Retry,
+            max_attempts: 2,
+        });
+        assert!(engine.find_recovery("some other error").is_none());
+    }
+
+    #[test]
+    fn recovery_engine_success_rate() {
+        let mut engine = ErrorRecoveryEngine::new();
+        engine.record_attempt("retry-network", true);
+        engine.record_attempt("retry-network", false);
+        engine.record_attempt("retry-network", true);
+        let rate = engine.success_rate("retry-network");
+        assert!((rate - 2.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn recovery_engine_should_escalate_after_max_failures() {
+        let mut engine = ErrorRecoveryEngine::new();
+        engine.add_strategy(RecoveryStrategy {
+            name: "flaky".to_string(),
+            error_pattern: "flaky".to_string(),
+            action: RecoveryAction::Retry,
+            max_attempts: 2,
+        });
+        assert!(!engine.should_escalate("flaky"));
+        engine.record_attempt("flaky", false);
+        assert!(!engine.should_escalate("flaky"));
+        engine.record_attempt("flaky", false);
+        assert!(engine.should_escalate("flaky"));
+    }
+
+    #[test]
+    fn recovery_engine_success_does_not_trigger_escalate() {
+        let mut engine = ErrorRecoveryEngine::new();
+        engine.add_strategy(RecoveryStrategy {
+            name: "ok".to_string(),
+            error_pattern: "err".to_string(),
+            action: RecoveryAction::SkipAndContinue,
+            max_attempts: 1,
+        });
+        engine.record_attempt("ok", true);
+        engine.record_attempt("ok", true);
+        assert!(!engine.should_escalate("ok"));
+    }
+
+    #[test]
+    fn recovery_attempt_number_increments() {
+        let mut engine = ErrorRecoveryEngine::new();
+        engine.record_attempt("s", false);
+        engine.record_attempt("s", true);
+        assert_eq!(engine.history[0].attempt_number, 1);
+        assert_eq!(engine.history[1].attempt_number, 2);
     }
 }

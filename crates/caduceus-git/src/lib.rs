@@ -688,6 +688,95 @@ impl AutoCommitter {
     }
 }
 
+// ── #217: Scaffold Quality Benchmark ─────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ScaffoldMeasurement {
+    pub model: String,
+    pub task_complexity: String,
+    pub tokens_used: usize,
+    pub tools_called: usize,
+    pub errors_recovered: usize,
+    pub success: bool,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct ScaffoldBenchmark {
+    measurements: Vec<ScaffoldMeasurement>,
+}
+
+impl ScaffoldBenchmark {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&mut self, measurement: ScaffoldMeasurement) {
+        self.measurements.push(measurement);
+    }
+
+    /// efficiency = success_rate × (1000 / avg_tokens), normalized so that
+    /// using fewer tokens at the same success rate is more efficient.
+    pub fn efficiency_score(&self) -> f64 {
+        if self.measurements.is_empty() {
+            return 0.0;
+        }
+        let successes = self.measurements.iter().filter(|m| m.success).count();
+        let success_rate = successes as f64 / self.measurements.len() as f64;
+        let avg_tokens: f64 = self
+            .measurements
+            .iter()
+            .map(|m| m.tokens_used as f64)
+            .sum::<f64>()
+            / self.measurements.len() as f64;
+        let avg_tokens_normalized = avg_tokens.max(1.0) / 1000.0;
+        success_rate * (1.0 / avg_tokens_normalized)
+    }
+
+    pub fn by_model<'a>(&'a self, model: &str) -> Vec<&'a ScaffoldMeasurement> {
+        self.measurements
+            .iter()
+            .filter(|m| m.model == model)
+            .collect()
+    }
+
+    pub fn by_complexity<'a>(&'a self, complexity: &str) -> Vec<&'a ScaffoldMeasurement> {
+        self.measurements
+            .iter()
+            .filter(|m| m.task_complexity == complexity)
+            .collect()
+    }
+
+    /// Returns `(model, efficiency_score)` pairs sorted descending by score.
+    pub fn compare_models(&self) -> Vec<(String, f64)> {
+        let mut model_names: Vec<String> = self
+            .measurements
+            .iter()
+            .map(|m| m.model.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        model_names.sort_unstable();
+
+        let mut scores: Vec<(String, f64)> = model_names
+            .into_iter()
+            .map(|model| {
+                let subset: Vec<&ScaffoldMeasurement> = self.by_model(&model);
+                let successes = subset.iter().filter(|m| m.success).count();
+                let success_rate = successes as f64 / subset.len() as f64;
+                let avg_tokens: f64 =
+                    subset.iter().map(|m| m.tokens_used as f64).sum::<f64>() / subset.len() as f64;
+                let avg_tokens_normalized = avg_tokens.max(1.0) / 1000.0;
+                let score = success_rate * (1.0 / avg_tokens_normalized);
+                (model, score)
+            })
+            .collect();
+
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scores
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1097,5 +1186,108 @@ mod tests {
         let (dir, _) = make_temp_repo();
         let branch = AutoCommitter::create_task_branch(dir.path(), "cleanup").unwrap();
         assert_eq!(branch, "task/cleanup");
+    }
+
+    // ── #217: ScaffoldBenchmark tests ─────────────────────────────────────────
+
+    fn make_measurement(
+        model: &str,
+        complexity: &str,
+        tokens: usize,
+        success: bool,
+    ) -> ScaffoldMeasurement {
+        ScaffoldMeasurement {
+            model: model.to_string(),
+            task_complexity: complexity.to_string(),
+            tokens_used: tokens,
+            tools_called: 3,
+            errors_recovered: 0,
+            success,
+            duration_ms: 500,
+        }
+    }
+
+    #[test]
+    fn scaffold_benchmark_empty_efficiency() {
+        let bench = ScaffoldBenchmark::new();
+        assert_eq!(bench.efficiency_score(), 0.0);
+    }
+
+    #[test]
+    fn scaffold_benchmark_record_and_efficiency() {
+        let mut bench = ScaffoldBenchmark::new();
+        bench.record(make_measurement("gpt-4", "simple", 1000, true));
+        bench.record(make_measurement("gpt-4", "simple", 1000, true));
+        // success_rate = 1.0, avg_tokens = 1000, normalized = 1.0 → efficiency = 1.0
+        let score = bench.efficiency_score();
+        assert!((score - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scaffold_benchmark_partial_success_lowers_efficiency() {
+        let mut bench = ScaffoldBenchmark::new();
+        bench.record(make_measurement("m", "simple", 1000, true));
+        bench.record(make_measurement("m", "simple", 1000, false));
+        // success_rate = 0.5, avg_tokens_norm = 1.0 → 0.5
+        let score = bench.efficiency_score();
+        assert!((score - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scaffold_benchmark_fewer_tokens_more_efficient() {
+        let mut bench_cheap = ScaffoldBenchmark::new();
+        bench_cheap.record(make_measurement("cheap", "simple", 500, true));
+
+        let mut bench_expensive = ScaffoldBenchmark::new();
+        bench_expensive.record(make_measurement("expensive", "simple", 2000, true));
+
+        assert!(bench_cheap.efficiency_score() > bench_expensive.efficiency_score());
+    }
+
+    #[test]
+    fn scaffold_benchmark_by_model() {
+        let mut bench = ScaffoldBenchmark::new();
+        bench.record(make_measurement("gpt-4", "simple", 1000, true));
+        bench.record(make_measurement("claude", "complex", 2000, false));
+        bench.record(make_measurement("gpt-4", "medium", 1500, true));
+
+        let gpt4 = bench.by_model("gpt-4");
+        assert_eq!(gpt4.len(), 2);
+        assert!(gpt4.iter().all(|m| m.model == "gpt-4"));
+
+        let claude = bench.by_model("claude");
+        assert_eq!(claude.len(), 1);
+    }
+
+    #[test]
+    fn scaffold_benchmark_by_complexity() {
+        let mut bench = ScaffoldBenchmark::new();
+        bench.record(make_measurement("m", "simple", 1000, true));
+        bench.record(make_measurement("m", "complex", 2000, true));
+        bench.record(make_measurement("m", "simple", 800, false));
+
+        let simple = bench.by_complexity("simple");
+        assert_eq!(simple.len(), 2);
+        assert!(simple.iter().all(|m| m.task_complexity == "simple"));
+    }
+
+    #[test]
+    fn scaffold_benchmark_compare_models_sorted_descending() {
+        let mut bench = ScaffoldBenchmark::new();
+        // cheap-model: 100% success, 500 tokens → efficiency = 2.0
+        bench.record(make_measurement("cheap-model", "simple", 500, true));
+        // heavy-model: 100% success, 2000 tokens → efficiency = 0.5
+        bench.record(make_measurement("heavy-model", "simple", 2000, true));
+
+        let ranking = bench.compare_models();
+        assert_eq!(ranking.len(), 2);
+        assert_eq!(ranking[0].0, "cheap-model");
+        assert!(ranking[0].1 > ranking[1].1);
+    }
+
+    #[test]
+    fn scaffold_benchmark_compare_models_empty() {
+        let bench = ScaffoldBenchmark::new();
+        assert!(bench.compare_models().is_empty());
     }
 }

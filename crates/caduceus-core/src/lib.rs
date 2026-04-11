@@ -868,6 +868,359 @@ impl FeatureFlags {
     }
 }
 
+// ── Feature #188: Agent Identity (DID) ────────────────────────────────────────
+
+fn fnv1a_hash(s: &str) -> u64 {
+    let mut hash: u64 = 14695981039346656037;
+    for byte in s.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    hash
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentIdentity {
+    pub did: String,
+    pub public_key: String,
+    pub created_at: u64,
+    pub metadata: HashMap<String, String>,
+}
+
+impl AgentIdentity {
+    pub fn generate() -> Self {
+        let seed = Uuid::new_v4().to_string();
+        let hex = format!(
+            "{:016x}{:016x}",
+            fnv1a_hash(&seed),
+            fnv1a_hash(&(seed.clone() + "2"))
+        );
+        let did = format!("did:caduceus:{}", hex);
+        let public_key = format!("{:016x}", fnv1a_hash(&did));
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self {
+            did,
+            public_key,
+            created_at,
+            metadata: HashMap::new(),
+        }
+    }
+
+    pub fn did(&self) -> &str {
+        &self.did
+    }
+
+    pub fn sign(&self, message: &str) -> String {
+        let input = format!("{}:{}", self.public_key, message);
+        format!("{:016x}", fnv1a_hash(&input))
+    }
+
+    pub fn verify_signature(&self, message: &str, signature: &str) -> bool {
+        self.sign(message) == signature
+    }
+}
+
+pub struct AgentIdentityRegistry {
+    identities: HashMap<String, AgentIdentity>,
+}
+
+impl AgentIdentityRegistry {
+    pub fn new() -> Self {
+        Self {
+            identities: HashMap::new(),
+        }
+    }
+
+    pub fn register(&mut self, identity: AgentIdentity) {
+        self.identities.insert(identity.did.clone(), identity);
+    }
+
+    pub fn lookup(&self, did: &str) -> Option<&AgentIdentity> {
+        self.identities.get(did)
+    }
+
+    pub fn verify(&self, did: &str, message: &str, signature: &str) -> bool {
+        self.identities
+            .get(did)
+            .map(|id| id.verify_signature(message, signature))
+            .unwrap_or(false)
+    }
+
+    pub fn list(&self) -> Vec<&AgentIdentity> {
+        self.identities.values().collect()
+    }
+}
+
+impl Default for AgentIdentityRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Feature #128: Bridge / Remote Control (WebSocket) ─────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct BridgeConfig {
+    pub host: String,
+    pub port: u16,
+    pub auth_token: Option<String>,
+    pub max_connections: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct BridgeMessage {
+    pub msg_type: BridgeMessageType,
+    pub payload: String,
+    pub sender: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeMessageType {
+    Command,
+    Response,
+    Event,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct BridgeSession {
+    pub id: String,
+    pub connected_at: u64,
+    pub last_activity: u64,
+    pub authenticated: bool,
+}
+
+impl BridgeConfig {
+    pub fn new(host: &str, port: u16) -> Self {
+        Self {
+            host: host.to_string(),
+            port,
+            auth_token: None,
+            max_connections: 100,
+        }
+    }
+
+    pub fn websocket_url(&self) -> String {
+        format!("ws://{}:{}", self.host, self.port)
+    }
+
+    pub fn with_auth(mut self, token: &str) -> Self {
+        self.auth_token = Some(token.to_string());
+        self
+    }
+}
+
+// ── Feature #129: SSH Sessions ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct SshSessionConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth_method: SshAuthMethod,
+}
+
+#[derive(Debug, Clone)]
+pub enum SshAuthMethod {
+    Password(String),
+    PrivateKey(String),
+    Agent,
+}
+
+impl SshSessionConfig {
+    pub fn new(host: &str, username: &str) -> Self {
+        Self {
+            host: host.to_string(),
+            port: 22,
+            username: username.to_string(),
+            auth_method: SshAuthMethod::Agent,
+        }
+    }
+
+    pub fn with_key(mut self, key_path: &str) -> Self {
+        self.auth_method = SshAuthMethod::PrivateKey(key_path.to_string());
+        self
+    }
+
+    pub fn connection_string(&self) -> String {
+        format!("{}@{}:{}", self.username, self.host, self.port)
+    }
+}
+
+// ── Feature #130: ACP Protocol ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpMessage {
+    pub jsonrpc: String,
+    pub method: String,
+    pub params: Option<serde_json::Value>,
+    pub id: Option<u64>,
+}
+
+impl AcpMessage {
+    pub fn request(method: &str, params: serde_json::Value) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params: Some(params),
+            id: Some(fnv1a_hash(&Uuid::new_v4().to_string())),
+        }
+    }
+
+    pub fn notification(method: &str, params: serde_json::Value) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params: Some(params),
+            id: None,
+        }
+    }
+
+    pub fn response(id: u64, result: serde_json::Value) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        })
+        .to_string()
+    }
+
+    pub fn error(id: u64, code: i32, message: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": code, "message": message },
+        })
+        .to_string()
+    }
+
+    pub fn parse(json: &str) -> Result<Self> {
+        serde_json::from_str(json).map_err(CaduceusError::Serialization)
+    }
+}
+
+// ── Feature #131: Collaboration Sync ──────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpType {
+    Insert,
+    Delete,
+    Replace,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeferredOp {
+    pub op_type: OpType,
+    pub path: String,
+    pub content: Option<String>,
+    pub timestamp: u64,
+    pub author: String,
+}
+
+pub struct OpLog {
+    ops: Vec<DeferredOp>,
+}
+
+impl OpLog {
+    pub fn new() -> Self {
+        Self { ops: Vec::new() }
+    }
+
+    pub fn append(&mut self, op: DeferredOp) {
+        self.ops.push(op);
+    }
+
+    pub fn replay(&self) -> Vec<&DeferredOp> {
+        self.ops.iter().collect()
+    }
+
+    pub fn ops_since(&self, timestamp: u64) -> Vec<&DeferredOp> {
+        self.ops
+            .iter()
+            .filter(|op| op.timestamp > timestamp)
+            .collect()
+    }
+
+    pub fn merge(&mut self, other: &OpLog) {
+        for op in &other.ops {
+            let is_dup = self
+                .ops
+                .iter()
+                .any(|e| e.timestamp == op.timestamp && e.author == op.author && e.path == op.path);
+            if !is_dup {
+                self.ops.push(op.clone());
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+}
+
+impl Default for OpLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Feature #132: Remote Selections / AI Cursors ──────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct RemoteCursor {
+    pub user_id: String,
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+    pub color: String,
+}
+
+pub struct CursorTracker {
+    cursors: HashMap<String, RemoteCursor>,
+}
+
+impl CursorTracker {
+    pub fn new() -> Self {
+        Self {
+            cursors: HashMap::new(),
+        }
+    }
+
+    pub fn update(&mut self, cursor: RemoteCursor) {
+        self.cursors.insert(cursor.user_id.clone(), cursor);
+    }
+
+    pub fn remove(&mut self, user_id: &str) {
+        self.cursors.remove(user_id);
+    }
+
+    pub fn get(&self, user_id: &str) -> Option<&RemoteCursor> {
+        self.cursors.get(user_id)
+    }
+
+    pub fn cursors_in_file(&self, file: &str) -> Vec<&RemoteCursor> {
+        self.cursors.values().filter(|c| c.file == file).collect()
+    }
+
+    pub fn all_cursors(&self) -> Vec<&RemoteCursor> {
+        self.cursors.values().collect()
+    }
+}
+
+impl Default for CursorTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1231,5 +1584,298 @@ log_level = "debug"
             usage: TokenUsage::default(),
         };
         assert_eq!(resp.text_content(), "hi");
+    }
+
+    // ── Feature #188: Agent Identity tests ─────────────────────────────────────
+
+    #[test]
+    fn agent_identity_generate_has_did_prefix() {
+        let id = AgentIdentity::generate();
+        assert!(id.did().starts_with("did:caduceus:"));
+    }
+
+    #[test]
+    fn agent_identity_sign_and_verify() {
+        let id = AgentIdentity::generate();
+        let sig = id.sign("hello world");
+        assert!(id.verify_signature("hello world", &sig));
+        assert!(!id.verify_signature("other msg", &sig));
+    }
+
+    #[test]
+    fn agent_identity_unique_dids() {
+        let a = AgentIdentity::generate();
+        let b = AgentIdentity::generate();
+        assert_ne!(a.did(), b.did());
+    }
+
+    #[test]
+    fn agent_identity_registry_register_and_lookup() {
+        let mut reg = AgentIdentityRegistry::new();
+        let id = AgentIdentity::generate();
+        let did = id.did().to_string();
+        reg.register(id);
+        assert!(reg.lookup(&did).is_some());
+        assert!(reg.lookup("did:caduceus:nonexistent").is_none());
+    }
+
+    #[test]
+    fn agent_identity_registry_verify() {
+        let mut reg = AgentIdentityRegistry::new();
+        let id = AgentIdentity::generate();
+        let did = id.did().to_string();
+        let sig = id.sign("test");
+        reg.register(id);
+        assert!(reg.verify(&did, "test", &sig));
+        assert!(!reg.verify(&did, "test", "badsig"));
+        assert!(!reg.verify("did:caduceus:ghost", "test", &sig));
+    }
+
+    #[test]
+    fn agent_identity_registry_list() {
+        let mut reg = AgentIdentityRegistry::new();
+        reg.register(AgentIdentity::generate());
+        reg.register(AgentIdentity::generate());
+        assert_eq!(reg.list().len(), 2);
+    }
+
+    // ── Feature #128: Bridge tests ──────────────────────────────────────────────
+
+    #[test]
+    fn bridge_config_websocket_url() {
+        let cfg = BridgeConfig::new("localhost", 8080);
+        assert_eq!(cfg.websocket_url(), "ws://localhost:8080");
+    }
+
+    #[test]
+    fn bridge_config_with_auth() {
+        let cfg = BridgeConfig::new("host", 9000).with_auth("secret");
+        assert_eq!(cfg.auth_token, Some("secret".to_string()));
+    }
+
+    #[test]
+    fn bridge_config_defaults() {
+        let cfg = BridgeConfig::new("host", 80);
+        assert!(cfg.auth_token.is_none());
+        assert_eq!(cfg.max_connections, 100);
+    }
+
+    #[test]
+    fn bridge_message_type_variants() {
+        let _ = BridgeMessageType::Command;
+        let _ = BridgeMessageType::Response;
+        let _ = BridgeMessageType::Event;
+        let _ = BridgeMessageType::Error;
+    }
+
+    // ── Feature #129: SSH Session tests ────────────────────────────────────────
+
+    #[test]
+    fn ssh_session_config_defaults() {
+        let cfg = SshSessionConfig::new("example.com", "alice");
+        assert_eq!(cfg.host, "example.com");
+        assert_eq!(cfg.username, "alice");
+        assert_eq!(cfg.port, 22);
+        assert!(matches!(cfg.auth_method, SshAuthMethod::Agent));
+    }
+
+    #[test]
+    fn ssh_session_config_with_key() {
+        let cfg = SshSessionConfig::new("host", "bob").with_key("/home/bob/.ssh/id_rsa");
+        assert!(matches!(cfg.auth_method, SshAuthMethod::PrivateKey(_)));
+    }
+
+    #[test]
+    fn ssh_session_config_connection_string() {
+        let cfg = SshSessionConfig::new("myhost", "user");
+        assert_eq!(cfg.connection_string(), "user@myhost:22");
+    }
+
+    // ── Feature #130: ACP Protocol tests ───────────────────────────────────────
+
+    #[test]
+    fn acp_message_request_has_id() {
+        let msg = AcpMessage::request("tools/list", serde_json::json!({}));
+        assert_eq!(msg.jsonrpc, "2.0");
+        assert_eq!(msg.method, "tools/list");
+        assert!(msg.id.is_some());
+        assert!(msg.params.is_some());
+    }
+
+    #[test]
+    fn acp_message_notification_has_no_id() {
+        let msg = AcpMessage::notification("event/fired", serde_json::json!({"key": "val"}));
+        assert!(msg.id.is_none());
+        assert_eq!(msg.method, "event/fired");
+    }
+
+    #[test]
+    fn acp_message_response_serializes() {
+        let resp = AcpMessage::response(42, serde_json::json!({"ok": true}));
+        assert!(resp.contains("\"jsonrpc\":\"2.0\""));
+        assert!(resp.contains("\"id\":42"));
+    }
+
+    #[test]
+    fn acp_message_error_serializes() {
+        let err = AcpMessage::error(1, -32600, "Invalid Request");
+        assert!(err.contains("\"error\""));
+        assert!(err.contains("-32600"));
+    }
+
+    #[test]
+    fn acp_message_parse_roundtrip() {
+        let msg = AcpMessage::request("ping", serde_json::json!(null));
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed = AcpMessage::parse(&json).unwrap();
+        assert_eq!(parsed.method, "ping");
+        assert_eq!(parsed.jsonrpc, "2.0");
+    }
+
+    // ── Feature #131: Collaboration Sync tests ─────────────────────────────────
+
+    #[test]
+    fn oplog_append_and_len() {
+        let mut log = OpLog::new();
+        assert_eq!(log.len(), 0);
+        log.append(DeferredOp {
+            op_type: OpType::Insert,
+            path: "file.rs".to_string(),
+            content: Some("fn main() {}".to_string()),
+            timestamp: 1,
+            author: "alice".to_string(),
+        });
+        assert_eq!(log.len(), 1);
+    }
+
+    #[test]
+    fn oplog_replay_order() {
+        let mut log = OpLog::new();
+        for i in 0u64..3 {
+            log.append(DeferredOp {
+                op_type: OpType::Insert,
+                path: format!("f{}.rs", i),
+                content: None,
+                timestamp: i,
+                author: "bob".to_string(),
+            });
+        }
+        let replayed = log.replay();
+        assert_eq!(replayed.len(), 3);
+        assert_eq!(replayed[0].timestamp, 0);
+        assert_eq!(replayed[2].timestamp, 2);
+    }
+
+    #[test]
+    fn oplog_ops_since() {
+        let mut log = OpLog::new();
+        for ts in [1u64, 5, 10] {
+            log.append(DeferredOp {
+                op_type: OpType::Replace,
+                path: "x".to_string(),
+                content: None,
+                timestamp: ts,
+                author: "carol".to_string(),
+            });
+        }
+        let recent = log.ops_since(5);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].timestamp, 10);
+    }
+
+    #[test]
+    fn oplog_merge_deduplicates() {
+        let mut log_a = OpLog::new();
+        let mut log_b = OpLog::new();
+        let op = DeferredOp {
+            op_type: OpType::Delete,
+            path: "shared.rs".to_string(),
+            content: None,
+            timestamp: 42,
+            author: "dave".to_string(),
+        };
+        log_a.append(op.clone());
+        log_b.append(op);
+        log_b.append(DeferredOp {
+            op_type: OpType::Insert,
+            path: "new.rs".to_string(),
+            content: Some("x".to_string()),
+            timestamp: 43,
+            author: "dave".to_string(),
+        });
+        log_a.merge(&log_b);
+        assert_eq!(log_a.len(), 2); // duplicate not added
+    }
+
+    // ── Feature #132: Remote Cursors tests ─────────────────────────────────────
+
+    #[test]
+    fn cursor_tracker_update_and_get() {
+        let mut tracker = CursorTracker::new();
+        tracker.update(RemoteCursor {
+            user_id: "u1".to_string(),
+            file: "main.rs".to_string(),
+            line: 10,
+            column: 5,
+            color: "#ff0000".to_string(),
+        });
+        let c = tracker.get("u1").unwrap();
+        assert_eq!(c.line, 10);
+    }
+
+    #[test]
+    fn cursor_tracker_remove() {
+        let mut tracker = CursorTracker::new();
+        tracker.update(RemoteCursor {
+            user_id: "u2".to_string(),
+            file: "lib.rs".to_string(),
+            line: 1,
+            column: 0,
+            color: "#00ff00".to_string(),
+        });
+        tracker.remove("u2");
+        assert!(tracker.get("u2").is_none());
+    }
+
+    #[test]
+    fn cursor_tracker_cursors_in_file() {
+        let mut tracker = CursorTracker::new();
+        tracker.update(RemoteCursor {
+            user_id: "u1".to_string(),
+            file: "a.rs".to_string(),
+            line: 1,
+            column: 0,
+            color: "red".to_string(),
+        });
+        tracker.update(RemoteCursor {
+            user_id: "u2".to_string(),
+            file: "b.rs".to_string(),
+            line: 2,
+            column: 0,
+            color: "blue".to_string(),
+        });
+        let in_a = tracker.cursors_in_file("a.rs");
+        assert_eq!(in_a.len(), 1);
+        assert_eq!(in_a[0].user_id, "u1");
+    }
+
+    #[test]
+    fn cursor_tracker_all_cursors() {
+        let mut tracker = CursorTracker::new();
+        tracker.update(RemoteCursor {
+            user_id: "u1".to_string(),
+            file: "f.rs".to_string(),
+            line: 0,
+            column: 0,
+            color: "red".to_string(),
+        });
+        tracker.update(RemoteCursor {
+            user_id: "u2".to_string(),
+            file: "g.rs".to_string(),
+            line: 0,
+            column: 0,
+            color: "green".to_string(),
+        });
+        assert_eq!(tracker.all_cursors().len(), 2);
     }
 }

@@ -3368,6 +3368,229 @@ impl SelfVerifier {
     }
 }
 
+// ── Feature #71: LSP Bridge Tool ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LspCapability {
+    GotoDefinition,
+    FindReferences,
+    Diagnostics,
+    Hover,
+    Completion,
+}
+
+#[derive(Debug, Clone)]
+pub struct LspBridgeTool {
+    pub server_command: String,
+    pub root_path: String,
+    pub capabilities: Vec<LspCapability>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LspRequest {
+    pub method: String,
+    pub file: String,
+    pub line: u32,
+    pub character: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct LspLocation {
+    pub file: String,
+    pub line: u32,
+    pub character: u32,
+    pub preview: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LspResponse {
+    pub result_type: String,
+    pub content: String,
+    pub locations: Vec<LspLocation>,
+}
+
+impl LspBridgeTool {
+    pub fn new(command: &str, root: &str) -> Self {
+        Self {
+            server_command: command.to_string(),
+            root_path: root.to_string(),
+            capabilities: Vec::new(),
+        }
+    }
+
+    pub fn format_request(&self, req: &LspRequest) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": req.method,
+            "params": {
+                "textDocument": { "uri": format!("file://{}", req.file) },
+                "position": { "line": req.line, "character": req.character },
+            }
+        })
+        .to_string()
+    }
+
+    pub fn parse_response(&self, json: &str) -> std::result::Result<LspResponse, String> {
+        let val: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let result_type = val
+            .get("result")
+            .and_then(|r| r.get("type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let content = val
+            .get("result")
+            .and_then(|r| r.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        Ok(LspResponse {
+            result_type,
+            content,
+            locations: Vec::new(),
+        })
+    }
+
+    pub fn supports(&self, cap: &LspCapability) -> bool {
+        self.capabilities.contains(cap)
+    }
+}
+
+// ── Feature #75: Notebook Cell Tool ───────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CellType {
+    Code,
+    Markdown,
+    Raw,
+}
+
+#[derive(Debug, Clone)]
+pub struct NotebookCell {
+    pub cell_type: CellType,
+    pub source: String,
+    pub outputs: Vec<String>,
+    pub execution_count: Option<u32>,
+}
+
+pub struct NotebookCellTool;
+
+impl NotebookCellTool {
+    pub fn parse_notebook(json: &str) -> std::result::Result<Vec<NotebookCell>, String> {
+        let val: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let cells_arr = val
+            .get("cells")
+            .and_then(|c| c.as_array())
+            .ok_or_else(|| "missing 'cells' array".to_string())?;
+        let mut cells = Vec::new();
+        for cell in cells_arr {
+            let cell_type_str = cell
+                .get("cell_type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("code");
+            let cell_type = match cell_type_str {
+                "markdown" => CellType::Markdown,
+                "raw" => CellType::Raw,
+                _ => CellType::Code,
+            };
+            let source = cell
+                .get("source")
+                .map(|s| {
+                    if s.is_array() {
+                        s.as_array()
+                            .unwrap()
+                            .iter()
+                            .filter_map(|l| l.as_str())
+                            .collect::<Vec<_>>()
+                            .join("")
+                    } else {
+                        s.as_str().unwrap_or("").to_string()
+                    }
+                })
+                .unwrap_or_default();
+            let outputs = cell
+                .get("outputs")
+                .and_then(|o| o.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|o| o.get("text").and_then(|t| t.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let execution_count = cell
+                .get("execution_count")
+                .and_then(|e| e.as_u64())
+                .map(|n| n as u32);
+            cells.push(NotebookCell {
+                cell_type,
+                source,
+                outputs,
+                execution_count,
+            });
+        }
+        Ok(cells)
+    }
+
+    pub fn get_cell(cells: &[NotebookCell], index: usize) -> Option<&NotebookCell> {
+        cells.get(index)
+    }
+
+    pub fn edit_cell(
+        cells: &mut [NotebookCell],
+        index: usize,
+        new_source: &str,
+    ) -> std::result::Result<(), String> {
+        cells
+            .get_mut(index)
+            .map(|c| c.source = new_source.to_string())
+            .ok_or_else(|| format!("index {} out of bounds", index))
+    }
+
+    pub fn insert_cell(
+        cells: &mut Vec<NotebookCell>,
+        index: usize,
+        cell: NotebookCell,
+    ) -> std::result::Result<(), String> {
+        if index > cells.len() {
+            return Err(format!("index {} out of bounds", index));
+        }
+        cells.insert(index, cell);
+        Ok(())
+    }
+
+    pub fn delete_cell(
+        cells: &mut Vec<NotebookCell>,
+        index: usize,
+    ) -> std::result::Result<(), String> {
+        if index >= cells.len() {
+            return Err(format!("index {} out of bounds", index));
+        }
+        cells.remove(index);
+        Ok(())
+    }
+
+    pub fn to_notebook_json(cells: &[NotebookCell]) -> String {
+        let cells_json: Vec<serde_json::Value> = cells
+            .iter()
+            .map(|c| {
+                let type_str = match c.cell_type {
+                    CellType::Markdown => "markdown",
+                    CellType::Raw => "raw",
+                    CellType::Code => "code",
+                };
+                serde_json::json!({
+                    "cell_type": type_str,
+                    "source": c.source,
+                    "outputs": c.outputs,
+                    "execution_count": c.execution_count,
+                })
+            })
+            .collect();
+        serde_json::json!({ "cells": cells_json }).to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4374,5 +4597,151 @@ mod tests {
         let mut verifier = SelfVerifier::new(PathBuf::from("."));
         let result = verifier.run_tests("false").unwrap();
         assert!(!result.passed);
+    }
+
+    // ── Feature #71: LSP Bridge Tool tests ─────────────────────────────────────
+
+    #[test]
+    fn lsp_bridge_new() {
+        let tool = LspBridgeTool::new("rust-analyzer", "/workspace");
+        assert_eq!(tool.server_command, "rust-analyzer");
+        assert_eq!(tool.root_path, "/workspace");
+        assert!(tool.capabilities.is_empty());
+    }
+
+    #[test]
+    fn lsp_bridge_supports_capability() {
+        let mut tool = LspBridgeTool::new("pylsp", "/proj");
+        tool.capabilities.push(LspCapability::Hover);
+        tool.capabilities.push(LspCapability::Diagnostics);
+        assert!(tool.supports(&LspCapability::Hover));
+        assert!(tool.supports(&LspCapability::Diagnostics));
+        assert!(!tool.supports(&LspCapability::GotoDefinition));
+    }
+
+    #[test]
+    fn lsp_bridge_format_request_is_json_rpc() {
+        let tool = LspBridgeTool::new("ls", "/");
+        let req = LspRequest {
+            method: "textDocument/hover".to_string(),
+            file: "/src/main.rs".to_string(),
+            line: 10,
+            character: 5,
+        };
+        let formatted = tool.format_request(&req);
+        let val: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+        assert_eq!(val["jsonrpc"], "2.0");
+        assert_eq!(val["method"], "textDocument/hover");
+        assert_eq!(val["params"]["position"]["line"], 10);
+        assert_eq!(val["params"]["position"]["character"], 5);
+    }
+
+    #[test]
+    fn lsp_bridge_parse_response_ok() {
+        let tool = LspBridgeTool::new("ls", "/");
+        let json = r#"{"jsonrpc":"2.0","id":1,"result":{"type":"hover","content":"fn main()"}}"#;
+        let resp = tool.parse_response(json).unwrap();
+        assert_eq!(resp.result_type, "hover");
+        assert_eq!(resp.content, "fn main()");
+    }
+
+    #[test]
+    fn lsp_bridge_parse_response_invalid_json_errors() {
+        let tool = LspBridgeTool::new("ls", "/");
+        assert!(tool.parse_response("not json").is_err());
+    }
+
+    // ── Feature #75: Notebook Cell Tool tests ──────────────────────────────────
+
+    fn sample_notebook_json() -> &'static str {
+        concat!(
+            r#"{"cells": ["#,
+            r#"{"cell_type": "code", "source": "x = 1", "outputs": [], "execution_count": 1},"#,
+            r#"{"cell_type": "markdown", "source": "Heading", "outputs": [], "execution_count": null}"#,
+            r#"]}"#
+        )
+    }
+
+    #[test]
+    fn notebook_parse_cells() {
+        let cells = NotebookCellTool::parse_notebook(sample_notebook_json()).unwrap();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].cell_type, CellType::Code);
+        assert_eq!(cells[0].source, "x = 1");
+        assert_eq!(cells[1].cell_type, CellType::Markdown);
+    }
+
+    #[test]
+    fn notebook_parse_invalid_json_errors() {
+        assert!(NotebookCellTool::parse_notebook("bad json").is_err());
+    }
+
+    #[test]
+    fn notebook_get_cell() {
+        let cells = NotebookCellTool::parse_notebook(sample_notebook_json()).unwrap();
+        assert!(NotebookCellTool::get_cell(&cells, 0).is_some());
+        assert!(NotebookCellTool::get_cell(&cells, 99).is_none());
+    }
+
+    #[test]
+    fn notebook_edit_cell() {
+        let mut cells = NotebookCellTool::parse_notebook(sample_notebook_json()).unwrap();
+        NotebookCellTool::edit_cell(&mut cells, 0, "x = 42").unwrap();
+        assert_eq!(cells[0].source, "x = 42");
+    }
+
+    #[test]
+    fn notebook_edit_cell_out_of_bounds() {
+        let mut cells = NotebookCellTool::parse_notebook(sample_notebook_json()).unwrap();
+        assert!(NotebookCellTool::edit_cell(&mut cells, 99, "x").is_err());
+    }
+
+    #[test]
+    fn notebook_insert_cell() {
+        let mut cells = NotebookCellTool::parse_notebook(sample_notebook_json()).unwrap();
+        let new_cell = NotebookCell {
+            cell_type: CellType::Raw,
+            source: "raw content".to_string(),
+            outputs: vec![],
+            execution_count: None,
+        };
+        NotebookCellTool::insert_cell(&mut cells, 1, new_cell).unwrap();
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[1].cell_type, CellType::Raw);
+    }
+
+    #[test]
+    fn notebook_insert_cell_out_of_bounds() {
+        let mut cells = NotebookCellTool::parse_notebook(sample_notebook_json()).unwrap();
+        let cell = NotebookCell {
+            cell_type: CellType::Code,
+            source: "".to_string(),
+            outputs: vec![],
+            execution_count: None,
+        };
+        assert!(NotebookCellTool::insert_cell(&mut cells, 99, cell).is_err());
+    }
+
+    #[test]
+    fn notebook_delete_cell() {
+        let mut cells = NotebookCellTool::parse_notebook(sample_notebook_json()).unwrap();
+        NotebookCellTool::delete_cell(&mut cells, 0).unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].cell_type, CellType::Markdown);
+    }
+
+    #[test]
+    fn notebook_delete_cell_out_of_bounds() {
+        let mut cells = NotebookCellTool::parse_notebook(sample_notebook_json()).unwrap();
+        assert!(NotebookCellTool::delete_cell(&mut cells, 5).is_err());
+    }
+
+    #[test]
+    fn notebook_to_json_roundtrip() {
+        let cells = NotebookCellTool::parse_notebook(sample_notebook_json()).unwrap();
+        let json = NotebookCellTool::to_notebook_json(&cells);
+        let reparsed = NotebookCellTool::parse_notebook(&json).unwrap();
+        assert_eq!(reparsed.len(), 2);
+        assert_eq!(reparsed[0].source, "x = 1");
     }
 }

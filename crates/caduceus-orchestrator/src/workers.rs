@@ -10,9 +10,13 @@
 use caduceus_core::{ModelId, ProviderId, TokenUsage};
 use caduceus_providers::{ChatRequest, LlmAdapter, Message};
 use std::{
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet, VecDeque},
+    io::Write,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::RwLock;
 
@@ -1078,6 +1082,1146 @@ fn detect_branch(path: &Path) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+// ── Plugin system ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plugin {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub enabled: bool,
+    pub manifest_path: String,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct PluginSystem {
+    plugins: Vec<Plugin>,
+}
+
+impl PluginSystem {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn load_manifest_toml(&mut self, toml_str: &str) -> Result<Plugin, String> {
+        let manifest = parse_plugin_manifest_toml(toml_str)?;
+        build_plugin_from_manifest(&manifest, "inline.toml")
+    }
+
+    pub fn load_manifest_json(&mut self, json_str: &str) -> Result<Plugin, String> {
+        let manifest: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|err| err.to_string())?;
+        build_plugin_from_json(&manifest, "inline.json")
+    }
+
+    pub fn install(&mut self, plugin: Plugin) {
+        if let Some(existing) = self
+            .plugins
+            .iter_mut()
+            .find(|item| item.name == plugin.name)
+        {
+            *existing = plugin;
+        } else {
+            self.plugins.push(plugin);
+        }
+    }
+
+    pub fn uninstall(&mut self, name: &str) -> Result<(), String> {
+        let index = self
+            .plugins
+            .iter()
+            .position(|plugin| plugin.name == name)
+            .ok_or_else(|| format!("Plugin '{name}' not found"))?;
+        self.plugins.remove(index);
+        Ok(())
+    }
+
+    pub fn enable(&mut self, name: &str) -> Result<(), String> {
+        let plugin = self
+            .plugins
+            .iter_mut()
+            .find(|plugin| plugin.name == name)
+            .ok_or_else(|| format!("Plugin '{name}' not found"))?;
+        plugin.enabled = true;
+        Ok(())
+    }
+
+    pub fn disable(&mut self, name: &str) -> Result<(), String> {
+        let plugin = self
+            .plugins
+            .iter_mut()
+            .find(|plugin| plugin.name == name)
+            .ok_or_else(|| format!("Plugin '{name}' not found"))?;
+        plugin.enabled = false;
+        Ok(())
+    }
+
+    pub fn list(&self) -> &[Plugin] {
+        &self.plugins
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Plugin> {
+        self.plugins.iter().find(|plugin| plugin.name == name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginCommand {
+    pub name: String,
+    pub description: String,
+    pub plugin: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginAgent {
+    pub name: String,
+    pub system_prompt: String,
+    pub plugin: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginSkill {
+    pub name: String,
+    pub content: String,
+    pub plugin: String,
+}
+
+#[derive(Debug, Default)]
+pub struct PluginExtensions {
+    commands: Vec<PluginCommand>,
+    agents: Vec<PluginAgent>,
+    skills: Vec<PluginSkill>,
+}
+
+impl PluginExtensions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register_command(&mut self, cmd: PluginCommand) {
+        self.commands.push(cmd);
+    }
+
+    pub fn register_agent(&mut self, agent: PluginAgent) {
+        self.agents.push(agent);
+    }
+
+    pub fn register_skill(&mut self, skill: PluginSkill) {
+        self.skills.push(skill);
+    }
+
+    pub fn commands_for_plugin(&self, plugin: &str) -> Vec<&PluginCommand> {
+        self.commands
+            .iter()
+            .filter(|cmd| cmd.plugin == plugin)
+            .collect()
+    }
+
+    pub fn all_commands(&self) -> &[PluginCommand] {
+        &self.commands
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PluginCapability {
+    ReadFiles,
+    WriteFiles,
+    RunCommands,
+    NetworkAccess,
+    FullAccess,
+}
+
+#[derive(Debug, Default)]
+pub struct PluginCapabilityManager {
+    grants: HashMap<String, Vec<PluginCapability>>,
+}
+
+impl PluginCapabilityManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn grant(&mut self, plugin: &str, cap: PluginCapability) {
+        let caps = self.grants.entry(plugin.to_string()).or_default();
+        if !caps.contains(&cap) {
+            caps.push(cap);
+        }
+    }
+
+    pub fn revoke(&mut self, plugin: &str, cap: &PluginCapability) {
+        if let Some(caps) = self.grants.get_mut(plugin) {
+            caps.retain(|existing| existing != cap);
+            if caps.is_empty() {
+                self.grants.remove(plugin);
+            }
+        }
+    }
+
+    pub fn check(&self, plugin: &str, cap: &PluginCapability) -> bool {
+        self.grants
+            .get(plugin)
+            .is_some_and(|caps| caps.contains(&PluginCapability::FullAccess) || caps.contains(cap))
+    }
+
+    pub fn list_grants(&self, plugin: &str) -> Vec<&PluginCapability> {
+        self.grants
+            .get(plugin)
+            .map(|caps| caps.iter().collect())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginDefinedTool {
+    pub name: String,
+    pub plugin: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+    pub command: String,
+    pub env_vars: HashMap<String, String>,
+}
+
+#[derive(Debug, Default)]
+pub struct PluginToolRegistry {
+    tools: Vec<PluginDefinedTool>,
+}
+
+impl PluginToolRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, tool: PluginDefinedTool) {
+        if let Some(existing) = self.tools.iter_mut().find(|item| item.name == tool.name) {
+            *existing = tool;
+        } else {
+            self.tools.push(tool);
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&PluginDefinedTool> {
+        self.tools.iter().find(|tool| tool.name == name)
+    }
+
+    pub fn list(&self) -> &[PluginDefinedTool] {
+        &self.tools
+    }
+
+    pub fn execute_sync(&self, name: &str, input: &str) -> Result<String, String> {
+        let tool = self
+            .get(name)
+            .ok_or_else(|| format!("Tool '{name}' not found"))?;
+        let parts = split_command_line(&tool.command)?;
+        let binary = parts
+            .first()
+            .ok_or_else(|| format!("Tool '{name}' has an empty command"))?;
+        let mut child = Command::new(binary)
+            .args(parts.iter().skip(1))
+            .envs(&tool.env_vars)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| err.to_string())?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(input.as_bytes())
+                .map_err(|err| err.to_string())?;
+        }
+
+        let output = child.wait_with_output().map_err(|err| err.to_string())?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if stderr.is_empty() {
+                format!("Tool '{name}' exited with status {}", output.status)
+            } else {
+                stderr
+            })
+        }
+    }
+}
+
+// ── Indexed task DAG ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DagTaskStatus {
+    Pending,
+    Ready,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DagTask {
+    pub id: usize,
+    pub name: String,
+    pub status: DagTaskStatus,
+    pub result: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct TaskDag {
+    tasks: Vec<DagTask>,
+    edges: Vec<(usize, usize)>,
+}
+
+impl TaskDag {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_task(&mut self, name: &str) -> usize {
+        let id = self.tasks.len();
+        self.tasks.push(DagTask {
+            id,
+            name: name.to_string(),
+            status: DagTaskStatus::Ready,
+            result: None,
+        });
+        id
+    }
+
+    pub fn add_dependency(&mut self, from: usize, to: usize) -> Result<(), String> {
+        if from >= self.tasks.len() || to >= self.tasks.len() {
+            return Err("Task dependency references an unknown task".to_string());
+        }
+        if from == to {
+            return Err("Task cannot depend on itself".to_string());
+        }
+        if !self.edges.contains(&(from, to)) {
+            self.edges.push((from, to));
+        }
+        if self.topological_order().is_err() {
+            self.edges.retain(|edge| edge != &(from, to));
+            return Err("Adding dependency would create a cycle".to_string());
+        }
+        self.refresh_statuses();
+        Ok(())
+    }
+
+    pub fn ready_tasks(&self) -> Vec<usize> {
+        self.tasks
+            .iter()
+            .filter(|task| task.status == DagTaskStatus::Ready)
+            .map(|task| task.id)
+            .collect()
+    }
+
+    pub fn complete_task(&mut self, id: usize, result: &str) {
+        if let Some(task) = self.tasks.get_mut(id) {
+            task.status = DagTaskStatus::Completed;
+            task.result = Some(result.to_string());
+            self.refresh_statuses();
+        }
+    }
+
+    pub fn fail_task(&mut self, id: usize) {
+        if id >= self.tasks.len() {
+            return;
+        }
+
+        let mut queue = VecDeque::from([id]);
+        let mut visited = HashSet::new();
+
+        while let Some(task_id) = queue.pop_front() {
+            if !visited.insert(task_id) {
+                continue;
+            }
+            if let Some(task) = self.tasks.get_mut(task_id) {
+                task.status = DagTaskStatus::Failed;
+                task.result = None;
+            }
+            for (_, to) in self
+                .edges
+                .iter()
+                .copied()
+                .filter(|(from, _)| *from == task_id)
+            {
+                queue.push_back(to);
+            }
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.tasks.iter().all(|task| {
+            matches!(
+                task.status,
+                DagTaskStatus::Completed | DagTaskStatus::Failed
+            )
+        })
+    }
+
+    pub fn topological_order(&self) -> Result<Vec<usize>, String> {
+        let mut indegree = vec![0usize; self.tasks.len()];
+        let mut adjacency: HashMap<usize, Vec<usize>> = HashMap::new();
+
+        for &(from, to) in &self.edges {
+            indegree[to] += 1;
+            adjacency.entry(from).or_default().push(to);
+        }
+
+        let mut queue: VecDeque<usize> = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(id, degree)| (*degree == 0).then_some(id))
+            .collect();
+        let mut ordered = Vec::with_capacity(self.tasks.len());
+
+        while let Some(id) = queue.pop_front() {
+            ordered.push(id);
+            if let Some(children) = adjacency.get(&id) {
+                for child in children {
+                    indegree[*child] = indegree[*child].saturating_sub(1);
+                    if indegree[*child] == 0 {
+                        queue.push_back(*child);
+                    }
+                }
+            }
+        }
+
+        if ordered.len() == self.tasks.len() {
+            Ok(ordered)
+        } else {
+            Err("Task graph contains a cycle".to_string())
+        }
+    }
+
+    fn refresh_statuses(&mut self) {
+        let completed: HashSet<usize> = self
+            .tasks
+            .iter()
+            .filter(|task| task.status == DagTaskStatus::Completed)
+            .map(|task| task.id)
+            .collect();
+
+        for task in &mut self.tasks {
+            if matches!(
+                task.status,
+                DagTaskStatus::Completed | DagTaskStatus::Failed | DagTaskStatus::Running
+            ) {
+                continue;
+            }
+            let ready = self
+                .edges
+                .iter()
+                .filter(|(_, to)| *to == task.id)
+                .all(|(from, _)| completed.contains(from));
+            task.status = if ready {
+                DagTaskStatus::Ready
+            } else {
+                DagTaskStatus::Pending
+            };
+        }
+    }
+}
+
+// ── Team orchestration ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamAgent {
+    pub name: String,
+    pub role: String,
+    pub specialties: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct TeamOrchestrator {
+    agents: Vec<TeamAgent>,
+    assignments: HashMap<usize, String>,
+}
+
+impl TeamOrchestrator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_agent(&mut self, agent: TeamAgent) {
+        if let Some(existing) = self.agents.iter_mut().find(|item| item.name == agent.name) {
+            *existing = agent;
+        } else {
+            self.agents.push(agent);
+        }
+    }
+
+    pub fn assign_task(&mut self, task_id: usize, agent_name: &str) -> Result<(), String> {
+        if self.agents.iter().any(|agent| agent.name == agent_name) {
+            self.assignments.insert(task_id, agent_name.to_string());
+            Ok(())
+        } else {
+            Err(format!("Agent '{agent_name}' not found"))
+        }
+    }
+
+    pub fn auto_assign(&mut self, tasks: &[DagTask]) -> HashMap<usize, String> {
+        let mut assigned = HashMap::new();
+        for task in tasks {
+            if let Some(agent_name) = self.best_agent_for_task(&task.name) {
+                self.assignments.insert(task.id, agent_name.clone());
+                assigned.insert(task.id, agent_name);
+            }
+        }
+        assigned
+    }
+
+    pub fn list_agents(&self) -> &[TeamAgent] {
+        &self.agents
+    }
+
+    fn best_agent_for_task(&self, task_name: &str) -> Option<String> {
+        let normalized_task = task_name.to_lowercase();
+        self.agents
+            .iter()
+            .max_by_key(|agent| {
+                agent
+                    .specialties
+                    .iter()
+                    .filter(|specialty| normalized_task.contains(&specialty.to_lowercase()))
+                    .count()
+            })
+            .map(|agent| agent.name.clone())
+            .or_else(|| self.agents.first().map(|agent| agent.name.clone()))
+    }
+}
+
+// ── Message bus ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusMessage {
+    pub from: String,
+    pub content: String,
+    pub timestamp: u64,
+    pub channel: String,
+}
+
+#[derive(Debug, Default)]
+pub struct MessageBus {
+    channels: HashMap<String, Vec<BusMessage>>,
+    subscribers: HashMap<String, Vec<String>>,
+}
+
+impl MessageBus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn subscribe(&mut self, agent: &str, channel: &str) {
+        let subscribers = self.subscribers.entry(channel.to_string()).or_default();
+        if !subscribers.iter().any(|existing| existing == agent) {
+            subscribers.push(agent.to_string());
+        }
+    }
+
+    pub fn publish(&mut self, message: BusMessage) {
+        self.channels
+            .entry(message.channel.clone())
+            .or_default()
+            .push(message);
+    }
+
+    pub fn read(&self, agent: &str, channel: &str) -> Vec<&BusMessage> {
+        let is_subscribed = self
+            .subscribers
+            .get(channel)
+            .is_some_and(|agents| agents.iter().any(|name| name == agent));
+        if !is_subscribed {
+            return Vec::new();
+        }
+        self.channels
+            .get(channel)
+            .map(|messages| messages.iter().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn read_since(&self, channel: &str, since: u64) -> Vec<&BusMessage> {
+        self.channels
+            .get(channel)
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter(|message| message.timestamp > since)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+// ── Shared memory ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedMemoryEntry {
+    pub key: String,
+    pub value: String,
+    pub writer: String,
+    pub version: u32,
+}
+
+#[derive(Debug, Default)]
+pub struct SharedMemory {
+    store: HashMap<String, SharedMemoryEntry>,
+}
+
+impl SharedMemory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn write(&mut self, key: &str, value: &str, writer: &str) {
+        let version = self
+            .store
+            .get(key)
+            .map(|entry| entry.version.saturating_add(1))
+            .unwrap_or(1);
+        self.store.insert(
+            key.to_string(),
+            SharedMemoryEntry {
+                key: key.to_string(),
+                value: value.to_string(),
+                writer: writer.to_string(),
+                version,
+            },
+        );
+    }
+
+    pub fn read(&self, key: &str) -> Option<&SharedMemoryEntry> {
+        self.store.get(key)
+    }
+
+    pub fn delete(&mut self, key: &str) -> bool {
+        self.store.remove(key).is_some()
+    }
+
+    pub fn list_keys(&self) -> Vec<&str> {
+        let mut keys: Vec<&str> = self.store.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    pub fn entries_by_writer(&self, writer: &str) -> Vec<&SharedMemoryEntry> {
+        let mut entries: Vec<&SharedMemoryEntry> = self
+            .store
+            .values()
+            .filter(|entry| entry.writer == writer)
+            .collect();
+        entries.sort_by(|left, right| left.key.cmp(&right.key));
+        entries
+    }
+}
+
+// ── Scheduling ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerStrategy {
+    RoundRobin,
+    LeastLoaded,
+    Priority,
+    Random,
+}
+
+#[derive(Debug)]
+pub struct TaskScheduler {
+    strategy: SchedulerStrategy,
+    agent_loads: HashMap<String, usize>,
+    round_robin_index: usize,
+    random_state: u64,
+}
+
+impl TaskScheduler {
+    pub fn new(strategy: SchedulerStrategy) -> Self {
+        Self {
+            strategy,
+            agent_loads: HashMap::new(),
+            round_robin_index: 0,
+            random_state: seed_random_state(),
+        }
+    }
+
+    pub fn schedule(&mut self, _task: &str, agents: &[&str]) -> String {
+        if agents.is_empty() {
+            return String::new();
+        }
+
+        let selected = match self.strategy {
+            SchedulerStrategy::RoundRobin => {
+                let agent = agents[self.round_robin_index % agents.len()];
+                self.round_robin_index = (self.round_robin_index + 1) % agents.len();
+                agent
+            }
+            SchedulerStrategy::LeastLoaded => agents
+                .iter()
+                .min_by_key(|agent| (self.agent_loads.get(**agent).copied().unwrap_or(0), **agent))
+                .copied()
+                .unwrap_or(agents[0]),
+            SchedulerStrategy::Priority => agents[0],
+            SchedulerStrategy::Random => {
+                let index = self.next_random_index(agents.len());
+                agents[index]
+            }
+        }
+        .to_string();
+
+        self.record_assignment(&selected);
+        selected
+    }
+
+    pub fn record_completion(&mut self, agent: &str) {
+        if let Some(load) = self.agent_loads.get_mut(agent) {
+            *load = load.saturating_sub(1);
+        }
+    }
+
+    pub fn record_assignment(&mut self, agent: &str) {
+        *self.agent_loads.entry(agent.to_string()).or_default() += 1;
+    }
+
+    fn next_random_index(&mut self, len: usize) -> usize {
+        self.random_state ^= self.random_state << 13;
+        self.random_state ^= self.random_state >> 7;
+        self.random_state ^= self.random_state << 17;
+        (self.random_state as usize) % len
+    }
+}
+
+// ── Just-in-time context loading ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefType {
+    File,
+    Query,
+    Url,
+    Memory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextReference {
+    pub id: String,
+    pub ref_type: RefType,
+    pub path: String,
+    pub estimated_tokens: usize,
+}
+
+#[derive(Debug)]
+pub struct JitContextLoader {
+    references: Vec<ContextReference>,
+    loaded: HashMap<String, String>,
+    max_loaded_tokens: usize,
+    access_order: RefCell<HashMap<String, u64>>,
+    next_tick: Cell<u64>,
+}
+
+impl JitContextLoader {
+    pub fn new(max_tokens: usize) -> Self {
+        Self {
+            references: Vec::new(),
+            loaded: HashMap::new(),
+            max_loaded_tokens: max_tokens,
+            access_order: RefCell::new(HashMap::new()),
+            next_tick: Cell::new(0),
+        }
+    }
+
+    pub fn add_reference(&mut self, reference: ContextReference) {
+        if let Some(existing) = self
+            .references
+            .iter_mut()
+            .find(|item| item.id == reference.id)
+        {
+            *existing = reference;
+        } else {
+            self.references.push(reference);
+        }
+    }
+
+    pub fn load(&mut self, id: &str, content: &str) {
+        if self.references.iter().any(|reference| reference.id == id) {
+            self.loaded.insert(id.to_string(), content.to_string());
+            self.touch(id);
+        }
+    }
+
+    pub fn unload(&mut self, id: &str) {
+        self.loaded.remove(id);
+        self.access_order.borrow_mut().remove(id);
+    }
+
+    pub fn get(&self, id: &str) -> Option<&str> {
+        if self.loaded.contains_key(id) {
+            self.touch(id);
+        }
+        self.loaded.get(id).map(String::as_str)
+    }
+
+    pub fn loaded_tokens(&self) -> usize {
+        self.references
+            .iter()
+            .filter(|reference| self.loaded.contains_key(&reference.id))
+            .map(|reference| reference.estimated_tokens)
+            .sum()
+    }
+
+    pub fn should_evict(&self) -> bool {
+        self.loaded_tokens() > self.max_loaded_tokens
+    }
+
+    pub fn evict_lru(&mut self) -> Option<String> {
+        let oldest = self
+            .access_order
+            .borrow()
+            .iter()
+            .filter(|(id, _)| self.loaded.contains_key(*id))
+            .min_by_key(|(_, tick)| *tick)
+            .map(|(id, _)| id.clone())?;
+        self.unload(&oldest);
+        Some(oldest)
+    }
+
+    fn touch(&self, id: &str) {
+        let next = self.next_tick.get().saturating_add(1);
+        self.next_tick.set(next);
+        self.access_order.borrow_mut().insert(id.to_string(), next);
+    }
+}
+
+fn seed_random_state() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(1)
+        .max(1)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManifestValue {
+    String(String),
+    Bool(bool),
+    Array(Vec<String>),
+}
+
+fn parse_plugin_manifest_toml(input: &str) -> Result<HashMap<String, ManifestValue>, String> {
+    let mut manifest = HashMap::new();
+    let mut lines = input.lines();
+
+    while let Some(raw_line) = lines.next() {
+        let line = strip_toml_comment(raw_line).trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && !line.contains('=') {
+            return Err("TOML tables are not supported for plugin manifests".to_string());
+        }
+        let (key, initial_value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("Invalid TOML line: {line}"))?;
+        let mut value = initial_value.trim().to_string();
+        while value.starts_with('[') && !brackets_balanced(&value) {
+            let next_line = lines
+                .next()
+                .ok_or_else(|| "Unterminated TOML array".to_string())?;
+            let next = strip_toml_comment(next_line).trim().to_string();
+            if !next.is_empty() {
+                value.push(' ');
+                value.push_str(&next);
+            }
+        }
+
+        let parsed = parse_manifest_value(&value)?;
+        manifest.insert(key.trim().to_string(), parsed);
+    }
+
+    Ok(manifest)
+}
+
+fn build_plugin_from_manifest(
+    manifest: &HashMap<String, ManifestValue>,
+    default_manifest_path: &str,
+) -> Result<Plugin, String> {
+    Ok(Plugin {
+        name: manifest_string(manifest, "name")?,
+        version: manifest_string(manifest, "version")?,
+        description: manifest_string_or_default(manifest, "description"),
+        enabled: manifest_bool_or_default(manifest, "enabled", true),
+        manifest_path: manifest
+            .get("manifest_path")
+            .map(manifest_value_as_string)
+            .transpose()?
+            .unwrap_or_else(|| default_manifest_path.to_string()),
+        capabilities: manifest
+            .get("capabilities")
+            .map(manifest_value_as_array)
+            .transpose()?
+            .unwrap_or_default(),
+    })
+}
+
+fn build_plugin_from_json(
+    manifest: &serde_json::Value,
+    default_manifest_path: &str,
+) -> Result<Plugin, String> {
+    let object = manifest
+        .as_object()
+        .ok_or_else(|| "Plugin manifest JSON must be an object".to_string())?;
+    let capabilities = object
+        .get("capabilities")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(ToString::to_string)
+                        .ok_or_else(|| "Plugin capabilities must be strings".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(Plugin {
+        name: json_string(object, "name")?,
+        version: json_string(object, "version")?,
+        description: object
+            .get("description")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        enabled: object
+            .get("enabled")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true),
+        manifest_path: object
+            .get("manifest_path")
+            .and_then(|value| value.as_str())
+            .unwrap_or(default_manifest_path)
+            .to_string(),
+        capabilities,
+    })
+}
+
+fn parse_manifest_value(value: &str) -> Result<ManifestValue, String> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('[') {
+        parse_manifest_array(trimmed).map(ManifestValue::Array)
+    } else if matches!(trimmed, "true" | "false") {
+        Ok(ManifestValue::Bool(trimmed == "true"))
+    } else {
+        parse_manifest_string(trimmed).map(ManifestValue::String)
+    }
+}
+
+fn parse_manifest_array(value: &str) -> Result<Vec<String>, String> {
+    let inner = value
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .ok_or_else(|| "Invalid TOML array".to_string())?;
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    split_toml_list(inner)
+        .into_iter()
+        .map(|item| parse_manifest_string(&item))
+        .collect()
+}
+
+fn parse_manifest_string(value: &str) -> Result<String, String> {
+    if value.starts_with('"') {
+        serde_json::from_str(value).map_err(|err| err.to_string())
+    } else if value.starts_with('\'') {
+        value
+            .strip_prefix('\'')
+            .and_then(|rest| rest.strip_suffix('\''))
+            .map(ToString::to_string)
+            .ok_or_else(|| "Invalid literal string".to_string())
+    } else if value.is_empty() {
+        Err("Manifest value cannot be empty".to_string())
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn split_toml_list(input: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+
+    for ch in input.chars() {
+        match ch {
+            '\\' if in_double && !escape => {
+                escape = true;
+                current.push(ch);
+            }
+            '\'' if !in_double && !escape => {
+                in_single = !in_single;
+                current.push(ch);
+            }
+            '"' if !in_single && !escape => {
+                in_double = !in_double;
+                current.push(ch);
+            }
+            ',' if !in_single && !in_double => {
+                if !current.trim().is_empty() {
+                    items.push(current.trim().to_string());
+                }
+                current.clear();
+            }
+            _ => {
+                escape = false;
+                current.push(ch);
+            }
+        }
+    }
+
+    if !current.trim().is_empty() {
+        items.push(current.trim().to_string());
+    }
+
+    items
+}
+
+fn strip_toml_comment(line: &str) -> String {
+    let mut result = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+
+    for ch in line.chars() {
+        match ch {
+            '\\' if in_double && !escape => {
+                escape = true;
+                result.push(ch);
+            }
+            '\'' if !in_double && !escape => {
+                in_single = !in_single;
+                result.push(ch);
+            }
+            '"' if !in_single && !escape => {
+                in_double = !in_double;
+                result.push(ch);
+            }
+            '#' if !in_single && !in_double => break,
+            _ => {
+                escape = false;
+                result.push(ch);
+            }
+        }
+    }
+
+    result
+}
+
+fn brackets_balanced(value: &str) -> bool {
+    let mut depth = 0isize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+
+    for ch in value.chars() {
+        match ch {
+            '\\' if in_double && !escape => escape = true,
+            '\'' if !in_double && !escape => in_single = !in_single,
+            '"' if !in_single && !escape => in_double = !in_double,
+            '[' if !in_single && !in_double => depth += 1,
+            ']' if !in_single && !in_double => depth -= 1,
+            _ => escape = false,
+        }
+    }
+
+    depth == 0
+}
+
+fn manifest_string(manifest: &HashMap<String, ManifestValue>, key: &str) -> Result<String, String> {
+    manifest
+        .get(key)
+        .map(manifest_value_as_string)
+        .transpose()?
+        .ok_or_else(|| format!("Plugin manifest is missing '{key}'"))
+}
+
+fn manifest_string_or_default(manifest: &HashMap<String, ManifestValue>, key: &str) -> String {
+    manifest
+        .get(key)
+        .and_then(|value| manifest_value_as_string(value).ok())
+        .unwrap_or_default()
+}
+
+fn manifest_bool_or_default(
+    manifest: &HashMap<String, ManifestValue>,
+    key: &str,
+    default: bool,
+) -> bool {
+    manifest
+        .get(key)
+        .and_then(|value| match value {
+            ManifestValue::Bool(flag) => Some(*flag),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
+fn manifest_value_as_string(value: &ManifestValue) -> Result<String, String> {
+    match value {
+        ManifestValue::String(text) => Ok(text.clone()),
+        _ => Err("Manifest value must be a string".to_string()),
+    }
+}
+
+fn manifest_value_as_array(value: &ManifestValue) -> Result<Vec<String>, String> {
+    match value {
+        ManifestValue::Array(items) => Ok(items.clone()),
+        _ => Err("Manifest value must be an array".to_string()),
+    }
+}
+
+fn json_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<String, String> {
+    object
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .ok_or_else(|| format!("Plugin manifest is missing '{key}'"))
+}
+
+fn split_command_line(command: &str) -> Result<Vec<String>, String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+
+    for ch in command.chars() {
+        match ch {
+            '\\' if !in_single && !escape => escape = true,
+            '\'' if !in_double && !escape => in_single = !in_single,
+            '"' if !in_single && !escape => in_double = !in_double,
+            ch if ch.is_whitespace() && !in_single && !in_double => {
+                if !current.is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+            }
+            _ => {
+                current.push(ch);
+                escape = false;
+            }
+        }
+    }
+
+    if escape || in_single || in_double {
+        return Err("Unterminated command string".to_string());
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    Ok(parts)
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1411,5 +2555,268 @@ Here is the task plan:
             workspace.get_active().map(|repo| repo.name.as_str()),
             Some("api")
         );
+    }
+
+    #[test]
+    fn plugin_system_loads_manifests_and_manages_state() {
+        let mut system = PluginSystem::new();
+        let toml_plugin = system
+            .load_manifest_toml(
+                r#"
+                name = "lint"
+                version = "1.2.3"
+                description = "Lint support"
+                enabled = false
+                manifest_path = "/plugins/lint.toml"
+                capabilities = ["read", "run"]
+                "#,
+            )
+            .unwrap();
+        assert_eq!(toml_plugin.name, "lint");
+        assert!(!toml_plugin.enabled);
+        assert_eq!(toml_plugin.capabilities, vec!["read", "run"]);
+
+        let json_plugin = system
+            .load_manifest_json(
+                r#"{
+                    "name": "review",
+                    "version": "0.4.0",
+                    "description": "Review support",
+                    "enabled": true,
+                    "manifest_path": "/plugins/review.json",
+                    "capabilities": ["network"]
+                }"#,
+            )
+            .unwrap();
+        system.install(toml_plugin.clone());
+        system.install(json_plugin.clone());
+        assert_eq!(system.list().len(), 2);
+        assert_eq!(system.get("review"), Some(&json_plugin));
+
+        system.enable("lint").unwrap();
+        assert!(system.get("lint").unwrap().enabled);
+        system.disable("review").unwrap();
+        assert!(!system.get("review").unwrap().enabled);
+
+        system.uninstall("lint").unwrap();
+        assert!(system.get("lint").is_none());
+        assert!(system.load_manifest_toml("name = [").is_err());
+    }
+
+    #[test]
+    fn plugin_extensions_group_commands_by_plugin() {
+        let mut extensions = PluginExtensions::new();
+        extensions.register_command(PluginCommand {
+            name: "lint".to_string(),
+            description: "Run lint".to_string(),
+            plugin: "quality".to_string(),
+        });
+        extensions.register_command(PluginCommand {
+            name: "fix".to_string(),
+            description: "Apply fixes".to_string(),
+            plugin: "quality".to_string(),
+        });
+        extensions.register_agent(PluginAgent {
+            name: "reviewer".to_string(),
+            system_prompt: "Review code".to_string(),
+            plugin: "quality".to_string(),
+        });
+        extensions.register_skill(PluginSkill {
+            name: "cleanup".to_string(),
+            content: "steps".to_string(),
+            plugin: "quality".to_string(),
+        });
+
+        let commands = extensions.commands_for_plugin("quality");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(extensions.all_commands().len(), 2);
+    }
+
+    #[test]
+    fn plugin_capability_manager_grants_and_revokes() {
+        let mut manager = PluginCapabilityManager::new();
+        manager.grant("quality", PluginCapability::ReadFiles);
+        manager.grant("quality", PluginCapability::FullAccess);
+        manager.grant("quality", PluginCapability::ReadFiles);
+
+        assert!(manager.check("quality", &PluginCapability::ReadFiles));
+        assert!(manager.check("quality", &PluginCapability::NetworkAccess));
+        assert_eq!(manager.list_grants("quality").len(), 2);
+
+        manager.revoke("quality", &PluginCapability::FullAccess);
+        assert!(!manager.check("quality", &PluginCapability::NetworkAccess));
+        assert!(manager.check("quality", &PluginCapability::ReadFiles));
+    }
+
+    #[test]
+    fn plugin_tool_registry_registers_and_executes_tools() {
+        let mut registry = PluginToolRegistry::new();
+        registry.register(PluginDefinedTool {
+            name: "echo".to_string(),
+            plugin: "quality".to_string(),
+            description: "Echo stdin".to_string(),
+            input_schema: serde_json::json!({"type": "string"}),
+            command: "cat".to_string(),
+            env_vars: HashMap::new(),
+        });
+
+        assert_eq!(registry.list().len(), 1);
+        let output = registry.execute_sync("echo", "hello plugin").unwrap();
+        assert_eq!(output, "hello plugin");
+        assert!(registry.execute_sync("missing", "ignored").is_err());
+    }
+
+    #[test]
+    fn indexed_task_dag_tracks_readiness_and_order() {
+        let mut dag = TaskDag::new();
+        let fetch = dag.add_task("fetch");
+        let build = dag.add_task("build");
+        let deploy = dag.add_task("deploy");
+        dag.add_dependency(fetch, build).unwrap();
+        dag.add_dependency(build, deploy).unwrap();
+
+        assert_eq!(dag.ready_tasks(), vec![fetch]);
+        assert_eq!(dag.topological_order().unwrap(), vec![fetch, build, deploy]);
+
+        dag.complete_task(fetch, "done");
+        assert_eq!(dag.ready_tasks(), vec![build]);
+        dag.complete_task(build, "done");
+        assert_eq!(dag.ready_tasks(), vec![deploy]);
+        dag.fail_task(deploy);
+        assert!(dag.is_complete());
+
+        let mut cyclic = TaskDag::new();
+        let a = cyclic.add_task("a");
+        let b = cyclic.add_task("b");
+        cyclic.add_dependency(a, b).unwrap();
+        assert!(cyclic.add_dependency(b, a).is_err());
+    }
+
+    #[test]
+    fn team_orchestrator_assigns_tasks_by_specialty() {
+        let mut orchestrator = TeamOrchestrator::new();
+        orchestrator.add_agent(TeamAgent {
+            name: "alice".to_string(),
+            role: "backend".to_string(),
+            specialties: vec!["api".to_string(), "service".to_string()],
+        });
+        orchestrator.add_agent(TeamAgent {
+            name: "bob".to_string(),
+            role: "frontend".to_string(),
+            specialties: vec!["ui".to_string(), "design".to_string()],
+        });
+
+        orchestrator.assign_task(99, "alice").unwrap();
+        let assignments = orchestrator.auto_assign(&[
+            DagTask {
+                id: 1,
+                name: "api cleanup".to_string(),
+                status: DagTaskStatus::Pending,
+                result: None,
+            },
+            DagTask {
+                id: 2,
+                name: "ui polish".to_string(),
+                status: DagTaskStatus::Pending,
+                result: None,
+            },
+        ]);
+
+        assert_eq!(orchestrator.list_agents().len(), 2);
+        assert_eq!(assignments.get(&1).map(String::as_str), Some("alice"));
+        assert_eq!(assignments.get(&2).map(String::as_str), Some("bob"));
+        assert!(orchestrator.assign_task(3, "carol").is_err());
+    }
+
+    #[test]
+    fn message_bus_filters_reads_by_subscription_and_time() {
+        let mut bus = MessageBus::new();
+        bus.subscribe("alice", "team");
+        bus.publish(BusMessage {
+            from: "alice".to_string(),
+            content: "started".to_string(),
+            timestamp: 10,
+            channel: "team".to_string(),
+        });
+        bus.publish(BusMessage {
+            from: "bob".to_string(),
+            content: "finished".to_string(),
+            timestamp: 20,
+            channel: "team".to_string(),
+        });
+
+        assert_eq!(bus.read("alice", "team").len(), 2);
+        assert!(bus.read("bob", "team").is_empty());
+        let recent = bus.read_since("team", 10);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].content, "finished");
+    }
+
+    #[test]
+    fn shared_memory_versions_and_filters_entries() {
+        let mut memory = SharedMemory::new();
+        memory.write("plan", "draft", "alice");
+        memory.write("plan", "final", "alice");
+        memory.write("notes", "todo", "bob");
+
+        let entry = memory.read("plan").unwrap();
+        assert_eq!(entry.value, "final");
+        assert_eq!(entry.version, 2);
+        assert_eq!(memory.list_keys(), vec!["notes", "plan"]);
+        assert_eq!(memory.entries_by_writer("alice").len(), 1);
+        assert!(memory.delete("notes"));
+        assert!(!memory.delete("notes"));
+    }
+
+    #[test]
+    fn task_scheduler_supports_multiple_strategies() {
+        let agents = ["alice", "bob", "carol"];
+
+        let mut round_robin = TaskScheduler::new(SchedulerStrategy::RoundRobin);
+        assert_eq!(round_robin.schedule("task-1", &agents), "alice");
+        assert_eq!(round_robin.schedule("task-2", &agents), "bob");
+
+        let mut least_loaded = TaskScheduler::new(SchedulerStrategy::LeastLoaded);
+        least_loaded.record_assignment("alice");
+        assert_eq!(least_loaded.schedule("task-1", &agents), "bob");
+        least_loaded.record_completion("alice");
+        assert_eq!(least_loaded.schedule("task-2", &agents), "alice");
+
+        let mut priority = TaskScheduler::new(SchedulerStrategy::Priority);
+        assert_eq!(priority.schedule("urgent", &agents), "alice");
+
+        let mut random = TaskScheduler::new(SchedulerStrategy::Random);
+        let choice = random.schedule("any", &agents);
+        assert!(agents.contains(&choice.as_str()));
+    }
+
+    #[test]
+    fn jit_context_loader_evicts_least_recently_used_entries() {
+        let mut loader = JitContextLoader::new(5);
+        loader.add_reference(ContextReference {
+            id: "a".to_string(),
+            ref_type: RefType::File,
+            path: "a.txt".to_string(),
+            estimated_tokens: 3,
+        });
+        loader.add_reference(ContextReference {
+            id: "b".to_string(),
+            ref_type: RefType::Memory,
+            path: "memory://b".to_string(),
+            estimated_tokens: 3,
+        });
+
+        loader.load("a", "alpha");
+        loader.load("b", "beta");
+        assert_eq!(loader.loaded_tokens(), 6);
+        assert!(loader.should_evict());
+
+        assert_eq!(loader.get("b"), Some("beta"));
+        let evicted = loader.evict_lru().unwrap();
+        assert_eq!(evicted, "a");
+        assert_eq!(loader.get("a"), None);
+
+        loader.unload("b");
+        assert_eq!(loader.loaded_tokens(), 0);
     }
 }
