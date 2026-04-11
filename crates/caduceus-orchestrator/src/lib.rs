@@ -1,5 +1,6 @@
 pub mod headless;
 pub mod instructions;
+pub mod kanban;
 pub mod mentions;
 pub mod modes;
 pub mod workers;
@@ -197,7 +198,20 @@ impl Default for LoopDetector {
 
 // ── Slash commands ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointCommand {
+    Create,
+    List,
+    Restore(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KanbanCommand {
+    Open,
+    Add(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
     Help,
     Clear,
@@ -215,6 +229,8 @@ pub enum SlashCommand {
     Effort(String),
     Config(String),
     Mode(String),
+    Checkpoint(CheckpointCommand),
+    Kanban(KanbanCommand),
     Exit,
     Unknown(String),
 }
@@ -226,34 +242,61 @@ impl SlashCommand {
             return None;
         }
         let parts: Vec<&str> = trimmed[1..].splitn(2, ' ').collect();
+        let args = parts.get(1).map(|value| value.trim()).unwrap_or_default();
         let cmd = match parts[0] {
             "help" => Self::Help,
             "clear" => Self::Clear,
             "status" => Self::Status,
             "compact" => Self::Compact,
             "marketplace" => Self::Marketplace,
-            "install" => Self::Install(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
+            "install" => Self::Install(args.to_string()),
             "recommend" => Self::Recommend,
             "mcp" => {
-                let subcommand = parts.get(1).map(|s| s.trim()).unwrap_or_default();
-                let subparts: Vec<&str> = subcommand.splitn(2, ' ').collect();
+                let subparts: Vec<&str> = args.splitn(2, ' ').collect();
                 match subparts[0] {
                     "status" => Self::McpStatus,
                     "add" => {
                         Self::McpAdd(subparts.get(1).map(|s| s.to_string()).unwrap_or_default())
                     }
-                    _ if subcommand.is_empty() => Self::Unknown("mcp".to_string()),
-                    _ => Self::Unknown(format!("mcp {}", subcommand)),
+                    _ if args.is_empty() => Self::Unknown("mcp".to_string()),
+                    _ => Self::Unknown(format!("mcp {args}")),
+                }
+            }
+            "checkpoint" => {
+                let subparts: Vec<&str> = args.splitn(3, ' ').collect();
+                match subparts[0] {
+                    "" => Self::Checkpoint(CheckpointCommand::Create),
+                    "list" => Self::Checkpoint(CheckpointCommand::List),
+                    "restore" => Self::Checkpoint(CheckpointCommand::Restore(
+                        subparts
+                            .get(1)
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_default(),
+                    )),
+                    _ => Self::Unknown(format!("checkpoint {args}")),
+                }
+            }
+            "kanban" => {
+                let subparts: Vec<&str> = args.splitn(2, ' ').collect();
+                match subparts[0] {
+                    "" => Self::Kanban(KanbanCommand::Open),
+                    "add" => Self::Kanban(KanbanCommand::Add(
+                        subparts
+                            .get(1)
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_default(),
+                    )),
+                    _ => Self::Unknown(format!("kanban {args}")),
                 }
             }
             "agents" => Self::Agents,
             "skills" => Self::Skills,
             "exit" | "quit" => Self::Exit,
-            "model" => Self::Model(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
-            "provider" => Self::Provider(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
-            "effort" => Self::Effort(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
-            "config" => Self::Config(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
-            "mode" => Self::Mode(parts.get(1).map(|s| s.to_string()).unwrap_or_default()),
+            "model" => Self::Model(args.to_string()),
+            "provider" => Self::Provider(args.to_string()),
+            "effort" => Self::Effort(args.to_string()),
+            "config" => Self::Config(args.to_string()),
+            "mode" => Self::Mode(args.to_string()),
             other => Self::Unknown(other.to_string()),
         };
         Some(cmd)
@@ -292,6 +335,23 @@ impl SlashCommand {
                 "Set agent mode (plan/act/research/autopilot/architect/debug/review)".to_string()
             }
             Self::Mode(mode) => format!("Switch agent mode to {mode}"),
+            Self::Checkpoint(CheckpointCommand::Create) => {
+                "Create a manual workspace checkpoint".to_string()
+            }
+            Self::Checkpoint(CheckpointCommand::List) => "List session checkpoints".to_string(),
+            Self::Checkpoint(CheckpointCommand::Restore(id)) if id.is_empty() => {
+                "Restore a checkpoint by id".to_string()
+            }
+            Self::Checkpoint(CheckpointCommand::Restore(id)) => {
+                format!("Restore checkpoint {id}")
+            }
+            Self::Kanban(KanbanCommand::Open) => "Open the kanban board".to_string(),
+            Self::Kanban(KanbanCommand::Add(title)) if title.is_empty() => {
+                "Add a kanban card to backlog".to_string()
+            }
+            Self::Kanban(KanbanCommand::Add(title)) => {
+                format!("Add kanban card to backlog: {title}")
+            }
             Self::Exit => "Exit the current session".to_string(),
             Self::Unknown(command) => format!("Unknown slash command: {command}"),
         }
@@ -873,6 +933,26 @@ mod tests {
             SlashCommand::parse("/mcp add github"),
             Some(SlashCommand::McpAdd(ref name)) if name == "github"
         ));
+        assert!(matches!(
+            SlashCommand::parse("/checkpoint"),
+            Some(SlashCommand::Checkpoint(CheckpointCommand::Create))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/checkpoint list"),
+            Some(SlashCommand::Checkpoint(CheckpointCommand::List))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/checkpoint restore abc123"),
+            Some(SlashCommand::Checkpoint(CheckpointCommand::Restore(ref id))) if id == "abc123"
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/kanban"),
+            Some(SlashCommand::Kanban(KanbanCommand::Open))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/kanban add Implement board"),
+            Some(SlashCommand::Kanban(KanbanCommand::Add(ref title))) if title == "Implement board"
+        ));
         assert!(SlashCommand::parse("hello").is_none());
     }
 
@@ -900,6 +980,14 @@ mod tests {
         );
         assert_eq!(SlashCommand::Skills.description(), "List available skills");
         assert_eq!(SlashCommand::Agents.description(), "List available agents");
+        assert_eq!(
+            SlashCommand::Checkpoint(CheckpointCommand::List).description(),
+            "List session checkpoints"
+        );
+        assert_eq!(
+            SlashCommand::Kanban(KanbanCommand::Add("Write tests".to_string())).description(),
+            "Add kanban card to backlog: Write tests"
+        );
     }
 
     #[test]

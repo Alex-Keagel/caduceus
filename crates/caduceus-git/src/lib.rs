@@ -1,3 +1,7 @@
+pub mod checkpoints;
+
+pub use checkpoints::{Checkpoint, CheckpointManager};
+
 use caduceus_core::{CaduceusError, Result};
 use chrono::TimeZone;
 use serde::{Deserialize, Serialize};

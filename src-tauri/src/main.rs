@@ -5,9 +5,12 @@ use caduceus_core::{
     CaduceusConfig, LlmMessage, ModelId, ProviderId, SessionId, SessionPhase, SessionState,
     SessionStorage,
 };
-use caduceus_git::{FileStatus, GitRepo};
+use caduceus_git::{CheckpointManager, FileStatus, GitRepo};
 use caduceus_marketplace::{recommend, BuiltinCatalog, ProjectContext};
-use caduceus_orchestrator::{AgentEventEmitter, AgentHarness, ConfigLoader};
+use caduceus_orchestrator::{
+    kanban::{KanbanBoard, KanbanCard},
+    AgentEventEmitter, AgentHarness, CheckpointCommand, ConfigLoader, KanbanCommand, SlashCommand,
+};
 use caduceus_providers::{AnthropicAdapter, LlmAdapter, OpenAiCompatibleAdapter};
 use caduceus_runtime::{BashSandbox, ExecRequest};
 use caduceus_scanner::ProjectScanner;
@@ -206,6 +209,13 @@ pub struct AgentTurnResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct KanbanAddCardRequest {
+    pub project_root: String,
+    pub title: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TerminalExecRequest {
     pub session_id: String,
     pub command: String,
@@ -298,6 +308,116 @@ pub struct PtyDataEvent {
     pub data: String,
 }
 
+fn load_or_create_kanban_board(project_root: &Path) -> Result<KanbanBoard, String> {
+    KanbanBoard::load_or_new(project_root, "Caduceus Board").map_err(|e| e.to_string())
+}
+
+fn format_kanban_summary(board: &KanbanBoard) -> String {
+    let total_cards = board.cards.len();
+    let ready_cards = board.ready_cards().len();
+    format!(
+        "Kanban board '{}' ready. {} cards total, {} ready to start.",
+        board.name, total_cards, ready_cards
+    )
+}
+
+fn execute_slash_command(
+    session: &SessionState,
+    user_input: &str,
+) -> Result<Option<AgentTurnResponse>, String> {
+    let Some(command) = SlashCommand::parse(user_input) else {
+        return Ok(None);
+    };
+
+    let response = match command {
+        SlashCommand::Checkpoint(CheckpointCommand::Create) => {
+            let mut manager =
+                CheckpointManager::discover(&session.project_root).map_err(|e| e.to_string())?;
+            let checkpoint = manager
+                .create(&session.id.to_string(), "manual checkpoint")
+                .map_err(|e| e.to_string())?;
+            AgentTurnResponse {
+                content: format!(
+                    "Created checkpoint {} at {}.",
+                    checkpoint.id, checkpoint.created_at
+                ),
+                input_tokens: 0,
+                output_tokens: 0,
+            }
+        }
+        SlashCommand::Checkpoint(CheckpointCommand::List) => {
+            let manager =
+                CheckpointManager::discover(&session.project_root).map_err(|e| e.to_string())?;
+            let checkpoints = manager.list(&session.id.to_string());
+            let content = if checkpoints.is_empty() {
+                "No checkpoints found for this session.".to_string()
+            } else {
+                checkpoints
+                    .iter()
+                    .map(|checkpoint| {
+                        format!(
+                            "{}  {}  {}",
+                            checkpoint.id, checkpoint.created_at, checkpoint.message
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            AgentTurnResponse {
+                content,
+                input_tokens: 0,
+                output_tokens: 0,
+            }
+        }
+        SlashCommand::Checkpoint(CheckpointCommand::Restore(id)) => {
+            if id.trim().is_empty() {
+                return Err("Provide a checkpoint id to restore.".to_string());
+            }
+            let manager =
+                CheckpointManager::discover(&session.project_root).map_err(|e| e.to_string())?;
+            manager.restore(&id).map_err(|e| e.to_string())?;
+            AgentTurnResponse {
+                content: format!("Restored checkpoint {id}."),
+                input_tokens: 0,
+                output_tokens: 0,
+            }
+        }
+        SlashCommand::Kanban(KanbanCommand::Open) => {
+            let board = load_or_create_kanban_board(session.project_root.as_path())?;
+            AgentTurnResponse {
+                content: format_kanban_summary(&board),
+                input_tokens: 0,
+                output_tokens: 0,
+            }
+        }
+        SlashCommand::Kanban(KanbanCommand::Add(title)) => {
+            if title.trim().is_empty() {
+                return Err("Provide a kanban card title.".to_string());
+            }
+            let mut board = load_or_create_kanban_board(session.project_root.as_path())?;
+            board
+                .add_card(KanbanCard::new(title.clone(), ""))
+                .map_err(|e| e.to_string())?;
+            board
+                .save_to_workspace(session.project_root.as_path())
+                .map_err(|e| e.to_string())?;
+            AgentTurnResponse {
+                content: format!("Added '{}' to the backlog.", title),
+                input_tokens: 0,
+                output_tokens: 0,
+            }
+        }
+        SlashCommand::Unknown(command) => AgentTurnResponse {
+            content: format!("Unknown slash command: {command}"),
+            input_tokens: 0,
+            output_tokens: 0,
+        },
+        _ => return Ok(None),
+    };
+
+    Ok(Some(response))
+}
+
 #[tauri::command]
 async fn session_create(
     state: State<'_, AppState>,
@@ -375,6 +495,23 @@ async fn agent_turn(
         &state.workspace_root,
         &session.project_root.to_string_lossy(),
     )?;
+    if let Some(response) = execute_slash_command(&session, &request.user_input)? {
+        state
+            .storage
+            .save_message(
+                &session.id,
+                &LlmMessage::assistant(&response.content),
+                Some(0),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        state
+            .storage
+            .update_session(&session)
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(response);
+    }
     let config = load_config(&state)?;
     let provider = build_provider(&config, &session.provider_id)?;
     let tools = default_registry_with_root(&session.project_root);
@@ -573,6 +710,38 @@ async fn git_diff(project_root: String, staged: bool) -> Result<String, String> 
 }
 
 #[tauri::command]
+async fn kanban_load(
+    state: State<'_, AppState>,
+    project_root: String,
+) -> Result<KanbanBoard, String> {
+    let project_root = resolve_under_workspace(&state.workspace_root, &project_root)?;
+    load_or_create_kanban_board(&project_root)
+}
+
+#[tauri::command]
+async fn kanban_add_card(
+    state: State<'_, AppState>,
+    request: KanbanAddCardRequest,
+) -> Result<KanbanBoard, String> {
+    let project_root = resolve_under_workspace(&state.workspace_root, &request.project_root)?;
+    let title = request.title.trim();
+    if title.is_empty() {
+        return Err("Provide a kanban card title.".to_string());
+    }
+    let mut board = load_or_create_kanban_board(&project_root)?;
+    board
+        .add_card(KanbanCard::new(
+            title,
+            request.description.unwrap_or_default(),
+        ))
+        .map_err(|e| e.to_string())?;
+    board
+        .save_to_workspace(&project_root)
+        .map_err(|e| e.to_string())?;
+    Ok(board)
+}
+
+#[tauri::command]
 async fn marketplace_search(query: String) -> Result<MarketplaceSearchResponse, String> {
     Ok(MarketplaceSearchResponse {
         skills: BuiltinCatalog::skills()
@@ -766,6 +935,8 @@ fn main() {
             project_scan,
             git_status,
             git_diff,
+            kanban_load,
+            kanban_add_card,
             marketplace_search,
             marketplace_install,
             marketplace_recommend,

@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
-import { agentTurn, sessionCreate, permissionRespond } from "../api/tauri";
+import { agentTurn, kanbanAddCard, kanbanLoad, permissionRespond, sessionCreate } from "../api/tauri";
 import { listenAgentEvent } from "../api/tauri";
-import type { SessionInfo, SessionPhase, TokenUsage, ChatMessage, ToolCallBlock, PermissionRequest } from "../types";
+import type { KanbanBoard, SessionInfo, SessionPhase, TokenUsage, ChatMessage, ToolCallBlock, PermissionRequest } from "../types";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 interface ChatProps {
@@ -9,6 +9,8 @@ interface ChatProps {
   onSessionCreated: (session: SessionInfo) => void;
   onPhaseChange?: (phase: SessionPhase) => void;
   onTokenUsage?: (usage: TokenUsage) => void;
+  onOpenKanban?: (board: KanbanBoard) => void;
+  onKanbanUpdated?: (board: KanbanBoard) => void;
 }
 
 const RISK_COLORS: Record<string, string> = {
@@ -141,7 +143,7 @@ function ToolCallView({ tc, onToggle }: { tc: ToolCallBlock; onToggle: () => voi
   );
 }
 
-export default function Chat({ session, onSessionCreated, onPhaseChange, onTokenUsage }: ChatProps) {
+export default function Chat({ session, onSessionCreated, onPhaseChange, onTokenUsage, onOpenKanban, onKanbanUpdated }: ChatProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -256,6 +258,45 @@ export default function Chat({ session, onSessionCreated, onPhaseChange, onToken
     }
   };
 
+  const appendAssistantMessage = (content: string, tokens?: number) => {
+    setMessages((m) => [
+      ...m,
+      {
+        id: `${Date.now()}-${Math.random()}`,
+        role: "Assistant",
+        content,
+        tokens,
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+  };
+
+  const handleKanbanSlashCommand = async (userInput: string): Promise<boolean> => {
+    if (!session) {
+      throw new Error("Create a session before using kanban commands.");
+    }
+    const trimmed = userInput.trim();
+    if (trimmed === "/kanban") {
+      const board = await kanbanLoad(session.project_root);
+      onOpenKanban?.(board);
+      onKanbanUpdated?.(board);
+      appendAssistantMessage(`Opened kanban board with ${board.cards.length} cards.`);
+      return true;
+    }
+    if (trimmed.startsWith("/kanban add")) {
+      const title = trimmed.replace(/^\/kanban add\s*/, "").trim();
+      if (!title) {
+        throw new Error("Provide a kanban card title.");
+      }
+      const board = await kanbanAddCard(session.project_root, title);
+      onKanbanUpdated?.(board);
+      onOpenKanban?.(board);
+      appendAssistantMessage(`Added '${title}' to the backlog.`);
+      return true;
+    }
+    return false;
+  };
+
   const handleSend = async () => {
     if (!input.trim() || !session || loading) return;
     const userInput = input;
@@ -270,7 +311,19 @@ export default function Chat({ session, onSessionCreated, onPhaseChange, onToken
     setLoading(true);
 
     try {
-      await agentTurn(session.id, userInput);
+      if (await handleKanbanSlashCommand(userInput)) {
+        setLoading(false);
+        return;
+      }
+      const response = await agentTurn(session.id, userInput);
+      if (userInput.trim().startsWith("/")) {
+        appendAssistantMessage(response.content, response.output_tokens);
+        onTokenUsage?.({
+          input_tokens: response.input_tokens,
+          output_tokens: response.output_tokens,
+        });
+      }
+      setLoading(false);
     } catch (e) {
       setMessages((m) => [
         ...m,
