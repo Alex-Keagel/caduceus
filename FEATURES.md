@@ -671,6 +671,16 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 | 215 | Memory garbage collector | Periodic pruning of stale/unreferenced memories | Memory Survey | ✅ | P2 | `caduceus-storage` |
 | 216 | Context quality scorer | Score context density/relevance before each LLM call | Confucius | ✅ | P2 | `caduceus-orchestrator` |
 | 217 | Scaffold quality benchmark | Measure orchestration quality independent of model choice | Confucius | ✅ | P3 | `caduceus-telemetry` |
+| 218 | SAST vulnerability scanner | AI-powered static analysis: secrets, injection, XSS, SQLi, SSRF, SSTI, IDOR, weak crypto, insecure deserialization | Copilot-Security | 📋 | P1 | `caduceus-tools` |
+| 219 | Audit scope tool (git diff) | Get git diff for security analysis with branch comparison and git ref validation | Copilot-Security | 📋 | P1 | `caduceus-tools` |
+| 220 | Line number finder | Locate exact line numbers of vulnerable code snippets in files | Copilot-Security | 📋 | P1 | `caduceus-tools` |
+| 221 | PoC runner (sandboxed) | Execute proof-of-concept scripts to verify vulnerabilities with sandbox, timeout, and file-type restrictions | Copilot-Security | 📋 | P1 | `caduceus-runtime` |
+| 222 | Dependency vulnerability scanner | OSV-Scanner integration for known CVEs in lock files (package-lock, Gemfile, go.mod, etc.) | Copilot-Security | 📋 | P1 | `caduceus-tools` |
+| 223 | Security severity classifier | Categorize findings as Critical/High/Medium/Low with impact and likelihood assessment | Copilot-Security | 📋 | P1 | `caduceus-permissions` |
+| 224 | PII flow tracer | Trace sensitive data (email, SSN, credit card, API keys) from sources to sinks (logs, APIs, analytics) | Copilot-Security | 📋 | P2 | `caduceus-tools` |
+| 225 | LLM safety checker | Detect prompt injection, unsafe eval of LLM output, overly permissive tool usage | Copilot-Security | 📋 | P1 | `caduceus-permissions` |
+| 226 | Security report generator | Structured vulnerability reports with location, evidence, severity, remediation per finding | Copilot-Security | 📋 | P1 | `caduceus-tools` |
+| 227 | Crypto weakness detector | Flag DES, 3DES, RC4, ECB mode, weak hash (MD5/SHA1), insufficient key lengths | Copilot-Security | 📋 | P2 | `caduceus-tools` |
 
 ---
 
