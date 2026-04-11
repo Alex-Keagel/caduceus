@@ -1589,6 +1589,96 @@ impl Tool for WebFetchTool {
     }
 }
 
+// ── BrowserActionTool ──────────────────────────────────────────────────────────
+
+pub struct BrowserActionTool {
+    headless: bool,
+}
+
+impl BrowserActionTool {
+    pub fn new(headless: bool) -> Self {
+        Self { headless }
+    }
+}
+
+#[async_trait]
+impl Tool for BrowserActionTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "browser_action".into(),
+            description: "Control a browser via Playwright CLI. Supports navigate, click, type, screenshot, get_text, wait_for, scroll, get_console actions.".into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["action_type"],
+                "properties": {
+                    "action_type": {
+                        "type": "string",
+                        "enum": ["Navigate","Click","Type","Screenshot","GetText","WaitFor","Scroll","GetConsole"]
+                    },
+                    "url": {"type": "string"},
+                    "selector": {"type": "string"},
+                    "value": {"type": "string"}
+                },
+                "additionalProperties": false
+            }),
+            required_capability: None,
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let action_type_str = match input.get("action_type").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => return Ok(tool_error("'action_type' is required")),
+        };
+
+        let action_type = match action_type_str.as_str() {
+            "Navigate" => caduceus_runtime::browser::BrowserActionType::Navigate,
+            "Click" => caduceus_runtime::browser::BrowserActionType::Click,
+            "Type" => caduceus_runtime::browser::BrowserActionType::Type,
+            "Screenshot" => caduceus_runtime::browser::BrowserActionType::Screenshot,
+            "GetText" => caduceus_runtime::browser::BrowserActionType::GetText,
+            "WaitFor" => caduceus_runtime::browser::BrowserActionType::WaitFor,
+            "Scroll" => caduceus_runtime::browser::BrowserActionType::Scroll,
+            "GetConsole" => caduceus_runtime::browser::BrowserActionType::GetConsole,
+            other => return Ok(tool_error(format!("unknown action_type: {other}"))),
+        };
+
+        let action = caduceus_runtime::browser::BrowserAction {
+            action_type,
+            url: input
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            selector: input
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            value: input
+                .get("value")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        };
+
+        let svc = caduceus_runtime::browser::BrowserService::new(self.headless);
+        let result = svc.execute(action).await;
+
+        if result.success {
+            let data = result.data.unwrap_or_default();
+            Ok(ToolResult::success(if result.console_logs.is_empty() {
+                data
+            } else {
+                format!("{}\nConsole:\n{}", data, result.console_logs.join("\n"))
+            }))
+        } else {
+            Ok(tool_error(
+                result
+                    .error
+                    .unwrap_or_else(|| "browser action failed".into()),
+            ))
+        }
+    }
+}
+
 pub fn default_registry_with_root(workspace_root: impl Into<PathBuf>) -> ToolRegistry {
     let workspace_root = workspace_root.into();
     let mut registry = ToolRegistry::new();
@@ -1603,6 +1693,7 @@ pub fn default_registry_with_root(workspace_root: impl Into<PathBuf>) -> ToolReg
     registry.register(Arc::new(GitStatusTool::new(&workspace_root)));
     registry.register(Arc::new(GitDiffTool::new(&workspace_root)));
     registry.register(Arc::new(WebFetchTool::new(Duration::from_secs(15))));
+    registry.register(Arc::new(BrowserActionTool::new(true)));
     registry
 }
 
@@ -1635,7 +1726,7 @@ mod tests {
     fn registry_lookup_and_specs() {
         let registry = default_registry_with_root(std::env::current_dir().unwrap());
         assert!(registry.get("bash").is_some());
-        assert_eq!(registry.list_specs().len(), 11);
+        assert_eq!(registry.list_specs().len(), 12);
     }
 
     #[tokio::test]
