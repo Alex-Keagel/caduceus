@@ -681,6 +681,10 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 | 225 | LLM safety checker | Detect prompt injection, unsafe eval of LLM output, overly permissive tool usage | Copilot-Security | ✅ | P1 | `caduceus-permissions` |
 | 226 | Security report generator | Structured vulnerability reports with location, evidence, severity, remediation per finding | Copilot-Security | ✅ | P1 | `caduceus-tools` |
 | 227 | Crypto weakness detector | Flag DES, 3DES, RC4, ECB mode, weak hash (MD5/SHA1), insufficient key lengths | Copilot-Security | ✅ | P2 | `caduceus-tools` |
+| 228 | Onboarding tour | First-launch guided walkthrough with React Joyride v3 — 10 steps covering all panels | New | ✅ | P1 | `caduceus-app` |
+| 229 | Feature discovery tooltips | Per-panel first-use hints stored in localStorage, shown once per feature | New | ✅ | P1 | `caduceus-app` |
+| 230 | Interactive command reference | Searchable /help panel with 27 commands, keybindings, mentions, and examples | New | ✅ | P1 | `caduceus-app` |
+| 231 | Contextual help overlay | ? hotkey toggles help badges on every UI element showing what it does | New | ✅ | P1 | `caduceus-app` |
 
 ---
 
