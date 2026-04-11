@@ -77,7 +77,7 @@ export default function BuddySprite({ mood, size = 48, name = "Cady", onClick }:
         title={name}
         role={interactive ? "button" : "img"}
         aria-label={`${name} is ${mood}`}
-        tabIndex={0}
+        tabIndex={interactive ? 0 : -1}
         onClick={() => onClick?.()}
         onKeyDown={(event) => {
           if (!interactive) return;

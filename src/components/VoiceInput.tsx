@@ -23,7 +23,10 @@ export default function VoiceInput({ onTranscript, enabled, language = "en" }: V
   const analyserRef = useRef<AnalyserNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const rafRef = useRef<number>(0);
+  const waveformBufferRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
   const startedAtRef = useRef<number | null>(null);
+  const enabledRef = useRef(enabled);
+  const startAttemptRef = useRef(0);
   const mountedRef = useRef(true);
 
   const clearRecordingResources = async () => {
@@ -45,6 +48,7 @@ export default function VoiceInput({ onTranscript, enabled, language = "en" }: V
     analyserRef.current = null;
     streamRef.current = null;
     audioContextRef.current = null;
+    waveformBufferRef.current = null;
     startedAtRef.current = null;
 
     return duration;
@@ -65,8 +69,13 @@ export default function VoiceInput({ onTranscript, enabled, language = "en" }: V
   }, [isRecording]);
 
   useEffect(() => {
+    enabledRef.current = enabled;
+  }, [enabled]);
+
+  useEffect(() => {
     if (enabled) return;
-    void stopRecording();
+    startAttemptRef.current += 1;
+    void stopRecording(false, "Voice input disabled");
   }, [enabled]);
 
   useEffect(() => {
@@ -84,7 +93,7 @@ export default function VoiceInput({ onTranscript, enabled, language = "en" }: V
     setIsRecording(false);
     setStatus(nextStatus ?? (enabled ? "Ready to record" : "Voice input disabled"));
 
-    if (emitTranscript && duration > 250) {
+    if (emitTranscript && enabledRef.current && duration > 250) {
       const transcript = `Simulated ${language} transcript captured from a ${formatDuration(duration)} voice note.`;
       onTranscript(transcript);
       setStatus(`Transcript ready · ${formatDuration(duration)}`);
@@ -112,7 +121,11 @@ export default function VoiceInput({ onTranscript, enabled, language = "en" }: V
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, height);
 
-    const buffer = new Uint8Array(analyser.frequencyBinCount);
+    const buffer =
+      waveformBufferRef.current && waveformBufferRef.current.length === analyser.frequencyBinCount
+        ? waveformBufferRef.current
+        : new Uint8Array(new ArrayBuffer(analyser.frequencyBinCount));
+    waveformBufferRef.current = buffer;
     analyser.getByteTimeDomainData(buffer);
 
     ctx.fillStyle = "rgba(15, 23, 42, 0.92)";
@@ -136,6 +149,7 @@ export default function VoiceInput({ onTranscript, enabled, language = "en" }: V
 
   const startRecording = async () => {
     if (!enabled || isRecording) return;
+    const startAttempt = ++startAttemptRef.current;
 
     try {
       if (!navigator.mediaDevices?.getUserMedia) {
@@ -155,6 +169,15 @@ export default function VoiceInput({ onTranscript, enabled, language = "en" }: V
       const source = context.createMediaStreamSource(stream);
       source.connect(analyser);
 
+      if (!mountedRef.current || !enabledRef.current || startAttempt !== startAttemptRef.current) {
+        source.disconnect();
+        stream.getTracks().forEach((track) => track.stop());
+        if (context.state !== "closed") {
+          await context.close();
+        }
+        return;
+      }
+
       streamRef.current = stream;
       audioContextRef.current = context;
       analyserRef.current = analyser;
@@ -165,6 +188,7 @@ export default function VoiceInput({ onTranscript, enabled, language = "en" }: V
       setStatus("Listening…");
       drawWaveform();
     } catch (caughtError) {
+      if (!mountedRef.current) return;
       const message = caughtError instanceof Error ? caughtError.message : "Unable to start recording.";
       setError(message);
       await stopRecording(false, "Recording failed");

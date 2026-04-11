@@ -71,8 +71,10 @@ export default function DesignMode({
   const [color, setColor] = useState("#38bdf8");
   const [textValue, setTextValue] = useState("Review this");
   const [draftPositions, setDraftPositions] = useState<Record<string, { x: number; y: number }>>({});
+  const [isDragging, setIsDragging] = useState(false);
 
   const overlayRef = useRef<HTMLDivElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
   const dragStateRef = useRef<DragState | null>(null);
 
   const visibleAnnotations = useMemo(
@@ -91,15 +93,35 @@ export default function DesignMode({
   useEffect(() => {
     if (!enabled) {
       dragStateRef.current = null;
+      setIsDragging(false);
       return;
     }
+  }, [enabled]);
+
+  useEffect(() => {
+    const annotationIds = new Set(annotations.map((annotation) => annotation.id));
+
+    setDraftPositions((current) => {
+      const nextEntries = Object.entries(current).filter(([id]) => annotationIds.has(id));
+      if (nextEntries.length === Object.keys(current).length) return current;
+      return Object.fromEntries(nextEntries);
+    });
+
+    if (dragStateRef.current && !annotationIds.has(dragStateRef.current.id)) {
+      dragStateRef.current = null;
+      setIsDragging(false);
+    }
+  }, [annotations]);
+
+  useEffect(() => {
+    if (!enabled || !isDragging) return;
 
     const handlePointerMove = (event: MouseEvent) => {
       const dragState = dragStateRef.current;
-      const overlay = overlayRef.current;
-      if (!dragState || !overlay) return;
+      const stage = stageRef.current;
+      if (!dragState || !stage) return;
 
-      const rect = overlay.getBoundingClientRect();
+      const rect = stage.getBoundingClientRect();
       if (!rect.width || !rect.height) return;
 
       const dx = (event.clientX - dragState.startClientX) / rect.width;
@@ -116,6 +138,7 @@ export default function DesignMode({
 
     const handlePointerUp = () => {
       dragStateRef.current = null;
+      setIsDragging(false);
     };
 
     window.addEventListener("mousemove", handlePointerMove);
@@ -125,7 +148,7 @@ export default function DesignMode({
       window.removeEventListener("mousemove", handlePointerMove);
       window.removeEventListener("mouseup", handlePointerUp);
     };
-  }, [enabled]);
+  }, [enabled, isDragging]);
 
   if (!enabled) return null;
 
@@ -204,10 +227,11 @@ export default function DesignMode({
       </div>
 
       <div
+        ref={stageRef}
         onClick={(event) => {
           if (event.target !== event.currentTarget) return;
 
-          const rect = event.currentTarget.getBoundingClientRect();
+          const rect = stageRef.current?.getBoundingClientRect() ?? event.currentTarget.getBoundingClientRect();
           const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
           const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
 
@@ -227,10 +251,10 @@ export default function DesignMode({
         style={{ position: "relative", flex: 1 }}
       >
         {visibleAnnotations.map((annotation) => {
-          const overlayWidth = overlayRef.current?.clientWidth ?? 0;
-          const overlayHeight = overlayRef.current?.clientHeight ?? 0;
-          const left = positionToCss(annotation.x, overlayWidth, 0.1);
-          const top = positionToCss(annotation.y, overlayHeight, 0.1);
+          const stageWidth = stageRef.current?.clientWidth ?? 0;
+          const stageHeight = stageRef.current?.clientHeight ?? 0;
+          const left = positionToCss(annotation.x, stageWidth, 0.1);
+          const top = positionToCss(annotation.y, stageHeight, 0.1);
           const width = sizeToCss(annotation.width, annotation.type === "highlight" ? 0.22 : 0.18);
           const height = sizeToCss(annotation.height, annotation.type === "highlight" ? 0.08 : 0.16);
 
@@ -242,8 +266,8 @@ export default function DesignMode({
                 event.preventDefault();
                 event.stopPropagation();
                 const current = draftPositions[annotation.id] ?? {
-                  x: toRatio(annotation.x, overlayWidth, 0.1),
-                  y: toRatio(annotation.y, overlayHeight, 0.1),
+                  x: toRatio(annotation.x, stageWidth, 0.1),
+                  y: toRatio(annotation.y, stageHeight, 0.1),
                 };
                 dragStateRef.current = {
                   id: annotation.id,
@@ -252,6 +276,7 @@ export default function DesignMode({
                   startX: current.x,
                   startY: current.y,
                 };
+                setIsDragging(true);
               }}
               onKeyDown={(event) => {
                 if (event.key === "Delete" || event.key === "Backspace") {

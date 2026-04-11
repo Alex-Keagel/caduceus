@@ -195,7 +195,11 @@ impl CompactionPipeline {
 
 // ── Built-in pipeline strategies ──────────────────────────────────────────────
 
-/// Collapses consecutive ToolCall groups into a single placeholder group.
+/// Drops consecutive ToolCall groups so that only the first one remains.
+///
+/// **NOTE:** subsequent tool groups are *removed entirely* (not merged or
+/// summarised). Use this strategy when tool-call duplication is the primary
+/// token pressure and discarding the extra calls is acceptable.
 pub struct ToolCollapseStrategy;
 
 impl CompactionStrategy for ToolCollapseStrategy {
@@ -265,8 +269,10 @@ impl CompactionStrategy for SummarizeStrategy {
         for &idx in &eligible {
             let g = &groups[idx];
             for msg in &g.messages {
-                let preview = if msg.content.len() > PREVIEW_CHARS {
-                    format!("{}…", &msg.content[..PREVIEW_CHARS])
+                // FIX 1: use char-based truncation to avoid panics on multi-byte UTF-8.
+                let preview = if msg.content.chars().count() > PREVIEW_CHARS {
+                    let truncated: String = msg.content.chars().take(PREVIEW_CHARS).collect();
+                    format!("{truncated}…")
                 } else {
                     msg.content.clone()
                 };
@@ -386,7 +392,10 @@ impl CompactionTrigger {
             Self::TurnsExceed(limit) => stats.turn_count > *limit,
             Self::Always => true,
             Self::Never => false,
-            Self::All(triggers) => triggers.iter().all(|t| t.should_compact(stats)),
+            // FIX 4: empty All(vec![]) must not vacuously return true.
+            Self::All(triggers) => {
+                !triggers.is_empty() && triggers.iter().all(|t| t.should_compact(stats))
+            }
             Self::Any(triggers) => triggers.iter().any(|t| t.should_compact(stats)),
         }
     }
@@ -629,8 +638,16 @@ impl CompactionStrategy for PatternCompactor {
                 && groups[i + 1].kind == MessageGroupKind::ToolCall
                 && groups[i + 2].kind == MessageGroupKind::AssistantText;
 
-            // Only compact outside the retention window.
-            if pattern_matches && non_system_seen <= protected_from {
+            // FIX 3: ensure all three groups in the pattern are outside the
+            // retention window, not just the first one.
+            let mut seen_through_pattern = non_system_seen;
+            if !groups[i + 1].is_system() {
+                seen_through_pattern += 1;
+            }
+            if !groups[i + 2].is_system() {
+                seen_through_pattern += 1;
+            }
+            if pattern_matches && seen_through_pattern <= protected_from {
                 let original = groups[i + 1].token_count;
                 let collapsed = (original / 4).max(1);
                 removed_tokens += original.saturating_sub(collapsed);
@@ -1259,5 +1276,82 @@ mod tests {
         let non_sys_remaining = groups.iter().filter(|g| !g.is_system()).count();
         assert_eq!(non_sys_remaining, 4);
         assert!(result.removed_tokens > 0);
+    }
+
+    // ── FIX 1: UTF-8 content through compaction ───────────────────────────────
+
+    #[test]
+    fn summarize_strategy_does_not_panic_on_multibyte_utf8() {
+        // 30 groups of emoji / CJK content — much longer than PREVIEW_CHARS bytes
+        // but potentially shorter in chars.  Must not panic on byte slicing.
+        let emoji_content = "🦀".repeat(200); // each '🦀' is 4 bytes
+        let cjk_content = "你好世界".repeat(50); // each CJK char is 3 bytes
+
+        let mut groups = Vec::new();
+        for i in 0..15 {
+            let content = if i % 2 == 0 {
+                emoji_content.clone()
+            } else {
+                cjk_content.clone()
+            };
+            let mut g = MessageGroup::new(MessageGroupKind::User);
+            g.add_message(msg("user", &content));
+            groups.push(g);
+        }
+        for _ in 0..15 {
+            let mut g = MessageGroup::new(MessageGroupKind::AssistantText);
+            g.add_message(msg("assistant", &emoji_content));
+            groups.push(g);
+        }
+
+        let strategy = SummarizeStrategy { keep_recent: 10 };
+        // Must not panic regardless of content encoding.
+        let result = strategy.compact(&mut groups);
+        assert!(result.groups_affected > 0);
+    }
+
+    #[test]
+    fn summarize_preview_truncates_on_char_boundary() {
+        // A string where bytes and chars diverge: 80 ASCII chars then an emoji.
+        let content = format!("{}{}", "a".repeat(80), "🦀");
+        let mut groups = vec![];
+        for _ in 0..15 {
+            let mut g = MessageGroup::new(MessageGroupKind::User);
+            g.add_message(msg("user", &content));
+            groups.push(g);
+        }
+        let strategy = SummarizeStrategy { keep_recent: 5 };
+        let result = strategy.compact(&mut groups);
+        // The result must not panic and must remove at least some groups.
+        assert!(result.groups_affected > 0);
+    }
+
+    // ── FIX 4: All(vec![]) and Any(vec![]) edge cases ─────────────────────────
+
+    #[test]
+    fn trigger_all_empty_is_false() {
+        // Vacuous truth bug: All([]) used to return true. It must return false.
+        let t = CompactionTrigger::All(vec![]);
+        assert!(
+            !t.should_compact(&stats(usize::MAX, usize::MAX, usize::MAX)),
+            "All(vec![]) must not trigger compaction"
+        );
+    }
+
+    #[test]
+    fn trigger_any_empty_is_false() {
+        // Any([]) has no conditions to satisfy → should remain false (standard behaviour).
+        let t = CompactionTrigger::Any(vec![]);
+        assert!(
+            !t.should_compact(&stats(usize::MAX, usize::MAX, usize::MAX)),
+            "Any(vec![]) must not trigger compaction"
+        );
+    }
+
+    #[test]
+    fn trigger_all_single_condition_behaves_correctly() {
+        let t = CompactionTrigger::All(vec![CompactionTrigger::TokensExceed(100)]);
+        assert!(!t.should_compact(&stats(100, 0, 0)));
+        assert!(t.should_compact(&stats(101, 0, 0)));
     }
 }

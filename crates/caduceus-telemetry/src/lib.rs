@@ -1,7 +1,7 @@
 use caduceus_core::{ModelId, ProviderId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 // ── Token counting ─────────────────────────────────────────────────────────────
@@ -998,7 +998,7 @@ pub enum RotTrend {
 pub struct ContextRotDetector {
     window_size: usize,
     rot_threshold: f64,
-    measurements: Vec<RotMeasurement>,
+    measurements: VecDeque<RotMeasurement>,
 }
 
 impl ContextRotDetector {
@@ -1006,16 +1006,16 @@ impl ContextRotDetector {
         Self {
             window_size: 6,
             rot_threshold: threshold.clamp(0.0, 1.0),
-            measurements: Vec::new(),
+            measurements: VecDeque::new(),
         }
     }
 
     pub fn record_turn(&mut self, recall: f64, repetitions: usize, hallucinations: usize) {
         let turn = self
             .measurements
-            .last()
+            .back()
             .map_or(1, |measurement| measurement.turn + 1);
-        self.measurements.push(RotMeasurement {
+        self.measurements.push_back(RotMeasurement {
             turn,
             recall_score: recall.clamp(0.0, 1.0),
             repetition_count: repetitions,
@@ -1023,12 +1023,12 @@ impl ContextRotDetector {
         });
 
         if self.measurements.len() > self.window_size {
-            self.measurements.remove(0);
+            self.measurements.pop_front();
         }
     }
 
     pub fn is_rotting(&self) -> bool {
-        let Some(latest) = self.measurements.last() else {
+        let Some(latest) = self.measurements.back() else {
             return false;
         };
 
@@ -1053,20 +1053,23 @@ impl ContextRotDetector {
         }
 
         let midpoint = (self.measurements.len() / 2).max(1);
-        let earlier = &self.measurements[..midpoint];
-        let later = &self.measurements[midpoint..];
-        let earlier_recall = earlier
+        let earlier_recall = self
+            .measurements
             .iter()
+            .take(midpoint)
             .map(|measurement| measurement.recall_score)
             .sum::<f64>()
-            / earlier.len() as f64;
-        let later_recall = later
+            / midpoint as f64;
+        let later_count = self.measurements.len().saturating_sub(midpoint).max(1);
+        let later_recall = self
+            .measurements
             .iter()
+            .skip(midpoint)
             .map(|measurement| measurement.recall_score)
             .sum::<f64>()
-            / later.len() as f64;
+            / later_count as f64;
         let decline = earlier_recall - later_recall;
-        let latest = self.measurements.last().expect("latest measurement exists");
+        let latest = self.measurements.back().expect("latest measurement exists");
         let latest_score = Self::measurement_score(latest);
 
         if latest.recall_score <= (self.rot_threshold * 0.8)
@@ -1107,6 +1110,8 @@ pub struct BehavioralDriftDetector {
     drift_measurements: Vec<DriftMeasurement>,
 }
 
+const MAX_DRIFT_MEASUREMENTS: usize = 100;
+
 impl BehavioralDriftDetector {
     pub fn new() -> Self {
         Self::default()
@@ -1137,6 +1142,13 @@ impl BehavioralDriftDetector {
             similarity_to_baseline: similarity,
             skipped_steps,
         });
+        let overflow = self
+            .drift_measurements
+            .len()
+            .saturating_sub(MAX_DRIFT_MEASUREMENTS);
+        if overflow > 0 {
+            self.drift_measurements.drain(..overflow);
+        }
     }
 
     pub fn drift_score(&self) -> f64 {
@@ -1211,6 +1223,8 @@ pub struct CognitiveDegradationBreaker {
     auto_reset_threshold: DegradationStage,
 }
 
+const MAX_STAGE_HISTORY: usize = 100;
+
 impl CognitiveDegradationBreaker {
     pub fn new() -> Self {
         let now = current_unix_timestamp();
@@ -1227,6 +1241,7 @@ impl CognitiveDegradationBreaker {
             self.stage = next_stage;
             self.stage_history
                 .push((next_stage, current_unix_timestamp()));
+            self.trim_stage_history();
         }
     }
 
@@ -1242,6 +1257,7 @@ impl CognitiveDegradationBreaker {
         self.stage = DegradationStage::Healthy;
         self.stage_history
             .push((DegradationStage::Healthy, current_unix_timestamp()));
+        self.trim_stage_history();
     }
 
     pub fn stage_duration(&self) -> u64 {
@@ -1278,6 +1294,13 @@ impl CognitiveDegradationBreaker {
             5 => DegradationStage::FunctionalOverride,
             6 => DegradationStage::SystemicCollapse,
             _ => DegradationStage::Healthy,
+        }
+    }
+
+    fn trim_stage_history(&mut self) {
+        let overflow = self.stage_history.len().saturating_sub(MAX_STAGE_HISTORY);
+        if overflow > 0 {
+            self.stage_history.drain(..overflow);
         }
     }
 }
@@ -1452,8 +1475,12 @@ impl AgenticTreeTracker {
 
     fn path_ids(&self, node_id: usize) -> Vec<usize> {
         let mut path = Vec::new();
+        let mut visited = HashSet::new();
         let mut current = self.nodes.get(node_id);
         while let Some(node) = current {
+            if !visited.insert(node.id) {
+                break;
+            }
             path.push(node.id);
             current = node.parent.and_then(|parent| self.nodes.get(parent));
         }
@@ -2139,5 +2166,15 @@ mod tests {
             tracker.nodes[sibling].status,
             NodeStatus::Failed(_)
         ));
+    }
+
+    #[test]
+    fn agentic_tree_tracker_path_ids_stops_on_cycles() {
+        let mut tracker = AgenticTreeTracker::new();
+        let root = tracker.add_branch(None, "root");
+        let child = tracker.add_branch(Some(root), "child");
+        tracker.nodes[root].parent = Some(child);
+
+        assert_eq!(tracker.path_ids(child), vec![root, child]);
     }
 }

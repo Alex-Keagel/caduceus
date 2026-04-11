@@ -12,7 +12,7 @@ pub use manifest::{Category, PluginManifest};
 pub use recommender::{recommend, ProjectContext, Recommendations};
 pub use registry::{AgentEntry, MarketplaceRegistry, PluginEntry, SkillEntry};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ── #207: Skill Evolver ───────────────────────────────────────────────────
@@ -63,7 +63,7 @@ impl SkillEvolver {
             .as_secs();
         let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
         for s in summaries.iter().filter(|s| s.success) {
-            if let Some(pattern) = s.patterns.first() {
+            for pattern in &s.patterns {
                 grouped
                     .entry(pattern.clone())
                     .or_default()
@@ -117,6 +117,7 @@ pub struct PatternEntry {
 
 pub struct PatternAggregator {
     patterns: HashMap<String, PatternEntry>,
+    seen_sessions: HashSet<String>,
     min_occurrences: usize,
     total_sessions: usize,
 }
@@ -125,13 +126,16 @@ impl PatternAggregator {
     pub fn new(min_occurrences: usize) -> Self {
         Self {
             patterns: HashMap::new(),
+            seen_sessions: HashSet::new(),
             min_occurrences,
             total_sessions: 0,
         }
     }
 
     pub fn ingest_session(&mut self, session_id: &str, patterns: &[String]) {
-        self.total_sessions += 1;
+        if self.seen_sessions.insert(session_id.to_string()) {
+            self.total_sessions += 1;
+        }
         for pattern in patterns {
             let entry = self
                 .patterns
@@ -173,6 +177,7 @@ impl PatternAggregator {
 
     pub fn clear(&mut self) {
         self.patterns.clear();
+        self.seen_sessions.clear();
         self.total_sessions = 0;
     }
 }
@@ -404,6 +409,17 @@ impl SkillSyncManager {
                 actions.push(SyncAction::Pull(name.to_string()));
             }
         }
+        actions.sort_by(|a, b| {
+            fn sort_key(action: &SyncAction) -> (u8, &str) {
+                match action {
+                    SyncAction::Push(n) => (0, n.as_str()),
+                    SyncAction::Pull(n) => (1, n.as_str()),
+                    SyncAction::Conflict(n, _) => (2, n.as_str()),
+                    SyncAction::UpToDate => (3, ""),
+                }
+            }
+            sort_key(a).cmp(&sort_key(b))
+        });
         actions
     }
 
@@ -522,25 +538,27 @@ impl MemoryGarbageCollector {
     }
 
     pub fn identify_garbage(&self, items: &[GarbageCandidate]) -> Vec<String> {
-        let mut garbage: Vec<String> = items
+        let mut garbage_set: HashSet<String> = items
             .iter()
             .filter(|i| i.last_accessed_days_ago > self.threshold_days)
             .map(|i| i.id.clone())
             .collect();
-        let mut remaining: Vec<&GarbageCandidate> =
-            items.iter().filter(|i| !garbage.contains(&i.id)).collect();
+        let mut remaining: Vec<&GarbageCandidate> = items
+            .iter()
+            .filter(|i| !garbage_set.contains(&i.id))
+            .collect();
         if remaining.len() > self.max_items {
             remaining.sort_by_key(|i| i.access_count);
             let excess = remaining.len() - self.max_items;
             for item in remaining.iter().take(excess) {
-                garbage.push(item.id.clone());
+                garbage_set.insert(item.id.clone());
             }
         }
-        garbage
+        garbage_set.into_iter().collect()
     }
 
     pub fn collect(&self, items: &mut Vec<GarbageCandidate>) -> usize {
-        let garbage = self.identify_garbage(items);
+        let garbage: HashSet<String> = self.identify_garbage(items).into_iter().collect();
         let before = items.len();
         items.retain(|i| !garbage.contains(&i.id));
         before - items.len()
@@ -1412,5 +1430,74 @@ mod tests {
         let removed = gc.collect(&mut items);
         assert_eq!(removed, 0);
         assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn test_pattern_aggregator_duplicate_session() {
+        let mut agg = PatternAggregator::new(1);
+        // Ingest same session_id twice — should count as one session
+        agg.ingest_session("s1", &["pattern-a".to_string()]);
+        agg.ingest_session("s1", &["pattern-a".to_string()]);
+        let results = agg.aggregate();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].occurrences, 1,
+            "duplicate ingest must not inflate occurrences"
+        );
+        assert!(
+            (results[0].confidence - 1.0).abs() < 0.001,
+            "confidence should be 1.0 (1 occurrence / 1 unique session), got {}",
+            results[0].confidence
+        );
+    }
+
+    #[test]
+    fn test_skill_evolver_all_patterns_aggregated() {
+        let config = EvolverConfig {
+            min_sessions_before_evolve: 1,
+            evolution_interval_secs: 3600,
+            quality_threshold: 0.0,
+        };
+        let mut evolver = SkillEvolver::new(config);
+        let summaries = vec![SessionSummary {
+            session_id: "s1".to_string(),
+            patterns: vec!["code-review".to_string(), "testing".to_string()],
+            tools_used: vec![],
+            success: true,
+        }];
+        let evolved = evolver.evolve_from_summaries(&summaries);
+        assert_eq!(
+            evolved.len(),
+            2,
+            "every pattern should produce an evolved skill"
+        );
+        let names: Vec<&str> = evolved.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"code-review"), "expected code-review skill");
+        assert!(names.contains(&"testing"), "expected testing skill");
+    }
+
+    #[test]
+    fn test_garbage_collector_large_input() {
+        // 2 000 items: even indices are recent (5 days), odd indices are stale (60 days).
+        // Validates HashSet-based membership check vs. O(n²) Vec::contains.
+        let gc = MemoryGarbageCollector::new(30, 2000);
+        let items: Vec<GarbageCandidate> = (0..2000_usize)
+            .map(|i| GarbageCandidate {
+                id: format!("item-{i:04}"),
+                last_accessed_days_ago: if i % 2 == 0 { 5 } else { 60 },
+                access_count: i as u32,
+                size_bytes: 100,
+            })
+            .collect();
+        let garbage = gc.identify_garbage(&items);
+        // 1 000 odd-indexed items are stale; max_items = 2 000 so cap is not hit
+        assert_eq!(garbage.len(), 1000, "expected exactly 1 000 stale items");
+        for g in &garbage {
+            let idx: usize = g.trim_start_matches("item-").parse().unwrap();
+            assert!(
+                idx % 2 == 1,
+                "only stale (odd-indexed) items should be garbage"
+            );
+        }
     }
 }
