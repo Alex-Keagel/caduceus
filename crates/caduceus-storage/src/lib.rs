@@ -1171,7 +1171,7 @@ fn extract_tool_call_id(blocks: &[ContentBlock]) -> Option<String> {
     blocks.iter().find_map(|block| match block {
         ContentBlock::ToolUse { id, .. } => Some(id.0.clone()),
         ContentBlock::ToolResult { tool_call_id, .. } => Some(tool_call_id.0.clone()),
-        ContentBlock::Text(_) => None,
+        ContentBlock::Text(_) | ContentBlock::Image(_) => None,
     })
 }
 
@@ -1284,6 +1284,133 @@ fn audit_decision_from_str(value: &str) -> Result<AuditDecision> {
         other => Err(CaduceusError::Storage(format!(
             "unknown audit decision `{other}`"
         ))),
+    }
+}
+
+// ── Feature #187: Replay Debugging ────────────────────────────────────────
+
+use serde::{Deserialize as ReplayDeserialize, Serialize as ReplaySerialize};
+
+#[derive(Debug, Clone, ReplaySerialize, ReplayDeserialize, PartialEq)]
+pub enum ReplayEventType {
+    UserMessage,
+    AssistantResponse,
+    ToolCall,
+    ToolResult,
+    StateChange,
+    Error,
+}
+
+#[derive(Debug, Clone, ReplaySerialize, ReplayDeserialize)]
+pub struct ReplayEvent {
+    pub timestamp: u64,
+    pub event_type: ReplayEventType,
+    pub data: serde_json::Value,
+}
+
+/// Records agent session events for later replay.
+pub struct SessionRecorder {
+    events: Vec<ReplayEvent>,
+    session_id: String,
+}
+
+impl SessionRecorder {
+    pub fn new(session_id: &str) -> Self {
+        Self {
+            events: Vec::new(),
+            session_id: session_id.to_string(),
+        }
+    }
+
+    pub fn record(&mut self, event_type: ReplayEventType, data: serde_json::Value) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.events.push(ReplayEvent {
+            timestamp,
+            event_type,
+            data,
+        });
+    }
+
+    pub fn export(&self) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "session_id": self.session_id,
+            "events": self.events,
+        }))
+        .unwrap_or_default()
+    }
+
+    pub fn import(json: &str) -> std::result::Result<Self, CaduceusError> {
+        let v: serde_json::Value = serde_json::from_str(json)?;
+        let session_id = v["session_id"].as_str().unwrap_or("").to_string();
+        let events: Vec<ReplayEvent> = serde_json::from_value(v["events"].clone())?;
+        Ok(Self { events, session_id })
+    }
+
+    pub fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn events_by_type(&self, event_type: &ReplayEventType) -> Vec<&ReplayEvent> {
+        self.events
+            .iter()
+            .filter(|e| &e.event_type == event_type)
+            .collect()
+    }
+}
+
+/// Steps through recorded events for debugging / audit.
+pub struct SessionReplayer {
+    events: Vec<ReplayEvent>,
+    cursor: usize,
+}
+
+impl SessionReplayer {
+    pub fn new(events: Vec<ReplayEvent>) -> Self {
+        Self { events, cursor: 0 }
+    }
+
+    /// Returns the event at the current cursor position and advances the cursor.
+    pub fn step_forward(&mut self) -> Option<&ReplayEvent> {
+        if self.cursor < self.events.len() {
+            let event = &self.events[self.cursor];
+            self.cursor += 1;
+            Some(event)
+        } else {
+            None
+        }
+    }
+
+    /// Moves the cursor back one position and returns the event there.
+    pub fn step_back(&mut self) -> Option<&ReplayEvent> {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            Some(&self.events[self.cursor])
+        } else {
+            None
+        }
+    }
+
+    /// Moves the cursor to `index` and returns the event there.
+    pub fn jump_to(&mut self, index: usize) -> Option<&ReplayEvent> {
+        if index < self.events.len() {
+            self.cursor = index;
+            Some(&self.events[self.cursor])
+        } else {
+            None
+        }
+    }
+
+    /// Returns the event at the current cursor without moving.
+    pub fn current(&self) -> Option<&ReplayEvent> {
+        self.events.get(self.cursor)
+    }
+
+    /// Number of events not yet consumed by `step_forward`.
+    pub fn remaining(&self) -> usize {
+        self.events.len().saturating_sub(self.cursor)
     }
 }
 
@@ -1913,5 +2040,170 @@ mod tests {
             matches!(err, CaduceusError::SessionNotFound(_)),
             "expected SessionNotFound, got: {err}"
         );
+    }
+
+    // ── Feature #187: Replay Debugging tests ────────────────────────────────
+
+    #[test]
+    fn test_recorder_record_and_count() {
+        let mut recorder = SessionRecorder::new("session-abc");
+        recorder.record(
+            ReplayEventType::UserMessage,
+            serde_json::json!({"text": "hello"}),
+        );
+        recorder.record(
+            ReplayEventType::AssistantResponse,
+            serde_json::json!({"text": "hi"}),
+        );
+        assert_eq!(recorder.event_count(), 2);
+    }
+
+    #[test]
+    fn test_recorder_export_import_roundtrip() {
+        let mut recorder = SessionRecorder::new("roundtrip-session");
+        recorder.record(
+            ReplayEventType::ToolCall,
+            serde_json::json!({"tool": "read"}),
+        );
+        recorder.record(
+            ReplayEventType::ToolResult,
+            serde_json::json!({"output": "file content"}),
+        );
+        recorder.record(ReplayEventType::Error, serde_json::json!({"msg": "oops"}));
+
+        let json = recorder.export();
+        assert!(!json.is_empty());
+
+        let imported = SessionRecorder::import(&json).unwrap();
+        assert_eq!(imported.event_count(), 3);
+        assert_eq!(imported.session_id, "roundtrip-session");
+    }
+
+    #[test]
+    fn test_recorder_events_by_type() {
+        let mut recorder = SessionRecorder::new("filter-session");
+        recorder.record(
+            ReplayEventType::UserMessage,
+            serde_json::json!({"text": "a"}),
+        );
+        recorder.record(
+            ReplayEventType::ToolCall,
+            serde_json::json!({"tool": "grep"}),
+        );
+        recorder.record(
+            ReplayEventType::UserMessage,
+            serde_json::json!({"text": "b"}),
+        );
+
+        let messages = recorder.events_by_type(&ReplayEventType::UserMessage);
+        assert_eq!(messages.len(), 2);
+
+        let tool_calls = recorder.events_by_type(&ReplayEventType::ToolCall);
+        assert_eq!(tool_calls.len(), 1);
+
+        let errors = recorder.events_by_type(&ReplayEventType::Error);
+        assert_eq!(errors.len(), 0);
+    }
+
+    #[test]
+    fn test_import_invalid_json_errors() {
+        let result = SessionRecorder::import("not valid json {{{{");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_replayer_step_forward() {
+        let events = vec![
+            ReplayEvent {
+                timestamp: 1,
+                event_type: ReplayEventType::UserMessage,
+                data: serde_json::json!({"n": 1}),
+            },
+            ReplayEvent {
+                timestamp: 2,
+                event_type: ReplayEventType::AssistantResponse,
+                data: serde_json::json!({"n": 2}),
+            },
+        ];
+        let mut replayer = SessionReplayer::new(events);
+        assert_eq!(replayer.remaining(), 2);
+
+        let e1 = replayer.step_forward().unwrap();
+        assert_eq!(e1.data["n"], 1);
+        assert_eq!(replayer.remaining(), 1);
+
+        let e2 = replayer.step_forward().unwrap();
+        assert_eq!(e2.data["n"], 2);
+        assert_eq!(replayer.remaining(), 0);
+
+        assert!(replayer.step_forward().is_none());
+    }
+
+    #[test]
+    fn test_replayer_step_back() {
+        let events = vec![
+            ReplayEvent {
+                timestamp: 1,
+                event_type: ReplayEventType::UserMessage,
+                data: serde_json::json!({"n": 1}),
+            },
+            ReplayEvent {
+                timestamp: 2,
+                event_type: ReplayEventType::ToolCall,
+                data: serde_json::json!({"n": 2}),
+            },
+        ];
+        let mut replayer = SessionReplayer::new(events);
+        replayer.step_forward();
+        replayer.step_forward();
+
+        let back = replayer.step_back().unwrap();
+        assert_eq!(back.data["n"], 2);
+
+        // step_back at start returns None
+        replayer.step_back();
+        assert!(replayer.step_back().is_none());
+    }
+
+    #[test]
+    fn test_replayer_jump_to() {
+        let events = vec![
+            ReplayEvent {
+                timestamp: 0,
+                event_type: ReplayEventType::UserMessage,
+                data: serde_json::json!({"i": 0}),
+            },
+            ReplayEvent {
+                timestamp: 1,
+                event_type: ReplayEventType::ToolCall,
+                data: serde_json::json!({"i": 1}),
+            },
+            ReplayEvent {
+                timestamp: 2,
+                event_type: ReplayEventType::ToolResult,
+                data: serde_json::json!({"i": 2}),
+            },
+        ];
+        let mut replayer = SessionReplayer::new(events);
+
+        let e = replayer.jump_to(2).unwrap();
+        assert_eq!(e.data["i"], 2);
+        assert_eq!(replayer.remaining(), 1);
+
+        // out-of-bounds returns None
+        assert!(replayer.jump_to(99).is_none());
+    }
+
+    #[test]
+    fn test_replayer_current() {
+        let events = vec![ReplayEvent {
+            timestamp: 0,
+            event_type: ReplayEventType::StateChange,
+            data: serde_json::json!({}),
+        }];
+        let mut replayer = SessionReplayer::new(events);
+        assert!(replayer.current().is_some());
+        replayer.step_forward();
+        assert!(replayer.current().is_none());
     }
 }

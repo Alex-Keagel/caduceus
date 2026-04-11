@@ -9,6 +9,16 @@ pub mod mentions;
 pub mod modes;
 pub mod workers;
 
+pub use context::{AssembledContext, ContextSource};
+pub use headless::{
+    CompactOutputFilter, ReplAction, ReplMode, ReplState, SummaryCompressor, TypoSuggester,
+};
+pub use modes::{AgentPersona, PersonaRegistry};
+pub use workers::{
+    Complexity, DecomposedTask, MultiRepoWorkspace, NotificationChannel, NotificationRoute,
+    NotificationRouter, NotificationSeverity, RepoEntry, TaskDecomposer,
+};
+
 use caduceus_core::{
     AgentEvent, CaduceusError, CancellationToken, ModelId, ProviderId, Result, SessionId,
     SessionPhase, SessionState, StopReason, TokenUsage, ToolCallId, WarningLevel,
@@ -495,7 +505,7 @@ impl ContextAssembler {
     }
 
     fn estimate_tokens(text: &str) -> u32 {
-        (text.len() as u32) / 4 + 1
+        crate::context::estimate_tokens(text)
     }
 
     fn message_tokens(msg: &caduceus_providers::Message) -> u32 {

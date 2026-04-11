@@ -181,6 +181,21 @@ pub enum ContentBlock {
         content: String,
         is_error: bool,
     },
+    Image(ImageContent),
+}
+
+// ── Vision types (Feature #72) ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ImageSource {
+    Base64 { media_type: String, data: String },
+    Url(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageContent {
+    pub source: ImageSource,
+    pub detail: Option<String>, // "auto", "low", "high"
 }
 
 // ── LLM Response ──────────────────────────────────────────────────────────────
@@ -784,6 +799,75 @@ pub enum WarningLevel {
     Critical95,
 }
 
+// ── Feature Flags (Feature #50) ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureFlag {
+    pub name: String,
+    pub enabled: bool,
+    pub description: String,
+    pub rollout_percentage: Option<u8>, // 0-100
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FeatureFlags {
+    flags: HashMap<String, FeatureFlag>,
+}
+
+impl FeatureFlags {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, name: &str, desc: &str, default: bool) {
+        self.flags.insert(
+            name.to_string(),
+            FeatureFlag {
+                name: name.to_string(),
+                enabled: default,
+                description: desc.to_string(),
+                rollout_percentage: None,
+            },
+        );
+    }
+
+    pub fn is_enabled(&self, name: &str) -> bool {
+        self.flags.get(name).map(|f| f.enabled).unwrap_or(false)
+    }
+
+    pub fn set(&mut self, name: &str, enabled: bool) {
+        if let Some(flag) = self.flags.get_mut(name) {
+            flag.enabled = enabled;
+        }
+    }
+
+    pub fn set_rollout(&mut self, name: &str, percentage: u8) {
+        if let Some(flag) = self.flags.get_mut(name) {
+            flag.rollout_percentage = Some(percentage.min(100));
+        }
+    }
+
+    /// Deterministic per-user rollout: returns `true` if `user_hash % 100 < percentage`.
+    pub fn check_rollout(&self, name: &str, user_hash: u64) -> bool {
+        let Some(flag) = self.flags.get(name) else {
+            return false;
+        };
+        if !flag.enabled {
+            return false;
+        }
+        match flag.rollout_percentage {
+            None => flag.enabled,
+            Some(0) => false,
+            Some(pct) if pct >= 100 => true,
+            Some(pct) => (user_hash % 100) < pct as u64,
+        }
+    }
+
+    pub fn all_flags(&self) -> Vec<&FeatureFlag> {
+        self.flags.values().collect()
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1018,5 +1102,134 @@ log_level = "debug"
             reserved_output: 100,
         };
         assert_eq!(budget.warning_level(), WarningLevel::Critical95);
+    }
+
+    // ── Feature #50: FeatureFlags tests ────────────────────────────────────────
+
+    #[test]
+    fn feature_flags_register_and_check() {
+        let mut flags = FeatureFlags::new();
+        flags.register("dark-mode", "Enable dark mode UI", false);
+        flags.register("beta-search", "New search engine", true);
+
+        assert!(!flags.is_enabled("dark-mode"));
+        assert!(flags.is_enabled("beta-search"));
+        assert!(!flags.is_enabled("nonexistent"));
+    }
+
+    #[test]
+    fn feature_flags_enable_disable() {
+        let mut flags = FeatureFlags::new();
+        flags.register("my-feature", "desc", false);
+
+        assert!(!flags.is_enabled("my-feature"));
+        flags.set("my-feature", true);
+        assert!(flags.is_enabled("my-feature"));
+        flags.set("my-feature", false);
+        assert!(!flags.is_enabled("my-feature"));
+    }
+
+    #[test]
+    fn feature_flags_set_on_unknown_is_noop() {
+        let mut flags = FeatureFlags::new();
+        flags.set("ghost", true); // should not panic
+        assert!(!flags.is_enabled("ghost"));
+    }
+
+    #[test]
+    fn feature_flags_rollout_zero() {
+        let mut flags = FeatureFlags::new();
+        flags.register("rollout-zero", "0% rollout", true);
+        flags.set_rollout("rollout-zero", 0);
+        // No user should get this
+        for hash in 0u64..200 {
+            assert!(!flags.check_rollout("rollout-zero", hash));
+        }
+    }
+
+    #[test]
+    fn feature_flags_rollout_hundred() {
+        let mut flags = FeatureFlags::new();
+        flags.register("rollout-full", "100% rollout", true);
+        flags.set_rollout("rollout-full", 100);
+        // Every user should get this
+        for hash in 0u64..200 {
+            assert!(flags.check_rollout("rollout-full", hash));
+        }
+    }
+
+    #[test]
+    fn feature_flags_rollout_fifty() {
+        let mut flags = FeatureFlags::new();
+        flags.register("rollout-half", "50% rollout", true);
+        flags.set_rollout("rollout-half", 50);
+        // Users 0-49 get it, 50-99 don't (deterministic)
+        let enabled: usize = (0u64..100)
+            .filter(|&h| flags.check_rollout("rollout-half", h))
+            .count();
+        assert_eq!(enabled, 50);
+    }
+
+    #[test]
+    fn feature_flags_rollout_respects_disabled() {
+        let mut flags = FeatureFlags::new();
+        flags.register("feat", "desc", false);
+        flags.set_rollout("feat", 100);
+        // Even 100% rollout should return false when feature is disabled
+        assert!(!flags.check_rollout("feat", 0));
+    }
+
+    #[test]
+    fn feature_flags_all_flags() {
+        let mut flags = FeatureFlags::new();
+        flags.register("a", "desc a", true);
+        flags.register("b", "desc b", false);
+        let all = flags.all_flags();
+        assert_eq!(all.len(), 2);
+    }
+
+    // ── Feature #72: Vision types tests ────────────────────────────────────────
+
+    #[test]
+    fn image_source_base64_variant() {
+        let src = ImageSource::Base64 {
+            media_type: "image/png".into(),
+            data: "aGVsbG8=".into(),
+        };
+        match src {
+            ImageSource::Base64 { media_type, data } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(data, "aGVsbG8=");
+            }
+            _ => panic!("expected Base64 variant"),
+        }
+    }
+
+    #[test]
+    fn image_source_url_variant() {
+        let src = ImageSource::Url("https://example.com/img.png".into());
+        match src {
+            ImageSource::Url(url) => assert!(url.contains("example.com")),
+            _ => panic!("expected Url variant"),
+        }
+    }
+
+    #[test]
+    fn image_content_block_in_content_block_enum() {
+        let img = ImageContent {
+            source: ImageSource::Base64 {
+                media_type: "image/jpeg".into(),
+                data: "dGVzdA==".into(),
+            },
+            detail: Some("auto".into()),
+        };
+        let block = ContentBlock::Image(img);
+        // text_content should skip images
+        let resp = LlmResponse {
+            content: vec![ContentBlock::Text("hi".into()), block],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+        };
+        assert_eq!(resp.text_content(), "hi");
     }
 }

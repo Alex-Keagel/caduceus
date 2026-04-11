@@ -567,6 +567,259 @@ impl FileWatcher {
     }
 }
 
+// ── Feature #90: E2B Template Management ─────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct E2bTemplate {
+    pub id: String,
+    pub name: String,
+    pub dockerfile: Option<String>,
+    pub start_command: Option<String>,
+    pub env_vars: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct E2bInstance {
+    pub id: String,
+    pub template_id: String,
+    pub status: String,
+}
+
+#[derive(Default)]
+pub struct E2bTemplateManager {
+    templates: HashMap<String, E2bTemplate>,
+}
+
+impl E2bTemplateManager {
+    pub fn new() -> Self {
+        Self {
+            templates: HashMap::new(),
+        }
+    }
+
+    pub fn register_template(&mut self, template: E2bTemplate) {
+        self.templates.insert(template.id.clone(), template);
+    }
+
+    pub fn get_template(&self, id: &str) -> Option<&E2bTemplate> {
+        self.templates.get(id)
+    }
+
+    pub fn list_templates(&self) -> Vec<&E2bTemplate> {
+        self.templates.values().collect()
+    }
+
+    pub fn instantiate(&self, template_id: &str) -> Result<E2bInstance> {
+        if !self.templates.contains_key(template_id) {
+            return Err(CaduceusError::Tool {
+                tool: "e2b".into(),
+                message: format!("Template not found: {template_id}"),
+            });
+        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let instance_id = format!("instance-{template_id}-{ts}");
+        Ok(E2bInstance {
+            id: instance_id,
+            template_id: template_id.to_string(),
+            status: "running".to_string(),
+        })
+    }
+}
+
+// ── Feature #91: E2B Volume Management ───────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct E2bVolume {
+    pub id: String,
+    pub name: String,
+    pub size_mb: u64,
+    pub mount_path: String,
+    pub attached_to: Option<String>,
+}
+
+#[derive(Default)]
+pub struct E2bVolumeManager {
+    volumes: HashMap<String, E2bVolume>,
+}
+
+impl E2bVolumeManager {
+    pub fn new() -> Self {
+        Self {
+            volumes: HashMap::new(),
+        }
+    }
+
+    pub fn create_volume(&mut self, name: &str, size_mb: u64, mount_path: &str) -> String {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let id = format!("vol-{name}-{ts}");
+        self.volumes.insert(
+            id.clone(),
+            E2bVolume {
+                id: id.clone(),
+                name: name.to_string(),
+                size_mb,
+                mount_path: mount_path.to_string(),
+                attached_to: None,
+            },
+        );
+        id
+    }
+
+    pub fn attach(&mut self, volume_id: &str, instance_id: &str) -> Result<()> {
+        let vol = self
+            .volumes
+            .get_mut(volume_id)
+            .ok_or_else(|| CaduceusError::Tool {
+                tool: "e2b".into(),
+                message: format!("Volume not found: {volume_id}"),
+            })?;
+        if vol.attached_to.is_some() {
+            return Err(CaduceusError::Tool {
+                tool: "e2b".into(),
+                message: format!("Volume {volume_id} is already attached"),
+            });
+        }
+        vol.attached_to = Some(instance_id.to_string());
+        Ok(())
+    }
+
+    pub fn detach(&mut self, volume_id: &str) -> Result<()> {
+        let vol = self
+            .volumes
+            .get_mut(volume_id)
+            .ok_or_else(|| CaduceusError::Tool {
+                tool: "e2b".into(),
+                message: format!("Volume not found: {volume_id}"),
+            })?;
+        vol.attached_to = None;
+        Ok(())
+    }
+
+    pub fn list_volumes(&self) -> Vec<&E2bVolume> {
+        self.volumes.values().collect()
+    }
+}
+
+// ── Feature #92: E2B Network Controls ────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct E2bNetworkConfig {
+    pub allowed_ports: Vec<u16>,
+    pub cidr_allowlist: Vec<String>,
+    pub dns_servers: Vec<String>,
+    pub egress_enabled: bool,
+}
+
+impl Default for E2bNetworkConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl E2bNetworkConfig {
+    /// Default: no ports allowed, no CIDR, egress disabled.
+    pub fn new() -> Self {
+        Self {
+            allowed_ports: Vec::new(),
+            cidr_allowlist: Vec::new(),
+            dns_servers: Vec::new(),
+            egress_enabled: false,
+        }
+    }
+
+    pub fn allow_port(&mut self, port: u16) {
+        if !self.allowed_ports.contains(&port) {
+            self.allowed_ports.push(port);
+        }
+    }
+
+    pub fn add_cidr(&mut self, cidr: &str) {
+        let cidr = cidr.to_string();
+        if !self.cidr_allowlist.contains(&cidr) {
+            self.cidr_allowlist.push(cidr);
+        }
+    }
+
+    pub fn set_dns(&mut self, servers: Vec<String>) {
+        self.dns_servers = servers;
+    }
+
+    pub fn is_port_allowed(&self, port: u16) -> bool {
+        self.allowed_ports.contains(&port)
+    }
+
+    pub fn is_cidr_allowed(&self, addr: &str) -> bool {
+        if self.cidr_allowlist.is_empty() {
+            return false;
+        }
+        self.cidr_allowlist
+            .iter()
+            .any(|cidr| cidr_contains(cidr, addr))
+    }
+
+    /// Most locked-down preset: nothing allowed.
+    pub fn restrictive() -> Self {
+        Self::new()
+    }
+
+    /// All-open preset: all ports, all IPs, egress enabled.
+    pub fn permissive() -> Self {
+        Self {
+            allowed_ports: (1..=65535).collect(),
+            cidr_allowlist: vec!["0.0.0.0/0".to_string()],
+            dns_servers: vec!["8.8.8.8".to_string(), "8.8.4.4".to_string()],
+            egress_enabled: true,
+        }
+    }
+}
+
+fn parse_ipv4(addr: &str) -> Option<u32> {
+    let parts: Vec<&str> = addr.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let mut result: u32 = 0;
+    for part in parts {
+        let octet: u32 = part.parse().ok()?;
+        if octet > 255 {
+            return None;
+        }
+        result = (result << 8) | octet;
+    }
+    Some(result)
+}
+
+fn cidr_contains(cidr: &str, addr: &str) -> bool {
+    let parts: Vec<&str> = cidr.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return cidr == addr;
+    }
+    let prefix_len: u32 = match parts[1].parse() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    match (parse_ipv4(parts[0]), parse_ipv4(addr)) {
+        (Some(cidr_n), Some(target_n)) => {
+            if prefix_len == 0 {
+                return true;
+            }
+            let mask = if prefix_len >= 32 {
+                u32::MAX
+            } else {
+                !((1u32 << (32 - prefix_len)) - 1)
+            };
+            (cidr_n & mask) == (target_n & mask)
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -936,5 +1189,199 @@ mod tests {
         assert_eq!(result.exit_code, 0);
         assert!(result.stdout.contains("visible.txt"));
         assert!(!result.timed_out);
+    }
+
+    // ── E2bTemplateManager tests (#90) ───────────────────────────────────
+
+    #[test]
+    fn e2b_template_register_get_list() {
+        let mut mgr = E2bTemplateManager::new();
+        let tmpl = E2bTemplate {
+            id: "tmpl-1".to_string(),
+            name: "Test Template".to_string(),
+            dockerfile: Some("FROM ubuntu".to_string()),
+            start_command: Some("bash".to_string()),
+            env_vars: HashMap::new(),
+        };
+        mgr.register_template(tmpl);
+
+        assert!(mgr.get_template("tmpl-1").is_some());
+        assert_eq!(mgr.get_template("tmpl-1").unwrap().name, "Test Template");
+        assert_eq!(mgr.list_templates().len(), 1);
+        assert!(mgr.get_template("nonexistent").is_none());
+    }
+
+    #[test]
+    fn e2b_template_instantiate_ok() {
+        let mut mgr = E2bTemplateManager::new();
+        mgr.register_template(E2bTemplate {
+            id: "base".to_string(),
+            name: "Base".to_string(),
+            dockerfile: None,
+            start_command: None,
+            env_vars: HashMap::new(),
+        });
+
+        let inst = mgr.instantiate("base").unwrap();
+        assert_eq!(inst.template_id, "base");
+        assert_eq!(inst.status, "running");
+        assert!(!inst.id.is_empty());
+    }
+
+    #[test]
+    fn e2b_template_instantiate_missing_errors() {
+        let mgr = E2bTemplateManager::new();
+        let err = mgr.instantiate("ghost").unwrap_err().to_string();
+        assert!(err.contains("ghost") || err.contains("not found") || err.contains("Template"));
+    }
+
+    #[test]
+    fn e2b_template_list_multiple() {
+        let mut mgr = E2bTemplateManager::new();
+        for i in 0..3 {
+            mgr.register_template(E2bTemplate {
+                id: format!("t{i}"),
+                name: format!("Template {i}"),
+                dockerfile: None,
+                start_command: None,
+                env_vars: HashMap::new(),
+            });
+        }
+        assert_eq!(mgr.list_templates().len(), 3);
+    }
+
+    // ── E2bVolumeManager tests (#91) ─────────────────────────────────────
+
+    #[test]
+    fn e2b_volume_create_and_list() {
+        let mut mgr = E2bVolumeManager::new();
+        let id = mgr.create_volume("data", 512, "/mnt/data");
+        assert!(!id.is_empty());
+        let vols = mgr.list_volumes();
+        assert_eq!(vols.len(), 1);
+        assert_eq!(vols[0].name, "data");
+        assert_eq!(vols[0].size_mb, 512);
+        assert_eq!(vols[0].mount_path, "/mnt/data");
+        assert!(vols[0].attached_to.is_none());
+    }
+
+    #[test]
+    fn e2b_volume_attach_detach() {
+        let mut mgr = E2bVolumeManager::new();
+        let id = mgr.create_volume("logs", 100, "/var/log");
+        mgr.attach(&id, "inst-42").unwrap();
+
+        let vol = mgr.list_volumes()[0];
+        assert_eq!(vol.attached_to.as_deref(), Some("inst-42"));
+
+        mgr.detach(&id).unwrap();
+        let vol = mgr.list_volumes()[0];
+        assert!(vol.attached_to.is_none());
+    }
+
+    #[test]
+    fn e2b_volume_double_attach_errors() {
+        let mut mgr = E2bVolumeManager::new();
+        let id = mgr.create_volume("cache", 256, "/cache");
+        mgr.attach(&id, "inst-1").unwrap();
+        assert!(mgr.attach(&id, "inst-2").is_err());
+    }
+
+    #[test]
+    fn e2b_volume_attach_missing_errors() {
+        let mut mgr = E2bVolumeManager::new();
+        assert!(mgr.attach("nonexistent", "inst").is_err());
+    }
+
+    #[test]
+    fn e2b_volume_detach_missing_errors() {
+        let mut mgr = E2bVolumeManager::new();
+        assert!(mgr.detach("nonexistent").is_err());
+    }
+
+    // ── E2bNetworkConfig tests (#92) ─────────────────────────────────────
+
+    #[test]
+    fn e2b_network_default_denies_all() {
+        let cfg = E2bNetworkConfig::new();
+        assert!(cfg.allowed_ports.is_empty());
+        assert!(cfg.cidr_allowlist.is_empty());
+        assert!(cfg.dns_servers.is_empty());
+        assert!(!cfg.egress_enabled);
+        assert!(!cfg.is_port_allowed(80));
+        assert!(!cfg.is_cidr_allowed("10.0.0.1"));
+    }
+
+    #[test]
+    fn e2b_network_allow_port() {
+        let mut cfg = E2bNetworkConfig::new();
+        cfg.allow_port(80);
+        cfg.allow_port(443);
+        assert!(cfg.is_port_allowed(80));
+        assert!(cfg.is_port_allowed(443));
+        assert!(!cfg.is_port_allowed(8080));
+
+        // No duplicates
+        cfg.allow_port(80);
+        assert_eq!(cfg.allowed_ports.iter().filter(|&&p| p == 80).count(), 1);
+    }
+
+    #[test]
+    fn e2b_network_cidr_filtering() {
+        let mut cfg = E2bNetworkConfig::new();
+        cfg.add_cidr("192.168.1.0/24");
+
+        assert!(cfg.is_cidr_allowed("192.168.1.1"));
+        assert!(cfg.is_cidr_allowed("192.168.1.254"));
+        assert!(!cfg.is_cidr_allowed("192.168.2.1"));
+        assert!(!cfg.is_cidr_allowed("10.0.0.1"));
+
+        // No duplicates
+        cfg.add_cidr("192.168.1.0/24");
+        assert_eq!(cfg.cidr_allowlist.len(), 1);
+    }
+
+    #[test]
+    fn e2b_network_set_dns() {
+        let mut cfg = E2bNetworkConfig::new();
+        cfg.set_dns(vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]);
+        assert_eq!(cfg.dns_servers, vec!["8.8.8.8", "1.1.1.1"]);
+    }
+
+    #[test]
+    fn e2b_network_restrictive() {
+        let cfg = E2bNetworkConfig::restrictive();
+        assert!(cfg.allowed_ports.is_empty());
+        assert!(cfg.cidr_allowlist.is_empty());
+        assert!(!cfg.egress_enabled);
+        assert!(!cfg.is_port_allowed(22));
+        assert!(!cfg.is_cidr_allowed("0.0.0.0"));
+    }
+
+    #[test]
+    fn e2b_network_permissive() {
+        let cfg = E2bNetworkConfig::permissive();
+        assert!(cfg.egress_enabled);
+        assert!(cfg.is_port_allowed(22));
+        assert!(cfg.is_port_allowed(80));
+        assert!(cfg.is_port_allowed(443));
+        assert!(cfg.is_port_allowed(65535));
+        assert!(cfg.is_cidr_allowed("10.0.0.1"));
+        assert!(cfg.is_cidr_allowed("172.16.0.1"));
+        assert!(cfg.is_cidr_allowed("192.168.1.100"));
+        assert!(!cfg.dns_servers.is_empty());
+    }
+
+    #[test]
+    fn cidr_contains_slash_zero_matches_all() {
+        // 0.0.0.0/0 matches everything
+        assert!(cidr_contains("0.0.0.0/0", "1.2.3.4"));
+        assert!(cidr_contains("0.0.0.0/0", "255.255.255.255"));
+    }
+
+    #[test]
+    fn cidr_contains_slash_32_exact_match() {
+        assert!(cidr_contains("10.0.0.1/32", "10.0.0.1"));
+        assert!(!cidr_contains("10.0.0.1/32", "10.0.0.2"));
     }
 }

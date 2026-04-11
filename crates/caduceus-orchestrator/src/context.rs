@@ -232,6 +232,209 @@ pub fn estimate_tokens(text: &str) -> u32 {
     (estimate * 1.1).ceil() as u32
 }
 
+// ── Context assembly / attunement ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextSource {
+    SystemPrompt(String),
+    Instructions(String),
+    FileContext {
+        path: String,
+        content: String,
+        priority: u8,
+    },
+    GitDiff(String),
+    MemoryBank(String),
+    ConversationHistory(Vec<String>),
+    Pinned(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssembledContext {
+    pub content: String,
+    pub total_tokens: usize,
+    pub sources_included: Vec<String>,
+    pub sources_truncated: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContextAssembler {
+    pub max_tokens: usize,
+    pub sources: Vec<ContextSource>,
+}
+
+impl ContextAssembler {
+    pub fn new(max_tokens: usize) -> Self {
+        Self {
+            max_tokens,
+            sources: Vec::new(),
+        }
+    }
+
+    pub fn add_source(&mut self, source: ContextSource) {
+        self.sources.push(source);
+    }
+
+    pub fn assemble(&self) -> AssembledContext {
+        let mut indexed_sources: Vec<(usize, &ContextSource)> =
+            self.sources.iter().enumerate().collect();
+        indexed_sources.sort_by(|(left_idx, left), (right_idx, right)| {
+            context_source_order(*left_idx, left).cmp(&context_source_order(*right_idx, right))
+        });
+
+        let mut included_sections = Vec::new();
+        let mut sources_included = Vec::new();
+        let mut sources_truncated = Vec::new();
+        let mut total_tokens = 0usize;
+
+        for (_, source) in indexed_sources {
+            let label = context_source_label(source);
+            let rendered = render_context_source(source);
+            let source_tokens = Self::estimate_tokens(&rendered);
+
+            if total_tokens + source_tokens <= self.max_tokens {
+                included_sections.push(rendered);
+                sources_included.push(label);
+                total_tokens += source_tokens;
+                continue;
+            }
+
+            let remaining_tokens = self.max_tokens.saturating_sub(total_tokens);
+            let truncated = truncate_context_source(source, remaining_tokens);
+
+            if !truncated.is_empty() {
+                total_tokens += Self::estimate_tokens(&truncated);
+                included_sections.push(truncated);
+                sources_included.push(label.clone());
+            }
+
+            sources_truncated.push(label);
+        }
+
+        AssembledContext {
+            content: included_sections.join("\n\n"),
+            total_tokens,
+            sources_included,
+            sources_truncated,
+        }
+    }
+
+    pub fn estimate_tokens(text: &str) -> usize {
+        estimate_tokens(text) as usize
+    }
+}
+
+fn context_source_order(index: usize, source: &ContextSource) -> (u8, u8, usize) {
+    match source {
+        ContextSource::SystemPrompt(_) => (0, 0, index),
+        ContextSource::Instructions(_) => (1, 0, index),
+        ContextSource::Pinned(_) => (2, 0, index),
+        ContextSource::FileContext { priority, .. } => (3, u8::MAX - *priority, index),
+        ContextSource::GitDiff(_) => (4, 0, index),
+        ContextSource::MemoryBank(_) => (5, 0, index),
+        ContextSource::ConversationHistory(_) => (6, 0, index),
+    }
+}
+
+fn context_source_label(source: &ContextSource) -> String {
+    match source {
+        ContextSource::SystemPrompt(_) => "system_prompt".to_string(),
+        ContextSource::Instructions(_) => "instructions".to_string(),
+        ContextSource::FileContext { path, .. } => format!("file:{path}"),
+        ContextSource::GitDiff(_) => "git_diff".to_string(),
+        ContextSource::MemoryBank(_) => "memory_bank".to_string(),
+        ContextSource::ConversationHistory(_) => "conversation_history".to_string(),
+        ContextSource::Pinned(_) => "pinned".to_string(),
+    }
+}
+
+fn render_context_source(source: &ContextSource) -> String {
+    match source {
+        ContextSource::SystemPrompt(text) => format!("[System Prompt]\n{text}"),
+        ContextSource::Instructions(text) => format!("[Instructions]\n{text}"),
+        ContextSource::FileContext { path, content, .. } => {
+            format!("[File Context: {path}]\n{content}")
+        }
+        ContextSource::GitDiff(text) => format!("[Git Diff]\n{text}"),
+        ContextSource::MemoryBank(text) => format!("[Memory Bank]\n{text}"),
+        ContextSource::ConversationHistory(messages) => {
+            format!("[Conversation History]\n{}", messages.join("\n"))
+        }
+        ContextSource::Pinned(text) => format!("[Pinned]\n{text}"),
+    }
+}
+
+fn truncate_context_source(source: &ContextSource, remaining_tokens: usize) -> String {
+    if remaining_tokens == 0 {
+        return String::new();
+    }
+
+    match source {
+        ContextSource::ConversationHistory(messages) => {
+            let header = "[Conversation History]\n";
+            let mut lines = Vec::new();
+            let mut used_tokens = ContextAssembler::estimate_tokens(header);
+
+            for message in messages.iter().rev() {
+                let line = if lines.is_empty() {
+                    message.clone()
+                } else {
+                    format!("\n{message}")
+                };
+                let line_tokens = ContextAssembler::estimate_tokens(&line);
+                if used_tokens + line_tokens > remaining_tokens {
+                    break;
+                }
+                used_tokens += line_tokens;
+                lines.push(message.clone());
+            }
+
+            if lines.is_empty() {
+                truncate_text(&render_context_source(source), remaining_tokens)
+            } else {
+                lines.reverse();
+                format!("{header}{}", lines.join("\n"))
+            }
+        }
+        _ => truncate_text(&render_context_source(source), remaining_tokens),
+    }
+}
+
+fn truncate_text(text: &str, remaining_tokens: usize) -> String {
+    if remaining_tokens == 0 {
+        return String::new();
+    }
+
+    let max_chars = remaining_tokens.saturating_mul(4);
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut truncated_chars: Vec<char> = text.chars().collect();
+
+    if truncated_chars.len() > max_chars {
+        if max_chars == 1 {
+            return "…".to_string();
+        }
+        truncated_chars.truncate(max_chars - 1);
+        truncated_chars.push('…');
+    }
+
+    while !truncated_chars.is_empty()
+        && ContextAssembler::estimate_tokens(&truncated_chars.iter().collect::<String>())
+            > remaining_tokens
+    {
+        if truncated_chars.last() == Some(&'…') {
+            truncated_chars.pop();
+        }
+        truncated_chars.pop();
+        if !truncated_chars.is_empty() {
+            truncated_chars.push('…');
+        }
+    }
+
+    truncated_chars.into_iter().collect()
+}
+
 // ── Context manager ────────────────────────────────────────────────────────────
 
 pub struct ContextManager {
@@ -683,6 +886,69 @@ mod tests {
     #[test]
     fn estimate_tokens_empty() {
         assert_eq!(estimate_tokens(""), 0);
+    }
+
+    #[test]
+    fn assembled_context_enforces_token_budget() {
+        let mut assembler = ContextAssembler::new(18);
+        assembler.add_source(ContextSource::SystemPrompt("You are helpful.".repeat(3)));
+        assembler.add_source(ContextSource::ConversationHistory(vec![
+            "First turn".to_string(),
+            "Second turn".to_string(),
+            "Third turn".to_string(),
+        ]));
+
+        let assembled = assembler.assemble();
+
+        assert!(assembled.total_tokens <= 18);
+        assert!(!assembled.sources_included.is_empty());
+    }
+
+    #[test]
+    fn assembled_context_respects_priority_ordering() {
+        let mut assembler = ContextAssembler::new(200);
+        assembler.add_source(ContextSource::ConversationHistory(vec![
+            "recent turn".to_string()
+        ]));
+        assembler.add_source(ContextSource::FileContext {
+            path: "b.rs".to_string(),
+            content: "lower priority".to_string(),
+            priority: 1,
+        });
+        assembler.add_source(ContextSource::SystemPrompt("system".to_string()));
+        assembler.add_source(ContextSource::FileContext {
+            path: "a.rs".to_string(),
+            content: "higher priority".to_string(),
+            priority: 10,
+        });
+
+        let assembled = assembler.assemble();
+
+        assert_eq!(
+            assembled.sources_included,
+            vec![
+                "system_prompt".to_string(),
+                "file:a.rs".to_string(),
+                "file:b.rs".to_string(),
+                "conversation_history".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn assembled_context_tracks_truncation() {
+        let mut assembler = ContextAssembler::new(10);
+        assembler.add_source(ContextSource::Pinned(
+            "Pinned context is important.".repeat(2),
+        ));
+        assembler.add_source(ContextSource::GitDiff("+".repeat(200)));
+
+        let assembled = assembler.assemble();
+
+        assert!(assembled.total_tokens <= 10);
+        assert!(assembled
+            .sources_truncated
+            .contains(&"git_diff".to_string()));
     }
 
     #[test]
