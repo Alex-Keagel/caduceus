@@ -1,0 +1,149 @@
+{
+  "version": "1.0",
+  "recommended_servers": {
+    "all": [
+      {
+        "name": "filesystem",
+        "purpose": "Read and write project files safely"
+      },
+      {
+        "name": "git",
+        "purpose": "Inspect history, diffs, and branch health"
+      },
+      {
+        "name": "github",
+        "purpose": "PR, issues, workflows, and repository automation"
+      },
+      {
+        "name": "shell",
+        "purpose": "Run project-native commands, tests, and builds"
+      }
+    ],
+    "web": [
+      {
+        "name": "playwright",
+        "purpose": "Browser automation and end-to-end validation"
+      },
+      {
+        "name": "chrome-devtools",
+        "purpose": "Runtime inspection, network, and performance profiling"
+      },
+      {
+        "name": "mdn-docs",
+        "purpose": "Web standards and API reference lookups"
+      }
+    ],
+    "python": [
+      {
+        "name": "python",
+        "purpose": "Package, interpreter, and script operations"
+      },
+      {
+        "name": "pypi",
+        "purpose": "Dependency metadata and vulnerability checks"
+      },
+      {
+        "name": "jupyter",
+        "purpose": "Notebook execution and analysis workflows"
+      }
+    ],
+    "rust": [
+      {
+        "name": "cargo",
+        "purpose": "Build, test, and dependency workflow management"
+      },
+      {
+        "name": "crates-io",
+        "purpose": "Rust crate discovery and release metadata"
+      },
+      {
+        "name": "rust-analyzer",
+        "purpose": "Semantic code intelligence for Rust projects"
+      }
+    ],
+    "go": [
+      {
+        "name": "go",
+        "purpose": "Module, build, and test orchestration"
+      },
+      {
+        "name": "pkg-go-dev",
+        "purpose": "Package documentation and API lookup"
+      },
+      {
+        "name": "goreleaser",
+        "purpose": "Automated cross-platform release pipelines"
+      }
+    ],
+    "java": [
+      {
+        "name": "maven",
+        "purpose": "Dependency and lifecycle orchestration for JVM projects"
+      },
+      {
+        "name": "gradle",
+        "purpose": "Flexible build automation and multi-module support"
+      },
+      {
+        "name": "javadocs",
+        "purpose": "API discovery and framework documentation"
+      }
+    ],
+    "database": [
+      {
+        "name": "postgres",
+        "purpose": "Schema inspection, query validation, and migration checks"
+      },
+      {
+        "name": "mysql",
+        "purpose": "Relational diagnostics for MySQL-compatible systems"
+      },
+      {
+        "name": "redis",
+        "purpose": "Cache behavior and keyspace diagnostics"
+      }
+    ],
+    "cloud": [
+      {
+        "name": "aws",
+        "purpose": "Cloud resource inspection and deployment workflows"
+      },
+      {
+        "name": "azure",
+        "purpose": "Azure architecture and operational automation"
+      },
+      {
+        "name": "gcp",
+        "purpose": "GCP resource operations and service management"
+      }
+    ],
+    "monitoring": [
+      {
+        "name": "prometheus",
+        "purpose": "Metrics querying and alert rule analysis"
+      },
+      {
+        "name": "grafana",
+        "purpose": "Dashboard management and observability insights"
+      },
+      {
+        "name": "sentry",
+        "purpose": "Error tracking, triage, and incident correlation"
+      }
+    ],
+    "design": [
+      {
+        "name": "figma",
+        "purpose": "Design system inspection and spec extraction"
+      },
+      {
+        "name": "storybook",
+        "purpose": "Component documentation and visual verification"
+      },
+      {
+        "name": "contrast-checker",
+        "purpose": "Accessibility color contrast validation"
+      }
+    ]
+  }
+}
