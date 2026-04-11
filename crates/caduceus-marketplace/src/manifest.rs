@@ -20,7 +20,7 @@ pub enum Category {
 }
 
 impl Category {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "code_review" | "codereview" | "code-review" | "review" => Some(Self::CodeReview),
             "testing" | "test" => Some(Self::Testing),
@@ -36,6 +36,14 @@ impl Category {
             "deployment" | "deploy" | "infra" | "infrastructure" => Some(Self::Deployment),
             _ => None,
         }
+    }
+}
+
+impl std::str::FromStr for Category {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or(())
     }
 }
 

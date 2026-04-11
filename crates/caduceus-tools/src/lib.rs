@@ -1565,4 +1565,105 @@ mod tests {
         let result = tool.call(json!({"url": "not-a-valid-url"})).await.unwrap();
         assert!(result.is_error);
     }
+
+    #[derive(Debug)]
+    struct SlowTool {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for SlowTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "slow".into(),
+                description: "slow test tool".into(),
+                input_schema: json!({"type": "object"}),
+                required_capability: None,
+            }
+        }
+
+        async fn call(&self, _input: Value) -> Result<ToolResult> {
+            let current = self
+                .active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.peak
+                .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult::success("ok"))
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_parallel_respects_concurrency_limit() {
+        let mut registry = ToolRegistry::new();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        registry.register(Arc::new(SlowTool {
+            active: active.clone(),
+            peak: peak.clone(),
+        }));
+
+        let results = registry
+            .execute_parallel_with_limit(
+                vec![
+                    ("slow".to_string(), json!({})),
+                    ("slow".to_string(), json!({})),
+                    ("slow".to_string(), json!({})),
+                    ("slow".to_string(), json!({})),
+                ],
+                2,
+            )
+            .await;
+
+        assert_eq!(results.len(), 4);
+        assert!(results
+            .iter()
+            .all(|result| result.as_ref().is_ok_and(|tool| !tool.is_error)));
+        assert!(peak.load(std::sync::atomic::Ordering::SeqCst) <= 2);
+    }
+
+    #[tokio::test]
+    async fn apply_patch_tool_updates_file() {
+        let root = test_workspace("apply-patch");
+        std::fs::write(root.join("demo.txt"), "hello\nworld\n").unwrap();
+        let tool = ApplyPatchTool::new(&root);
+        let patch = concat!(
+            "--- a/demo.txt\n",
+            "+++ b/demo.txt\n",
+            "@@ -1,2 +1,2 @@\n",
+            " hello\n",
+            "-world\n",
+            "+caduceus\n"
+        );
+
+        let result = tool.call(json!({"patch": patch})).await.unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(root.join("demo.txt")).unwrap(),
+            "hello\ncaduceus"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn apply_patch_rejects_workspace_escape() {
+        let root = test_workspace("apply-patch-escape");
+        let tool = ApplyPatchTool::new(&root);
+        let patch = concat!(
+            "--- a/../../evil.txt\n",
+            "+++ b/../../evil.txt\n",
+            "@@ -0,0 +1 @@\n",
+            "+bad\n"
+        );
+
+        let result = tool.call(json!({"patch": patch})).await.unwrap();
+        assert!(result.is_error);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

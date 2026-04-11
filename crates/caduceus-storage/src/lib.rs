@@ -1423,4 +1423,122 @@ mod tests {
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
         assert_eq!(context_limit, 200_000);
     }
+
+    #[tokio::test]
+    async fn exports_transcript_as_jsonl() {
+        let (dir, storage) = temp_storage();
+        let state = sample_state();
+        storage.create_session(&state).await.unwrap();
+        storage
+            .save_message(&state.id, &LlmMessage::user("hello"), Some(5))
+            .await
+            .unwrap();
+        storage
+            .save_message(
+                &state.id,
+                &LlmMessage {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: ToolCallId::new("tool-123"),
+                        name: "bash".into(),
+                        input: serde_json::json!({"command":"pwd"}),
+                    }],
+                },
+                Some(8),
+            )
+            .await
+            .unwrap();
+
+        let export_path = dir.path().join("transcript.jsonl");
+        storage
+            .export_transcript(&state.id, &export_path)
+            .await
+            .unwrap();
+        let lines: Vec<_> = std::fs::read_to_string(export_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect();
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["role"], "user");
+        assert_eq!(lines[1]["tool_call_id"], "tool-123");
+    }
+
+    #[tokio::test]
+    async fn resume_session_returns_state_and_history() {
+        let (_dir, storage) = temp_storage();
+        let state = sample_state();
+        storage.create_session(&state).await.unwrap();
+        storage
+            .save_message(&state.id, &LlmMessage::user("hello"), Some(3))
+            .await
+            .unwrap();
+
+        let resumed = storage.resume_session(&state.id).await.unwrap();
+        assert_eq!(resumed.state.id.to_string(), state.id.to_string());
+        assert_eq!(resumed.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recovers_crashed_sessions_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("recovery.sqlite3");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let mut state = sample_state();
+        state.phase = SessionPhase::Running;
+        storage.create_session(&state).await.unwrap();
+        drop(storage);
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        let loaded = reopened.load_session(&state.id).await.unwrap().unwrap();
+        assert!(matches!(loaded.phase, SessionPhase::Error));
+        let messages = reopened.list_messages(&state.id).await.unwrap();
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message.message.role, Role::System)));
+    }
+
+    #[tokio::test]
+    async fn memory_crud_round_trips() {
+        let (_dir, storage) = temp_storage();
+        storage
+            .set_memory("project", "summary", "important fact", "test")
+            .await
+            .unwrap();
+        storage
+            .set_memory("global", "version", "1", "test")
+            .await
+            .unwrap();
+
+        let record = storage
+            .get_memory("project", "summary")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.value, "important fact");
+
+        let all = storage.list_memories(None).await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        storage.delete_memory("project", "summary").await.unwrap();
+        assert!(storage
+            .get_memory("project", "summary")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_store_round_trips_api_keys() {
+        let (_dir, storage) = temp_storage();
+        let provider = ProviderId::new("openai");
+        storage.set_api_key(&provider, "secret").await.unwrap();
+        assert_eq!(
+            storage.get_api_key(&provider).await.unwrap().as_deref(),
+            Some("secret")
+        );
+        storage.delete_api_key(&provider).await.unwrap();
+        assert!(storage.get_api_key(&provider).await.unwrap().is_none());
+    }
 }

@@ -554,7 +554,7 @@ async fn marketplace_search(query: String) -> Result<MarketplaceSearchResponse, 
         skills: BuiltinCatalog::skills()
             .into_iter()
             .filter(|skill| {
-                matches_catalog_entry(&skill.name, skill.description, skill.triggers, &query)
+                matches_catalog_entry(skill.name, skill.description, skill.triggers, &query)
             })
             .map(|skill| MarketplaceItem {
                 kind: "skill".to_string(),
@@ -567,7 +567,7 @@ async fn marketplace_search(query: String) -> Result<MarketplaceSearchResponse, 
         agents: BuiltinCatalog::agents()
             .into_iter()
             .filter(|agent| {
-                matches_catalog_entry(&agent.name, agent.description, agent.triggers, &query)
+                matches_catalog_entry(agent.name, agent.description, agent.triggers, &query)
             })
             .map(|agent| MarketplaceItem {
                 kind: "agent".to_string(),
