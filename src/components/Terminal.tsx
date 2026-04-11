@@ -1,98 +1,114 @@
-import { useEffect, useRef, useCallback } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { listenPtyData, ptyWrite } from "../api/tauri";
+import { listenPtyData, ptyClose, ptyCreate, ptyResize, ptyWrite } from "../api/tauri";
 import type { TerminalTab } from "../types";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import type { ThemeDefinition } from "../theme";
 import "@xterm/xterm/css/xterm.css";
 
 interface TerminalProps {
   tabs: TerminalTab[];
   activeTabId: string;
-  sessionId: string | null;
   onTabChange: (id: string) => void;
   onTabClose: (id: string) => void;
   onNewTab: () => void;
+  terminalTheme: ThemeDefinition["terminal"];
 }
 
-const CATPPUCCIN_THEME = {
-  background: "#1e1e2e",
-  foreground: "#cdd6f4",
-  cursor: "#f5e0dc",
-  selectionBackground: "#45475a",
-  black: "#45475a",
-  red: "#f38ba8",
-  green: "#a6e3a1",
-  yellow: "#f9e2af",
-  blue: "#89b4fa",
-  magenta: "#cba6f7",
-  cyan: "#89dceb",
-  white: "#bac2de",
-};
+interface TerminalInstance {
+  term: XTerm;
+  fit: FitAddon;
+  ptyId?: string;
+  element?: HTMLDivElement;
+}
+
+function decodeBase64(value: string): string {
+  const binary = window.atob(value);
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
 
 export default function Terminal({
   tabs,
   activeTabId,
-  sessionId,
   onTabChange,
   onTabClose,
   onNewTab,
+  terminalTheme,
 }: TerminalProps) {
-  const termInstances = useRef<Map<string, { term: XTerm; fit: FitAddon }>>(new Map());
+  const termInstances = useRef<Map<string, TerminalInstance>>(new Map());
   const initializedTabs = useRef<Set<string>>(new Set());
-  const sessionIdRef = useRef<string | null>(sessionId);
   const activeTabIdRef = useRef<string>(activeTabId);
-
-  useEffect(() => {
-    sessionIdRef.current = sessionId;
-  }, [sessionId]);
 
   useEffect(() => {
     activeTabIdRef.current = activeTabId;
   }, [activeTabId]);
 
-  const initTab = useCallback((tabId: string, el: HTMLDivElement) => {
-    if (initializedTabs.current.has(tabId)) return;
-    initializedTabs.current.add(tabId);
-
-    const term = new XTerm({
-      theme: CATPPUCCIN_THEME,
-      fontFamily: '"JetBrains Mono", "Fira Code", monospace',
-      fontSize: 13,
-      cursorBlink: true,
-      scrollback: 10000,
-    });
-
-    const fitAddon = new FitAddon();
-    term.loadAddon(fitAddon);
-
-    try {
-      const webglAddon = new WebglAddon();
-      term.loadAddon(webglAddon);
-    } catch {
-      // WebGL not available
-    }
-
-    term.open(el);
-    fitAddon.fit();
-
-    term.onData((data) => {
-      if (sessionIdRef.current) {
-        ptyWrite(sessionIdRef.current, data).catch(console.error);
+  const initTab = useCallback(
+    async (tabId: string, element: HTMLDivElement) => {
+      if (initializedTabs.current.has(tabId)) {
+        const instance = termInstances.current.get(tabId);
+        if (instance) {
+          instance.element = element;
+        }
+        return;
       }
+      initializedTabs.current.add(tabId);
+
+      const term = new XTerm({
+        theme: terminalTheme,
+        fontFamily: '"JetBrains Mono", "Fira Code", monospace',
+        fontSize: 13,
+        cursorBlink: true,
+        scrollback: 10000,
+      });
+      const fitAddon = new FitAddon();
+      term.loadAddon(fitAddon);
+
+      try {
+        term.loadAddon(new WebglAddon());
+      } catch {
+        // Ignore WebGL failures.
+      }
+
+      term.open(element);
+      fitAddon.fit();
+
+      const response = await ptyCreate(term.cols, term.rows);
+      const instance: TerminalInstance = { term, fit: fitAddon, ptyId: response.pty_id, element };
+
+      term.onData((data) => {
+        if (!instance.ptyId) return;
+        void ptyWrite(instance.ptyId, data);
+      });
+
+      termInstances.current.set(tabId, instance);
+      if (instance.ptyId) {
+        void ptyResize(instance.ptyId, term.cols, term.rows);
+      }
+    },
+    [terminalTheme]
+  );
+
+  useEffect(() => {
+    termInstances.current.forEach((instance) => {
+      instance.term.options.theme = terminalTheme;
+      instance.term.refresh(0, instance.term.rows - 1);
     });
+  }, [terminalTheme]);
 
-    termInstances.current.set(tabId, { term, fit: fitAddon });
-  }, []);
-
-  // Listen for PTY data
   useEffect(() => {
     let unlisten: UnlistenFn | null = null;
-    listenPtyData((payload) => {
-      if (payload.session_id !== sessionIdRef.current) return;
-      const inst = termInstances.current.get(activeTabIdRef.current);
-      if (inst) inst.term.write(payload.data);
+    void listenPtyData((payload) => {
+      const decoded = decodeBase64(payload.data);
+      for (const instance of termInstances.current.values()) {
+        if (instance.ptyId === payload.pty_id) {
+          instance.term.write(decoded);
+          break;
+        }
+      }
     }).then((fn) => {
       unlisten = fn;
     });
@@ -101,34 +117,56 @@ export default function Terminal({
     };
   }, []);
 
-  // ResizeObserver for active tab
   useEffect(() => {
-    const inst = termInstances.current.get(activeTabId);
-    if (!inst) return;
+    const tabIds = new Set(tabs.map((tab) => tab.id));
+    const removed = Array.from(termInstances.current.entries()).filter(([tabId]) => !tabIds.has(tabId));
+    removed.forEach(([tabId, instance]) => {
+      if (instance.ptyId) {
+        void ptyClose(instance.ptyId);
+      }
+      instance.term.dispose();
+      termInstances.current.delete(tabId);
+      initializedTabs.current.delete(tabId);
+    });
+  }, [tabs]);
 
-    inst.fit.fit();
+  useEffect(() => {
+    const instance = termInstances.current.get(activeTabId);
+    if (!instance) return;
 
-    const container = inst.term.element?.parentElement;
+    instance.fit.fit();
+    if (instance.ptyId) {
+      void ptyResize(instance.ptyId, instance.term.cols, instance.term.rows);
+    }
+
+    const container = instance.element;
     if (!container) return;
 
-    const ro = new ResizeObserver(() => {
-      inst.fit.fit();
+    const observer = new ResizeObserver(() => {
+      instance.fit.fit();
+      if (instance.ptyId) {
+        void ptyResize(instance.ptyId, instance.term.cols, instance.term.rows);
+      }
     });
-    ro.observe(container);
-    return () => ro.disconnect();
+    observer.observe(container);
+    return () => observer.disconnect();
   }, [activeTabId]);
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
-      termInstances.current.forEach((inst) => inst.term.dispose());
+      termInstances.current.forEach((instance) => {
+        if (instance.ptyId) {
+          void ptyClose(instance.ptyId);
+        }
+        instance.term.dispose();
+      });
       termInstances.current.clear();
       initializedTabs.current.clear();
     };
   }, []);
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+    <div className="terminal-shell">
       <div className="terminal-tabs">
         {tabs.map((tab) => (
           <div
@@ -137,17 +175,17 @@ export default function Terminal({
             onClick={() => onTabChange(tab.id)}
           >
             {tab.title}
-            {tabs.length > 1 && (
+            {tabs.length > 1 ? (
               <span
                 className="terminal-tab-close"
-                onClick={(e) => {
-                  e.stopPropagation();
+                onClick={(event) => {
+                  event.stopPropagation();
                   onTabClose(tab.id);
                 }}
               >
                 ✕
               </span>
-            )}
+            ) : null}
           </div>
         ))}
         <div className="terminal-tab-new" onClick={onNewTab}>
@@ -158,13 +196,12 @@ export default function Terminal({
       {tabs.map((tab) => (
         <div
           key={tab.id}
-          style={{
-            flex: 1,
-            overflow: "hidden",
-            display: tab.id === activeTabId ? "block" : "none",
-          }}
-          ref={(el) => {
-            if (el) initTab(tab.id, el);
+          className="terminal-stage"
+          style={{ display: tab.id === activeTabId ? "block" : "none" }}
+          ref={(element) => {
+            if (element) {
+              void initTab(tab.id, element);
+            }
           }}
         />
       ))}

@@ -47,6 +47,20 @@ pub struct CommitInfo {
     pub date: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BranchFreshness {
+    pub branch: String,
+    pub upstream: String,
+    pub ahead: usize,
+    pub behind: usize,
+}
+
+impl BranchFreshness {
+    pub fn is_stale(&self) -> bool {
+        self.behind > 0
+    }
+}
+
 pub struct GitRepo {
     inner: git2::Repository,
 }
@@ -84,6 +98,58 @@ impl GitRepo {
             let sha = oid.to_string();
             Ok(format!("HEAD ({})", &sha[..7.min(sha.len())]))
         }
+    }
+
+    pub fn check_freshness(&self) -> Result<Option<BranchFreshness>> {
+        let head = self
+            .inner
+            .head()
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("git head: {e}")))?;
+        if !head.is_branch() {
+            return Ok(None);
+        }
+
+        let branch_name = head
+            .shorthand()
+            .ok_or_else(|| CaduceusError::Other(anyhow::anyhow!("missing branch shorthand")))?;
+        let local_branch = self
+            .inner
+            .find_branch(branch_name, git2::BranchType::Local)
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("find branch: {e}")))?;
+        let upstream = match local_branch.upstream() {
+            Ok(branch) => branch,
+            Err(err) if err.code() == git2::ErrorCode::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(CaduceusError::Other(anyhow::anyhow!(
+                    "find upstream branch: {err}"
+                )))
+            }
+        };
+
+        let local_oid = local_branch
+            .get()
+            .target()
+            .ok_or_else(|| CaduceusError::Other(anyhow::anyhow!("missing local branch target")))?;
+        let upstream_oid = upstream
+            .get()
+            .target()
+            .ok_or_else(|| CaduceusError::Other(anyhow::anyhow!("missing upstream target")))?;
+        let (ahead, behind) = self
+            .inner
+            .graph_ahead_behind(local_oid, upstream_oid)
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("graph ahead/behind: {e}")))?;
+
+        Ok(Some(BranchFreshness {
+            branch: branch_name.to_string(),
+            upstream: upstream
+                .name()
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .to_string(),
+            ahead,
+            behind,
+        }))
     }
 
     /// Returns the last `n` commits from HEAD.
@@ -296,6 +362,8 @@ impl GitRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
 
     fn make_temp_repo() -> (tempfile::TempDir, GitRepo) {
         let dir = tempfile::tempdir().unwrap();
@@ -322,6 +390,93 @@ mod tests {
 
         let git_repo = GitRepo::open(dir.path()).expect("open temp repo");
         (dir, git_repo)
+    }
+
+    fn commit_file(
+        repo: &git2::Repository,
+        repo_root: &Path,
+        path: &str,
+        content: &str,
+        message: &str,
+    ) {
+        fs::write(repo_root.join(path), content).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(path)).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = repo.signature().unwrap();
+        let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
+            .unwrap();
+    }
+
+    fn setup_remote_tracking_repo() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        GitRepo,
+        git2::Repository,
+        String,
+    ) {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let _remote_repo = git2::Repository::init_bare(remote_dir.path()).unwrap();
+
+        let seed_dir = tempfile::tempdir().unwrap();
+        let seed_repo = git2::Repository::init(seed_dir.path()).unwrap();
+        let mut seed_config = seed_repo.config().unwrap();
+        seed_config.set_str("user.name", "Test User").unwrap();
+        seed_config
+            .set_str("user.email", "test@example.com")
+            .unwrap();
+        commit_file(
+            &seed_repo,
+            seed_dir.path(),
+            "README.md",
+            "# Seed Repo\n",
+            "Initial commit",
+        );
+        let branch = seed_repo.head().unwrap().shorthand().unwrap().to_string();
+        if seed_repo.find_remote("origin").is_err() {
+            seed_repo
+                .remote("origin", remote_dir.path().to_str().unwrap())
+                .unwrap();
+        }
+        let mut push_remote = seed_repo.find_remote("origin").unwrap();
+        push_remote
+            .push(&[format!("refs/heads/{0}:refs/heads/{0}", branch)], None)
+            .unwrap();
+
+        let local_dir = tempfile::tempdir().unwrap();
+        let local_repo = git2::build::RepoBuilder::new()
+            .clone(remote_dir.path().to_str().unwrap(), local_dir.path())
+            .unwrap();
+        let mut local_config = local_repo.config().unwrap();
+        local_config.set_str("user.name", "Test User").unwrap();
+        local_config
+            .set_str("user.email", "test@example.com")
+            .unwrap();
+
+        let updater_dir = tempfile::tempdir().unwrap();
+        let updater_repo = git2::build::RepoBuilder::new()
+            .clone(remote_dir.path().to_str().unwrap(), updater_dir.path())
+            .unwrap();
+        let mut updater_config = updater_repo.config().unwrap();
+        updater_config.set_str("user.name", "Test User").unwrap();
+        updater_config
+            .set_str("user.email", "test@example.com")
+            .unwrap();
+
+        let git_repo = GitRepo::open(local_dir.path()).expect("open local clone");
+        (
+            remote_dir,
+            local_dir,
+            updater_dir,
+            git_repo,
+            updater_repo,
+            branch,
+        )
     }
 
     #[test]
@@ -402,5 +557,38 @@ mod tests {
         };
         let json = serde_json::to_string(&cr).expect("serialize");
         assert!(json.contains("abc123"));
+    }
+
+    #[test]
+    fn check_freshness_returns_none_without_upstream() {
+        let (_dir, repo) = make_temp_repo();
+        assert_eq!(repo.check_freshness().unwrap(), None);
+    }
+
+    #[test]
+    fn check_freshness_detects_stale_branch() {
+        let (_remote_dir, local_dir, updater_dir, repo, updater_repo, branch) =
+            setup_remote_tracking_repo();
+
+        commit_file(
+            &updater_repo,
+            updater_dir.path(),
+            "CHANGELOG.md",
+            "new line\n",
+            "Remote update",
+        );
+        let mut updater_remote = updater_repo.find_remote("origin").unwrap();
+        updater_remote
+            .push(&[format!("refs/heads/{0}:refs/heads/{0}", branch)], None)
+            .unwrap();
+
+        let local_repo = git2::Repository::open(local_dir.path()).unwrap();
+        let mut local_remote = local_repo.find_remote("origin").unwrap();
+        local_remote.fetch(&[&branch], None, None).unwrap();
+
+        let freshness = repo.check_freshness().unwrap().unwrap();
+        assert!(freshness.is_stale());
+        assert_eq!(freshness.behind, 1);
+        assert_eq!(freshness.ahead, 0);
     }
 }

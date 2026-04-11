@@ -1,4 +1,4 @@
-import { useMemo, useReducer, useRef } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import Terminal from "./components/Terminal";
 import Chat, { type ChatHandle } from "./components/Chat";
 import GitPanel from "./components/GitPanel";
@@ -7,21 +7,33 @@ import CommandPalette from "./components/CommandPalette";
 import MarketplacePanel from "./components/MarketplacePanel";
 import KanbanBoard from "./components/KanbanBoard";
 import KeybindingSettings from "./components/KeybindingSettings";
+import ThemePicker from "./components/ThemePicker";
+import SplitPane from "./components/SplitPane";
+import AgentsWindow, { type AgentWindowTab } from "./components/AgentsWindow";
+import DesktopNotifications from "./components/DesktopNotifications";
 import { useKeybindings } from "./hooks/useKeybindings";
+import { applyTheme, getTheme, loadStoredTheme, type ThemeName } from "./theme";
 import type {
+  KanbanBoard as KanbanBoardData,
+  ProjectScanResult,
   SessionInfo,
   SessionPhase,
-  TokenUsage,
-  ProjectScanResult,
   TerminalTab,
-  KanbanBoard as KanbanBoardData,
+  TokenUsage,
 } from "./types";
 
+interface AgentWorkspace {
+  id: string;
+  title: string;
+  session: SessionInfo | null;
+  terminalTabs: TerminalTab[];
+  activeTerminalTabId: string;
+  status: AgentWindowTab["status"];
+}
+
 interface AppState {
-  sessions: SessionInfo[];
-  activeSessionId: string | null;
-  tabs: TerminalTab[];
-  activeTabId: string;
+  workspaces: AgentWorkspace[];
+  activeWorkspaceId: string;
   commandPaletteOpen: boolean;
   marketplaceOpen: boolean;
   kanbanOpen: boolean;
@@ -35,11 +47,15 @@ interface AppState {
 }
 
 type AppAction =
-  | { type: "ADD_SESSION"; session: SessionInfo }
-  | { type: "SET_ACTIVE_SESSION"; sessionId: string | null }
-  | { type: "NEW_TAB" }
-  | { type: "CLOSE_TAB"; tabId: string }
-  | { type: "SET_ACTIVE_TAB"; tabId: string }
+  | { type: "ADD_WORKSPACE" }
+  | { type: "CLOSE_WORKSPACE"; workspaceId: string }
+  | { type: "RENAME_WORKSPACE"; workspaceId: string; title: string }
+  | { type: "SET_ACTIVE_WORKSPACE"; workspaceId: string }
+  | { type: "SET_WORKSPACE_SESSION"; workspaceId: string; session: SessionInfo }
+  | { type: "SET_WORKSPACE_PHASE"; workspaceId: string; phase: SessionPhase }
+  | { type: "NEW_TERMINAL_TAB"; workspaceId: string }
+  | { type: "CLOSE_TERMINAL_TAB"; workspaceId: string; tabId: string }
+  | { type: "SET_ACTIVE_TERMINAL_TAB"; workspaceId: string; tabId: string }
   | { type: "TOGGLE_COMMAND_PALETTE" }
   | { type: "CLOSE_COMMAND_PALETTE" }
   | { type: "TOGGLE_MARKETPLACE" }
@@ -56,13 +72,33 @@ type AppAction =
   | { type: "SET_TOKEN_USAGE"; usage: TokenUsage }
   | { type: "SET_PROJECT_CONTEXT"; context: ProjectScanResult };
 
-const initialTab: TerminalTab = { id: "tab-1", title: "Terminal 1" };
+let workspaceCounter = 1;
+let terminalCounter = 1;
+
+function createTerminalTab(): TerminalTab {
+  return { id: `terminal-${terminalCounter}`, title: `Terminal ${terminalCounter}` };
+}
+
+function createWorkspace(): AgentWorkspace {
+  const terminalTab = createTerminalTab();
+  const workspace = {
+    id: `agent-${workspaceCounter}`,
+    title: `Agent ${workspaceCounter}`,
+    session: null,
+    terminalTabs: [terminalTab],
+    activeTerminalTabId: terminalTab.id,
+    status: "idle" as const,
+  };
+  workspaceCounter += 1;
+  terminalCounter += 1;
+  return workspace;
+}
+
+const initialWorkspace = createWorkspace();
 
 const initialState: AppState = {
-  sessions: [],
-  activeSessionId: null,
-  tabs: [initialTab],
-  activeTabId: initialTab.id,
+  workspaces: [initialWorkspace],
+  activeWorkspaceId: initialWorkspace.id,
   commandPaletteOpen: false,
   marketplaceOpen: false,
   kanbanOpen: false,
@@ -75,35 +111,122 @@ const initialState: AppState = {
   kanbanBoard: null,
 };
 
-let tabCounter = 1;
+function statusFromPhase(phase: SessionPhase): AgentWindowTab["status"] {
+  switch (phase) {
+    case "Running":
+    case "AwaitingPermission":
+      return "running";
+    case "Error":
+      return "error";
+    case "Completed":
+      return "complete";
+    default:
+      return "idle";
+  }
+}
 
 function reducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
-    case "ADD_SESSION":
+    case "ADD_WORKSPACE": {
+      const workspace = createWorkspace();
       return {
         ...state,
-        sessions: [...state.sessions, action.session],
-        activeSessionId: action.session.id,
-        phase: action.session.phase,
+        workspaces: [...state.workspaces, workspace],
+        activeWorkspaceId: workspace.id,
       };
-    case "SET_ACTIVE_SESSION":
-      return { ...state, activeSessionId: action.sessionId };
-    case "NEW_TAB": {
-      tabCounter += 1;
-      const newTab: TerminalTab = { id: `tab-${tabCounter}`, title: `Terminal ${tabCounter}` };
-      return { ...state, tabs: [...state.tabs, newTab], activeTabId: newTab.id };
     }
-    case "CLOSE_TAB": {
-      const remaining = state.tabs.filter((t) => t.id !== action.tabId);
-      if (remaining.length === 0) return state;
-      const newActive =
-        state.activeTabId === action.tabId
-          ? remaining[remaining.length - 1].id
-          : state.activeTabId;
-      return { ...state, tabs: remaining, activeTabId: newActive };
+    case "CLOSE_WORKSPACE": {
+      if (state.workspaces.length === 1) {
+        return state;
+      }
+      const remaining = state.workspaces.filter((workspace) => workspace.id !== action.workspaceId);
+      const activeWorkspaceId =
+        state.activeWorkspaceId === action.workspaceId ? remaining[remaining.length - 1].id : state.activeWorkspaceId;
+      return { ...state, workspaces: remaining, activeWorkspaceId };
     }
-    case "SET_ACTIVE_TAB":
-      return { ...state, activeTabId: action.tabId };
+    case "RENAME_WORKSPACE":
+      return {
+        ...state,
+        workspaces: state.workspaces.map((workspace) =>
+          workspace.id === action.workspaceId ? { ...workspace, title: action.title } : workspace
+        ),
+      };
+    case "SET_ACTIVE_WORKSPACE":
+      return { ...state, activeWorkspaceId: action.workspaceId };
+    case "SET_WORKSPACE_SESSION":
+      return {
+        ...state,
+        phase: action.session.phase,
+        workspaces: state.workspaces.map((workspace) =>
+          workspace.id === action.workspaceId
+            ? {
+                ...workspace,
+                title: workspace.title.startsWith("Agent ")
+                  ? action.session.project_root.split("/").pop() || workspace.title
+                  : workspace.title,
+                session: action.session,
+                status: statusFromPhase(action.session.phase),
+              }
+            : workspace
+        ),
+      };
+    case "SET_WORKSPACE_PHASE":
+      return {
+        ...state,
+        phase: action.phase,
+        workspaces: state.workspaces.map((workspace) =>
+          workspace.id === action.workspaceId
+            ? {
+                ...workspace,
+                status: statusFromPhase(action.phase),
+                session: workspace.session ? { ...workspace.session, phase: action.phase } : null,
+              }
+            : workspace
+        ),
+      };
+    case "NEW_TERMINAL_TAB": {
+      terminalCounter += 1;
+      const newTab: TerminalTab = { id: `terminal-${terminalCounter}`, title: `Terminal ${terminalCounter}` };
+      return {
+        ...state,
+        workspaces: state.workspaces.map((workspace) =>
+          workspace.id === action.workspaceId
+            ? {
+                ...workspace,
+                terminalTabs: [...workspace.terminalTabs, newTab],
+                activeTerminalTabId: newTab.id,
+              }
+            : workspace
+        ),
+      };
+    }
+    case "CLOSE_TERMINAL_TAB":
+      return {
+        ...state,
+        workspaces: state.workspaces.map((workspace) => {
+          if (workspace.id !== action.workspaceId || workspace.terminalTabs.length === 1) {
+            return workspace;
+          }
+          const remaining = workspace.terminalTabs.filter((tab) => tab.id !== action.tabId);
+          return {
+            ...workspace,
+            terminalTabs: remaining,
+            activeTerminalTabId:
+              workspace.activeTerminalTabId === action.tabId
+                ? remaining[remaining.length - 1].id
+                : workspace.activeTerminalTabId,
+          };
+        }),
+      };
+    case "SET_ACTIVE_TERMINAL_TAB":
+      return {
+        ...state,
+        workspaces: state.workspaces.map((workspace) =>
+          workspace.id === action.workspaceId
+            ? { ...workspace, activeTerminalTabId: action.tabId }
+            : workspace
+        ),
+      };
     case "TOGGLE_COMMAND_PALETTE":
       return { ...state, commandPaletteOpen: !state.commandPaletteOpen };
     case "CLOSE_COMMAND_PALETTE":
@@ -125,9 +248,7 @@ function reducer(state: AppState, action: AppAction): AppState {
     case "CLOSE_KANBAN":
       return { ...state, kanbanOpen: false };
     case "TOGGLE_KANBAN":
-      return state.kanbanBoard
-        ? { ...state, kanbanOpen: !state.kanbanOpen, marketplaceOpen: false }
-        : state;
+      return state.kanbanBoard ? { ...state, kanbanOpen: !state.kanbanOpen, marketplaceOpen: false } : state;
     case "SET_KANBAN_BOARD":
       return { ...state, kanbanBoard: action.board };
     case "SET_PHASE":
@@ -141,16 +262,28 @@ function reducer(state: AppState, action: AppAction): AppState {
 
 function App() {
   const [state, dispatch] = useReducer(reducer, initialState);
+  const [themeName, setThemeName] = useState<ThemeName>(loadStoredTheme());
   const chatRef = useRef<ChatHandle>(null);
   const terminalRegionRef = useRef<HTMLDivElement>(null);
 
-  const activeSession = state.sessions.find((s) => s.id === state.activeSessionId) ?? null;
+  useEffect(() => {
+    applyTheme(themeName);
+  }, [themeName]);
+
+  const theme = useMemo(() => getTheme(themeName), [themeName]);
+  const activeWorkspace = state.workspaces.find((workspace) => workspace.id === state.activeWorkspaceId) ?? state.workspaces[0];
+  const activeSession = activeWorkspace?.session ?? null;
 
   const keybindingActions = useMemo<Record<string, () => void>>(
     () => ({
       command_palette: () => dispatch({ type: "TOGGLE_COMMAND_PALETTE" }),
-      new_terminal_tab: () => dispatch({ type: "NEW_TAB" }),
-      close_tab: () => dispatch({ type: "CLOSE_TAB", tabId: state.activeTabId }),
+      new_terminal_tab: () => dispatch({ type: "NEW_TERMINAL_TAB", workspaceId: activeWorkspace.id }),
+      close_tab: () =>
+        dispatch({
+          type: "CLOSE_TERMINAL_TAB",
+          workspaceId: activeWorkspace.id,
+          tabId: activeWorkspace.activeTerminalTabId,
+        }),
       split_horizontal: () => {},
       split_vertical: () => {},
       toggle_chat: () => dispatch({ type: "TOGGLE_CHAT" }),
@@ -164,16 +297,28 @@ function App() {
       focus_terminal: () => terminalRegionRef.current?.focus(),
       focus_chat: () => chatRef.current?.focusInput(),
       next_tab: () => {
-        if (state.tabs.length <= 1) return;
-        const currentIndex = state.tabs.findIndex((tab) => tab.id === state.activeTabId);
-        const nextIndex = (currentIndex + 1) % state.tabs.length;
-        dispatch({ type: "SET_ACTIVE_TAB", tabId: state.tabs[nextIndex].id });
+        if (activeWorkspace.terminalTabs.length <= 1) return;
+        const currentIndex = activeWorkspace.terminalTabs.findIndex(
+          (tab) => tab.id === activeWorkspace.activeTerminalTabId
+        );
+        const nextIndex = (currentIndex + 1) % activeWorkspace.terminalTabs.length;
+        dispatch({
+          type: "SET_ACTIVE_TERMINAL_TAB",
+          workspaceId: activeWorkspace.id,
+          tabId: activeWorkspace.terminalTabs[nextIndex].id,
+        });
       },
       prev_tab: () => {
-        if (state.tabs.length <= 1) return;
-        const currentIndex = state.tabs.findIndex((tab) => tab.id === state.activeTabId);
-        const nextIndex = (currentIndex - 1 + state.tabs.length) % state.tabs.length;
-        dispatch({ type: "SET_ACTIVE_TAB", tabId: state.tabs[nextIndex].id });
+        if (activeWorkspace.terminalTabs.length <= 1) return;
+        const currentIndex = activeWorkspace.terminalTabs.findIndex(
+          (tab) => tab.id === activeWorkspace.activeTerminalTabId
+        );
+        const nextIndex = (currentIndex - 1 + activeWorkspace.terminalTabs.length) % activeWorkspace.terminalTabs.length;
+        dispatch({
+          type: "SET_ACTIVE_TERMINAL_TAB",
+          workspaceId: activeWorkspace.id,
+          tabId: activeWorkspace.terminalTabs[nextIndex].id,
+        });
       },
       search_files: () => dispatch({ type: "TOGGLE_COMMAND_PALETTE" }),
       quick_open: () => dispatch({ type: "TOGGLE_COMMAND_PALETTE" }),
@@ -181,7 +326,7 @@ function App() {
       switch_mode: () => dispatch({ type: "TOGGLE_MARKETPLACE" }),
       checkpoint: () => chatRef.current?.sendRaw("/checkpoint create"),
     }),
-    [state.activeTabId, state.tabs]
+    [activeWorkspace]
   );
 
   const { reload } = useKeybindings(keybindingActions);
@@ -190,111 +335,122 @@ function App() {
     ? "Browse marketplace entries"
     : state.kanbanOpen
       ? "Kanban board"
-      : "Terminal + project workspace";
+      : "Parallel agent tabs with independent terminals and chat";
 
-  const workspaceButtonLabel = state.marketplaceOpen ? "Back to Terminal" : "Open Marketplace";
-  const canOpenKanban = state.kanbanBoard !== null;
+  const workspaceTabs = state.workspaces.map<AgentWindowTab>((workspace) => ({
+    id: workspace.id,
+    title: workspace.title,
+    status: workspace.status,
+    subtitle: workspace.session?.model_id ?? "New session",
+  }));
 
-  const handleKanbanToggle = () => {
-    if (state.kanbanOpen) {
-      dispatch({ type: "CLOSE_KANBAN" });
-    } else if (state.kanbanBoard) {
-      dispatch({ type: "OPEN_KANBAN", board: state.kanbanBoard });
-    }
-  };
+  const terminalPanels = state.workspaces.map((workspace) => (
+    <div
+      key={workspace.id}
+      style={{
+        display: workspace.id === activeWorkspace.id ? "flex" : "none",
+        flex: 1,
+        minHeight: 0,
+      }}
+    >
+      <Terminal
+        tabs={workspace.terminalTabs}
+        activeTabId={workspace.activeTerminalTabId}
+        onTabChange={(tabId) => dispatch({ type: "SET_ACTIVE_TERMINAL_TAB", workspaceId: workspace.id, tabId })}
+        onTabClose={(tabId) => dispatch({ type: "CLOSE_TERMINAL_TAB", workspaceId: workspace.id, tabId })}
+        onNewTab={() => dispatch({ type: "NEW_TERMINAL_TAB", workspaceId: workspace.id })}
+        terminalTheme={theme.terminal}
+      />
+    </div>
+  ));
 
-  const gridColumns = `${state.gitPanelOpen ? "240px" : "0px"} 1fr ${state.chatOpen ? "320px" : "0px"}`;
+  const workspaceContent = state.marketplaceOpen ? (
+    <MarketplacePanel />
+  ) : state.kanbanOpen ? (
+    <KanbanBoard board={state.kanbanBoard} />
+  ) : (
+    terminalPanels
+  );
+
+  const centerPane = (
+    <main className="workspace-main" ref={terminalRegionRef} tabIndex={-1}>
+      <div className="workspace-toolbar">
+        <div>
+          <div className="workspace-title">Workspace</div>
+          <div className="workspace-subtitle">{workspaceSubtitle}</div>
+        </div>
+        <div className="workspace-toolbar__controls">
+          <ThemePicker value={themeName} onChange={setThemeName} />
+          <button type="button" className="workspace-button" onClick={() => dispatch({ type: "TOGGLE_KANBAN" })}>
+            {state.kanbanOpen ? "Back to terminal" : "Open kanban"}
+          </button>
+          <button
+            type="button"
+            className="workspace-button workspace-button--accent"
+            onClick={() => dispatch({ type: "TOGGLE_MARKETPLACE" })}
+          >
+            {state.marketplaceOpen ? "Back to terminal" : "Open marketplace"}
+          </button>
+        </div>
+      </div>
+
+      <AgentsWindow
+        tabs={workspaceTabs}
+        activeTabId={activeWorkspace.id}
+        onSelect={(workspaceId) => dispatch({ type: "SET_ACTIVE_WORKSPACE", workspaceId })}
+        onAdd={() => dispatch({ type: "ADD_WORKSPACE" })}
+        onClose={(workspaceId) => dispatch({ type: "CLOSE_WORKSPACE", workspaceId })}
+        onRename={(workspaceId) => {
+          const workspace = state.workspaces.find((item) => item.id === workspaceId);
+          const title = window.prompt("Rename agent tab", workspace?.title ?? "");
+          if (title?.trim()) {
+            dispatch({ type: "RENAME_WORKSPACE", workspaceId, title: title.trim() });
+          }
+        }}
+      />
+
+      <div className="workspace-stage">{workspaceContent}</div>
+    </main>
+  );
+
+  const rightPane = state.chatOpen ? (
+    <aside className="chat-pane">
+      <Chat
+        key={activeWorkspace.id}
+        ref={chatRef}
+        session={activeSession}
+        onSessionCreated={(session) => dispatch({ type: "SET_WORKSPACE_SESSION", workspaceId: activeWorkspace.id, session })}
+        onSessionUpdated={(session) => dispatch({ type: "SET_WORKSPACE_SESSION", workspaceId: activeWorkspace.id, session })}
+        onPhaseChange={(phase) => dispatch({ type: "SET_WORKSPACE_PHASE", workspaceId: activeWorkspace.id, phase })}
+        onTokenUsage={(usage) => dispatch({ type: "SET_TOKEN_USAGE", usage })}
+      />
+    </aside>
+  ) : null;
+
+  const centerAndRight = state.chatOpen ? (
+    <SplitPane direction="horizontal" storageKey="caduceus:layout:center-chat" defaultSplit={0.68}>
+      {centerPane}
+      {rightPane}
+    </SplitPane>
+  ) : (
+    centerPane
+  );
+
+  const shellContent = state.gitPanelOpen ? (
+    <SplitPane direction="horizontal" storageKey="caduceus:layout:git-main" defaultSplit={0.2} minSize={0.12}>
+      <aside className="sidebar">
+        <GitPanel projectRoot={activeSession?.project_root ?? null} />
+      </aside>
+      {centerAndRight}
+    </SplitPane>
+  ) : (
+    centerAndRight
+  );
 
   return (
-    <div className="app-layout" style={{ gridTemplateColumns: gridColumns }} tabIndex={-1}>
-      {state.gitPanelOpen && (
-        <aside className="sidebar">
-          <GitPanel projectRoot={activeSession?.project_root ?? null} />
-        </aside>
-      )}
-
-      <main className="main-area" ref={terminalRegionRef} tabIndex={-1}>
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            padding: "8px 12px",
-            borderBottom: "1px solid #313244",
-            background: "#181825",
-            flexShrink: 0,
-            gap: 8,
-          }}
-        >
-          <div>
-            <div style={{ fontSize: 12, fontWeight: 700 }}>Workspace</div>
-            <div style={{ fontSize: 11, color: "#6c7086", marginTop: 2 }}>{workspaceSubtitle}</div>
-          </div>
-
-          <div style={{ display: "flex", gap: 8 }}>
-            <button
-              type="button"
-              onClick={handleKanbanToggle}
-              style={{
-                border: "none",
-                borderRadius: 8,
-                padding: "8px 12px",
-                background: state.kanbanOpen ? "#f9e2af" : "#94e2d5",
-                color: "#1e1e2e",
-                fontWeight: 700,
-                cursor: "pointer",
-              }}
-              disabled={!canOpenKanban && !state.kanbanOpen}
-            >
-              {state.kanbanOpen ? "Back to Terminal" : "Open Kanban"}
-            </button>
-            <button
-              type="button"
-              onClick={() => dispatch({ type: "TOGGLE_MARKETPLACE" })}
-              style={{
-                border: "none",
-                borderRadius: 8,
-                padding: "8px 12px",
-                background: state.marketplaceOpen ? "#cba6f7" : "#89b4fa",
-                color: "#1e1e2e",
-                fontWeight: 700,
-                cursor: "pointer",
-              }}
-            >
-              {workspaceButtonLabel}
-            </button>
-          </div>
-        </div>
-
-        {state.marketplaceOpen ? (
-          <MarketplacePanel />
-        ) : state.kanbanOpen ? (
-          <KanbanBoard board={state.kanbanBoard} />
-        ) : (
-          <Terminal
-            tabs={state.tabs}
-            activeTabId={state.activeTabId}
-            sessionId={state.activeSessionId}
-            onTabChange={(id) => dispatch({ type: "SET_ACTIVE_TAB", tabId: id })}
-            onTabClose={(id) => dispatch({ type: "CLOSE_TAB", tabId: id })}
-            onNewTab={() => dispatch({ type: "NEW_TAB" })}
-          />
-        )}
-      </main>
-
-      {state.chatOpen && (
-        <aside className="chat-pane">
-          <Chat
-            ref={chatRef}
-            session={activeSession}
-            onSessionCreated={(s) => dispatch({ type: "ADD_SESSION", session: s })}
-            onPhaseChange={(phase) => dispatch({ type: "SET_PHASE", phase })}
-            onTokenUsage={(usage) => dispatch({ type: "SET_TOKEN_USAGE", usage })}
-            onOpenKanban={(board) => dispatch({ type: "OPEN_KANBAN", board })}
-            onKanbanUpdated={(board) => dispatch({ type: "SET_KANBAN_BOARD", board })}
-          />
-        </aside>
-      )}
+    <div className="app-layout">
+      <DesktopNotifications />
+      <div className="app-layout__content">{shellContent}</div>
 
       <StatusBar
         session={activeSession}
@@ -303,24 +459,24 @@ function App() {
         projectContext={state.projectContext}
       />
 
-      {state.commandPaletteOpen && (
+      {state.commandPaletteOpen ? (
         <CommandPalette
           onClose={() => dispatch({ type: "CLOSE_COMMAND_PALETTE" })}
-          onSessionSelect={(s) => {
-            dispatch({ type: "SET_ACTIVE_SESSION", sessionId: s.id });
+          onSessionSelect={(session) => {
+            dispatch({ type: "SET_WORKSPACE_SESSION", workspaceId: activeWorkspace.id, session });
             dispatch({ type: "CLOSE_COMMAND_PALETTE" });
           }}
         />
-      )}
+      ) : null}
 
-      {state.keybindingSettingsOpen && (
+      {state.keybindingSettingsOpen ? (
         <KeybindingSettings
           onClose={() => dispatch({ type: "CLOSE_KEYBINDING_SETTINGS" })}
           onSaved={() => {
             void reload();
           }}
         />
-      )}
+      ) : null}
     </div>
   );
 }

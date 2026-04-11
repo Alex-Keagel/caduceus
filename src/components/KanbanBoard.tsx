@@ -18,7 +18,6 @@ function statusLabel(status: CardStatus): string {
 function tokenCount(usage: KanbanTokenUsage): number {
   return usage.input_tokens
     + usage.output_tokens
-    + (usage.cached_tokens ?? 0)
     + (usage.cache_read_tokens ?? 0)
     + (usage.cache_write_tokens ?? 0);
 }

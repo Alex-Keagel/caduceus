@@ -2,22 +2,31 @@ import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "re
 import {
   agentAbort,
   agentTurn,
-  kanbanAddCard,
-  kanbanLoad,
+  listenAgentEvent,
   permissionRespond,
   sessionCreate,
+  sessionMessages,
 } from "../api/tauri";
-import { listenAgentEvent } from "../api/tauri";
-import type { KanbanBoard, SessionInfo, SessionPhase, TokenUsage, ChatMessage, ToolCallBlock, PermissionRequest } from "../types";
+import type {
+  ChatMessage,
+  PermissionRequest,
+  SessionInfo,
+  SessionPhase,
+  TokenUsage,
+  ToolCallBlock,
+  TranscriptEntry,
+} from "../types";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import ModelPicker from "./ModelPicker";
+import SyntaxHighlighter from "./SyntaxHighlighter";
+import { emitDesktopNotification } from "./DesktopNotifications";
 
 interface ChatProps {
   session: SessionInfo | null;
   onSessionCreated: (session: SessionInfo) => void;
+  onSessionUpdated: (session: SessionInfo) => void;
   onPhaseChange?: (phase: SessionPhase) => void;
   onTokenUsage?: (usage: TokenUsage) => void;
-  onOpenKanban?: (board: KanbanBoard) => void;
-  onKanbanUpdated?: (board: KanbanBoard) => void;
 }
 
 export interface ChatHandle {
@@ -27,62 +36,36 @@ export interface ChatHandle {
   cancelAgent: () => Promise<void>;
 }
 
-const RISK_COLORS: Record<string, string> = {
-  Low: "#a6e3a1",
-  Medium: "#f9e2af",
-  High: "#fab387",
-  Critical: "#f38ba8",
-};
+function transcriptToMessage(entry: TranscriptEntry): ChatMessage {
+  return {
+    id: `${entry.timestamp}-${entry.role}-${Math.random().toString(16).slice(2)}`,
+    role: entry.role,
+    content: entry.content,
+    tokens: entry.tokens,
+    timestamp: entry.timestamp,
+  };
+}
 
 function renderMarkdown(text: string): React.ReactNode {
   if (!text) return null;
-  const parts = text.split(/(```[\w]*\n[\s\S]*?```|`[^`\n]+`)/g);
+  const parts = text.split(/(```[\w-]*\n[\s\S]*?```|`[^`\n]+`)/g);
   return (
     <>
-      {parts.map((part, i) => {
+      {parts.map((part, index) => {
         if (part.startsWith("```")) {
-          const firstNewline = part.indexOf("\n");
-          const code =
-            firstNewline >= 0
-              ? part.slice(firstNewline + 1).replace(/```$/, "")
-              : part.slice(3).replace(/```$/, "");
-          return (
-            <pre
-              key={i}
-              style={{
-                background: "#11111b",
-                border: "1px solid #313244",
-                borderRadius: 6,
-                padding: "8px 12px",
-                overflow: "auto",
-                margin: "8px 0",
-                fontSize: 11,
-                fontFamily: '"JetBrains Mono", monospace',
-                whiteSpace: "pre",
-              }}
-            >
-              <code>{code}</code>
-            </pre>
-          );
+          const header = part.slice(3, part.indexOf("\n") >= 0 ? part.indexOf("\n") : undefined);
+          const code = part.replace(/^```[\w-]*\n?/, "").replace(/```$/, "");
+          return <SyntaxHighlighter key={index} code={code} language={header} />;
         }
         if (part.startsWith("`") && part.endsWith("`")) {
           return (
-            <code
-              key={i}
-              style={{
-                background: "#313244",
-                padding: "1px 4px",
-                borderRadius: 3,
-                fontFamily: '"JetBrains Mono", monospace',
-                fontSize: 11,
-              }}
-            >
+            <code key={index} className="chat-inline-code">
               {part.slice(1, -1)}
             </code>
           );
         }
         return (
-          <span key={i} style={{ whiteSpace: "pre-wrap" }}>
+          <span key={index} style={{ whiteSpace: "pre-wrap" }}>
             {part}
           </span>
         );
@@ -92,79 +75,33 @@ function renderMarkdown(text: string): React.ReactNode {
 }
 
 function ToolCallView({ tc, onToggle }: { tc: ToolCallBlock; onToggle: () => void }) {
-  const resultColor = tc.is_error ? "#f38ba8" : "#a6e3a1";
+  const resultColor = tc.is_error ? "var(--color-danger)" : "var(--color-success)";
   return (
-    <div
-      style={{
-        margin: "4px 0",
-        border: "1px solid #313244",
-        borderRadius: 6,
-        overflow: "hidden",
-        fontSize: 11,
-      }}
-    >
-      <div
-        onClick={onToggle}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
-          padding: "4px 8px",
-          background: "#181825",
-          cursor: "pointer",
-          userSelect: "none",
-        }}
-      >
-        <span style={{ color: "#89b4fa" }}>⚙ {tc.name}</span>
-        {tc.result !== undefined && (
-          <span style={{ color: resultColor, marginLeft: "auto" }}>
-            {tc.is_error ? "✗" : "✓"}
-          </span>
-        )}
-        <span style={{ color: "#6c7086" }}>{tc.collapsed ? "▶" : "▼"}</span>
+    <div className="tool-call-card">
+      <div className="tool-call-card__header" onClick={onToggle}>
+        <span style={{ color: "var(--color-accent)" }}>⚙ {tc.name}</span>
+        {tc.result !== undefined ? <span style={{ color: resultColor }}>{tc.is_error ? "✗" : "✓"}</span> : null}
+        <span style={{ color: "var(--color-muted)" }}>{tc.collapsed ? "▶" : "▼"}</span>
       </div>
-      {!tc.collapsed && (
-        <div style={{ padding: "6px 8px", background: "#11111b" }}>
-          {tc.input_json && (
-            <pre
-              style={{
-                margin: 0,
-                fontSize: 10,
-                color: "#cba6f7",
-                overflow: "auto",
-                maxHeight: 120,
-              }}
-            >
-              {tc.input_json}
-            </pre>
-          )}
-          {tc.result !== undefined && (
-            <pre
-              style={{
-                margin: "4px 0 0",
-                fontSize: 10,
-                color: resultColor,
-                overflow: "auto",
-                maxHeight: 120,
-              }}
-            >
-              {tc.result}
-            </pre>
-          )}
+      {!tc.collapsed ? (
+        <div className="tool-call-card__body">
+          {tc.input_json ? <pre>{tc.input_json}</pre> : null}
+          {tc.result !== undefined ? <pre style={{ color: resultColor }}>{tc.result}</pre> : null}
         </div>
-      )}
+      ) : null}
     </div>
   );
 }
 
 const Chat = forwardRef<ChatHandle, ChatProps>(function Chat(
-  { session, onSessionCreated, onPhaseChange, onTokenUsage, onOpenKanban, onKanbanUpdated }: ChatProps,
+  { session, onSessionCreated, onSessionUpdated, onPhaseChange, onTokenUsage }: ChatProps,
   ref
 ) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [projectRoot, setProjectRoot] = useState("");
+  const [projectRoot, setProjectRoot] = useState(session?.project_root ?? "");
+  const [newSessionModel, setNewSessionModel] = useState("claude-opus-4-5");
   const [streamingText, setStreamingText] = useState("");
   const [streamingToolCalls, setStreamingToolCalls] = useState<Map<string, ToolCallBlock>>(new Map());
   const [pendingPermission, setPendingPermission] = useState<PermissionRequest | null>(null);
@@ -178,18 +115,42 @@ const Chat = forwardRef<ChatHandle, ChatProps>(function Chat(
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, streamingText, streamingToolCalls, pendingPermission]);
 
-  // Listen for agent events
+  useEffect(() => {
+    setProjectRoot(session?.project_root ?? "");
+  }, [session?.project_root]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadHistory = async () => {
+      if (!session) {
+        setMessages([]);
+        return;
+      }
+      const history = await sessionMessages(session.id);
+      if (!cancelled) {
+        setMessages(history.map(transcriptToMessage));
+        setStreamingText("");
+        streamingTextRef.current = "";
+        setStreamingToolCalls(new Map());
+        streamingToolCallsRef.current = new Map();
+        setPendingPermission(null);
+      }
+    };
+    void loadHistory();
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.id]);
+
   useEffect(() => {
     let unlisten: UnlistenFn | null = null;
-    listenAgentEvent((event) => {
-      switch (event.kind) {
+    void listenAgentEvent((event) => {
+      switch (event.type) {
         case "TextDelta":
           streamingTextRef.current += event.text;
           setStreamingText(streamingTextRef.current);
           break;
-        case "ThinkingDelta":
-          break;
-        case "ToolUseStart":
+        case "ToolCallStart":
           streamingToolCallsRef.current.set(event.id, {
             id: event.id,
             name: event.name,
@@ -198,56 +159,66 @@ const Chat = forwardRef<ChatHandle, ChatProps>(function Chat(
           });
           setStreamingToolCalls(new Map(streamingToolCallsRef.current));
           break;
-        case "ToolInputDelta": {
-          const tc = streamingToolCallsRef.current.get(event.id);
-          if (tc) {
-            tc.input_json += event.partial_json;
+        case "ToolCallInput": {
+          const item = streamingToolCallsRef.current.get(event.id);
+          if (item) {
+            item.input_json += event.delta;
             setStreamingToolCalls(new Map(streamingToolCallsRef.current));
           }
           break;
         }
-        case "ToolResult": {
-          const tc = streamingToolCallsRef.current.get(event.id);
-          if (tc) {
-            tc.result = event.content;
-            tc.is_error = event.is_error;
-            tc.collapsed = true;
+        case "ToolResultEnd": {
+          const item = streamingToolCallsRef.current.get(event.id);
+          if (item) {
+            item.result = event.content;
+            item.is_error = event.is_error;
+            item.collapsed = true;
             setStreamingToolCalls(new Map(streamingToolCallsRef.current));
           }
           break;
         }
         case "PermissionRequest":
-          setPendingPermission(event.request);
+          setPendingPermission({
+            id: event.id,
+            capability: event.capability,
+            description: event.description,
+          });
+          emitDesktopNotification({
+            title: "Caduceus needs permission",
+            body: event.description,
+          });
           break;
-        case "MessageStop": {
+        case "TurnComplete": {
           const finalMessage: ChatMessage = {
             id: `${Date.now()}`,
             role: "Assistant",
             content: streamingTextRef.current,
-            tokens: event.output_tokens,
+            tokens: event.usage.output_tokens,
             timestamp: new Date().toISOString(),
             tool_calls: Array.from(streamingToolCallsRef.current.values()),
           };
-          setMessages((m) => [...m, finalMessage]);
+          if (finalMessage.content || finalMessage.tool_calls?.length) {
+            setMessages((existing) => [...existing, finalMessage]);
+          }
           setStreamingText("");
-          setStreamingToolCalls(new Map());
           streamingTextRef.current = "";
+          setStreamingToolCalls(new Map());
           streamingToolCallsRef.current = new Map();
           setPendingPermission(null);
           setLoading(false);
-          onTokenUsage?.({
-            input_tokens: event.input_tokens,
-            output_tokens: event.output_tokens,
-            cached_tokens: event.cached_tokens,
+          onTokenUsage?.(event.usage);
+          emitDesktopNotification({
+            title: "Agent completed",
+            body: session ? `${session.project_root.split("/").pop()} finished a turn.` : "Agent completed its turn.",
           });
           break;
         }
-        case "PhaseChange":
+        case "SessionPhaseChanged":
           onPhaseChange?.(event.phase);
           break;
         case "Error":
-          setMessages((m) => [
-            ...m,
+          setMessages((existing) => [
+            ...existing,
             {
               id: `${Date.now()}`,
               role: "System",
@@ -256,6 +227,13 @@ const Chat = forwardRef<ChatHandle, ChatProps>(function Chat(
             },
           ]);
           setLoading(false);
+          emitDesktopNotification({
+            title: "Agent error",
+            body: event.message,
+          });
+          break;
+        case "ToolCallEnd":
+        case "ToolResultStart":
           break;
       }
     }).then((fn) => {
@@ -264,96 +242,74 @@ const Chat = forwardRef<ChatHandle, ChatProps>(function Chat(
     return () => {
       unlisten?.();
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [onPhaseChange, onTokenUsage, session]);
 
   const handleCreateSession = async () => {
     if (!projectRoot.trim()) return;
     try {
-      const s = await sessionCreate(projectRoot, "anthropic", "claude-opus-4-5");
-      onSessionCreated(s);
-    } catch (e) {
-      console.error("Failed to create session", e);
+      const created = await sessionCreate(projectRoot, "anthropic", newSessionModel);
+      onSessionCreated(created);
+    } catch (error) {
+      console.error("Failed to create session", error);
     }
   };
 
-  const appendAssistantMessage = (content: string, tokens?: number) => {
-    setMessages((m) => [
-      ...m,
+  const appendSystemMessage = (content: string) => {
+    setMessages((existing) => [
+      ...existing,
       {
-        id: `${Date.now()}-${Math.random()}`,
-        role: "Assistant",
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        role: "System",
         content,
-        tokens,
         timestamp: new Date().toISOString(),
       },
     ]);
   };
 
-  const handleKanbanSlashCommand = async (userInput: string): Promise<boolean> => {
-    if (!session) {
-      throw new Error("Create a session before using kanban commands.");
-    }
-    const trimmed = userInput.trim();
-    if (trimmed === "/kanban") {
-      const board = await kanbanLoad(session.project_root);
-      onOpenKanban?.(board);
-      onKanbanUpdated?.(board);
-      appendAssistantMessage(`Opened kanban board with ${board.cards.length} cards.`);
-      return true;
-    }
-    if (trimmed.startsWith("/kanban add")) {
-      const title = trimmed.replace(/^\/kanban add\s*/, "").trim();
-      if (!title) {
-        throw new Error("Provide a kanban card title.");
-      }
-      const board = await kanbanAddCard(session.project_root, title);
-      onKanbanUpdated?.(board);
-      onOpenKanban?.(board);
-      appendAssistantMessage(`Added '${title}' to the backlog.`);
-      return true;
-    }
-    return false;
-  };
-
   const sendInput = async (messageValue: string, clearInput = false) => {
     if (!messageValue.trim() || !session || loading) return;
     const userInput = messageValue;
-    const userMessage: ChatMessage = {
-      id: `${Date.now()}`,
-      role: "User",
-      content: userInput,
-      timestamp: new Date().toISOString(),
-    };
-    setMessages((m) => [...m, userMessage]);
+    setMessages((existing) => [
+      ...existing,
+      {
+        id: `${Date.now()}`,
+        role: "User",
+        content: userInput,
+        timestamp: new Date().toISOString(),
+      },
+    ]);
     if (clearInput) {
       setInput("");
     }
     setLoading(true);
 
     try {
-      if (await handleKanbanSlashCommand(userInput)) {
-        setLoading(false);
-        return;
-      }
       const response = await agentTurn(session.id, userInput);
+      if (response.warning) {
+        appendSystemMessage(response.warning);
+      }
+      if (response.session) {
+        onSessionUpdated(response.session);
+      }
       if (userInput.trim().startsWith("/")) {
-        appendAssistantMessage(response.content, response.output_tokens);
+        setMessages((existing) => [
+          ...existing,
+          {
+            id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+            role: "Assistant",
+            content: response.content,
+            tokens: response.output_tokens,
+            timestamp: new Date().toISOString(),
+          },
+        ]);
         onTokenUsage?.({
           input_tokens: response.input_tokens,
           output_tokens: response.output_tokens,
         });
+        setLoading(false);
       }
-      setLoading(false);
-    } catch (e) {
-      setMessages((m) => [
-        ...m,
-        {
-          id: `${Date.now()}`,
-          role: "System",
-          content: `Error: ${e}`,
-          timestamp: new Date().toISOString(),
-        },
-      ]);
+    } catch (error) {
+      appendSystemMessage(`Error: ${String(error)}`);
       setLoading(false);
     }
   };
@@ -377,7 +333,7 @@ const Chat = forwardRef<ChatHandle, ChatProps>(function Chat(
         await agentAbort(session.id);
       },
     }),
-    [handleSend, session]
+    [handleSend, session, input]
   );
 
   const handlePermission = async (requestId: string, allow: boolean) => {
@@ -385,21 +341,21 @@ const Chat = forwardRef<ChatHandle, ChatProps>(function Chat(
     setPendingPermission(null);
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
-      e.preventDefault();
-      handleSend();
+  const handleKeyDown = (event: React.KeyboardEvent) => {
+    if (event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      event.preventDefault();
+      void handleSend();
     }
   };
 
   const toggleToolCallCollapse = (messageIdx: number, toolCallId: string) => {
-    setMessages((prev) =>
-      prev.map((msg, i) => {
-        if (i !== messageIdx || !msg.tool_calls) return msg;
+    setMessages((existing) =>
+      existing.map((message, index) => {
+        if (index !== messageIdx || !message.tool_calls) return message;
         return {
-          ...msg,
-          tool_calls: msg.tool_calls.map((tc) =>
-            tc.id === toolCallId ? { ...tc, collapsed: !tc.collapsed } : tc
+          ...message,
+          tool_calls: message.tool_calls.map((toolCall) =>
+            toolCall.id === toolCallId ? { ...toolCall, collapsed: !toolCall.collapsed } : toolCall
           ),
         };
       })
@@ -407,85 +363,58 @@ const Chat = forwardRef<ChatHandle, ChatProps>(function Chat(
   };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
-      {/* Header */}
-      <div style={{ padding: "8px 12px", borderBottom: "1px solid #313244", fontSize: 12 }}>
-        <strong>AI Chat</strong>
-        {session && (
-          <span style={{ color: "#6c7086", marginLeft: 8 }}>{session.model_id}</span>
-        )}
-      </div>
-
-      {/* Session setup (when no session) */}
-      {!session && (
-        <div style={{ padding: 12 }}>
-          <p style={{ color: "#6c7086", marginBottom: 8, fontSize: 12 }}>Open a project to start</p>
-          <input
-            value={projectRoot}
-            onChange={(e) => setProjectRoot(e.target.value)}
-            placeholder="/path/to/project"
-            style={{
-              width: "100%",
-              background: "#313244",
-              border: "none",
-              borderRadius: 4,
-              padding: "6px 8px",
-              color: "#cdd6f4",
-              fontSize: 12,
-              marginBottom: 8,
+    <div className="chat-shell">
+      <div className="chat-header">
+        <div>
+          <strong>Agent Chat</strong>
+          {session ? <span className="chat-header__meta">{session.project_root}</span> : null}
+        </div>
+        {session ? (
+          <ModelPicker
+            value={session.model_id}
+            onChange={(modelId) => {
+              void sendInput(`/model ${modelId}`);
             }}
           />
-          <button
-            onClick={handleCreateSession}
-            style={{
-              width: "100%",
-              background: "#89b4fa",
-              color: "#1e1e2e",
-              border: "none",
-              borderRadius: 4,
-              padding: "6px 0",
-              cursor: "pointer",
-              fontWeight: 600,
-              fontSize: 12,
-            }}
-          >
-            Open Project
+        ) : null}
+      </div>
+
+      {!session ? (
+        <div className="chat-empty-state">
+          <p>Open a project to start an agent session.</p>
+          <input
+            value={projectRoot}
+            onChange={(event) => setProjectRoot(event.target.value)}
+            placeholder="/path/to/project"
+          />
+          <ModelPicker value={newSessionModel} onChange={setNewSessionModel} />
+          <button type="button" onClick={handleCreateSession}>
+            Open project
           </button>
         </div>
-      )}
+      ) : null}
 
-      {/* Messages */}
-      <div style={{ flex: 1, overflowY: "auto", padding: "8px 12px" }}>
-        {messages.map((msg, idx) => (
+      <div className="chat-messages">
+        {messages.map((message, index) => (
           <MessageBubble
-            key={msg.id}
-            message={msg}
-            onToggleToolCall={(toolCallId) => toggleToolCallCollapse(idx, toolCallId)}
+            key={message.id}
+            message={message}
+            onToggleToolCall={(toolCallId) => toggleToolCallCollapse(index, toolCallId)}
           />
         ))}
 
-        {/* Streaming content */}
         {(streamingText || streamingToolCalls.size > 0) && (
-          <div style={{ marginBottom: 12 }}>
-            <div style={{ fontSize: 10, color: "#6c7086", marginBottom: 2 }}>Assistant</div>
-            <div
-              style={{
-                background: "#313244",
-                borderRadius: 6,
-                padding: "6px 10px",
-                maxWidth: "95%",
-                lineHeight: 1.5,
-                fontSize: 12,
-              }}
-            >
-              {streamingText && renderMarkdown(streamingText)}
-              {Array.from(streamingToolCalls.values()).map((tc) => (
+          <div className="message-row">
+            <div className="message-role">Assistant</div>
+            <div className="message-bubble">
+              {streamingText ? renderMarkdown(streamingText) : null}
+              {Array.from(streamingToolCalls.values()).map((toolCall) => (
                 <ToolCallView
-                  key={tc.id}
-                  tc={tc}
+                  key={toolCall.id}
+                  tc={toolCall}
                   onToggle={() => {
                     const updated = new Map(streamingToolCallsRef.current);
-                    const item = updated.get(tc.id);
+                    const item = updated.get(toolCall.id);
                     if (item) {
                       item.collapsed = !item.collapsed;
                       streamingToolCallsRef.current = updated;
@@ -498,96 +427,40 @@ const Chat = forwardRef<ChatHandle, ChatProps>(function Chat(
           </div>
         )}
 
-        {/* Permission request */}
-        {pendingPermission && (
-          <div
-            style={{
-              margin: "8px 0",
-              border: `1px solid ${RISK_COLORS[pendingPermission.risk_level] ?? "#6c7086"}`,
-              borderRadius: 6,
-              padding: 10,
-              background: "#181825",
-            }}
-          >
-            <div
-              style={{
-                fontWeight: 600,
-                color: RISK_COLORS[pendingPermission.risk_level] ?? "#6c7086",
-                fontSize: 11,
-                marginBottom: 4,
-              }}
-            >
-              ⚠ Permission Request: {pendingPermission.tool_name}
-            </div>
-            <div style={{ color: "#cdd6f4", fontSize: 11, marginBottom: 8 }}>
-              {pendingPermission.description}
-            </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              <button
-                onClick={() => handlePermission(pendingPermission.id, true)}
-                style={{
-                  background: "#a6e3a1",
-                  color: "#1e1e2e",
-                  border: "none",
-                  borderRadius: 4,
-                  padding: "4px 12px",
-                  cursor: "pointer",
-                  fontWeight: 600,
-                  fontSize: 11,
-                }}
-              >
+        {pendingPermission ? (
+          <div className="permission-card">
+            <div className="permission-card__title">⚠ Permission request · {pendingPermission.capability}</div>
+            <div className="permission-card__body">{pendingPermission.description}</div>
+            <div className="permission-card__actions">
+              <button type="button" onClick={() => void handlePermission(pendingPermission.id, true)}>
                 Approve
               </button>
-              <button
-                onClick={() => handlePermission(pendingPermission.id, false)}
-                style={{
-                  background: "#f38ba8",
-                  color: "#1e1e2e",
-                  border: "none",
-                  borderRadius: 4,
-                  padding: "4px 12px",
-                  cursor: "pointer",
-                  fontWeight: 600,
-                  fontSize: 11,
-                }}
-              >
+              <button type="button" className="danger" onClick={() => void handlePermission(pendingPermission.id, false)}>
                 Deny
               </button>
             </div>
           </div>
-        )}
+        ) : null}
 
-        {loading && !streamingText && streamingToolCalls.size === 0 && (
-          <div style={{ color: "#6c7086", fontStyle: "italic", marginTop: 8 }}>Thinking…</div>
-        )}
+        {loading && !streamingText && streamingToolCalls.size === 0 ? (
+          <div className="chat-loading">Thinking…</div>
+        ) : null}
         <div ref={bottomRef} />
       </div>
 
-      {/* Input */}
-      {session && (
-        <div style={{ padding: 8, borderTop: "1px solid #313244" }}>
+      {session ? (
+        <div className="chat-input-shell">
           <textarea
             ref={inputRef}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(event) => setInput(event.target.value)}
             onKeyDown={handleKeyDown}
             placeholder="Ask anything… (Enter to send)"
             rows={3}
             disabled={loading}
-            style={{
-              width: "100%",
-              background: "#313244",
-              border: "none",
-              borderRadius: 4,
-              padding: "6px 8px",
-              color: "#cdd6f4",
-              fontSize: 12,
-              resize: "none",
-              fontFamily: "inherit",
-            }}
           />
         </div>
-      )}
+      ) : null}
     </div>
   );
 });
@@ -601,31 +474,15 @@ function MessageBubble({
 }) {
   const isUser = message.role === "User";
   return (
-    <div
-      style={{
-        marginBottom: 12,
-        display: "flex",
-        flexDirection: "column",
-        alignItems: isUser ? "flex-end" : "flex-start",
-      }}
-    >
-      <div style={{ fontSize: 10, color: "#6c7086", marginBottom: 2 }}>
+    <div className={`message-row ${isUser ? "message-row--user" : ""}`}>
+      <div className="message-role">
         {message.role}
         {message.tokens ? ` · ${message.tokens} tokens` : ""}
       </div>
-      <div
-        style={{
-          background: isUser ? "#89b4fa22" : "#313244",
-          borderRadius: 6,
-          padding: "6px 10px",
-          maxWidth: "95%",
-          lineHeight: 1.5,
-          fontSize: 12,
-        }}
-      >
+      <div className={`message-bubble ${isUser ? "message-bubble--user" : ""}`}>
         {renderMarkdown(message.content)}
-        {message.tool_calls?.map((tc) => (
-          <ToolCallView key={tc.id} tc={tc} onToggle={() => onToggleToolCall(tc.id)} />
+        {message.tool_calls?.map((toolCall) => (
+          <ToolCallView key={toolCall.id} tc={toolCall} onToggle={() => onToggleToolCall(toolCall.id)} />
         ))}
       </div>
     </div>

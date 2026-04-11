@@ -2,8 +2,8 @@
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use caduceus_core::{
-    CaduceusConfig, KeybindingConfig, KeybindingPreset, LlmMessage, ModelId, ProviderId, SessionId,
-    SessionPhase, SessionState, SessionStorage,
+    CaduceusConfig, ContentBlock, KeybindingConfig, KeybindingPreset, LlmMessage, ModelId,
+    ProviderId, SessionId, SessionPhase, SessionState, SessionStorage, TokenBudget,
 };
 use caduceus_git::{CheckpointManager, FileStatus, GitRepo};
 use caduceus_marketplace::{recommend, BuiltinCatalog, ProjectContext};
@@ -194,6 +194,7 @@ pub struct SessionInfo {
     pub message_count: usize,
     pub provider_id: String,
     pub model_id: String,
+    pub token_budget: TokenBudget,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -207,6 +208,16 @@ pub struct AgentTurnResponse {
     pub content: String,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub warning: Option<String>,
+    pub session: Option<SessionInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TranscriptEntry {
+    pub role: String,
+    pub content: String,
+    pub tokens: Option<u32>,
+    pub timestamp: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -322,8 +333,216 @@ fn format_kanban_summary(board: &KanbanBoard) -> String {
     )
 }
 
-fn execute_slash_command(
+fn session_export_base(project_root: &Path) -> PathBuf {
+    project_root.join(".caduceus").join("exports")
+}
+
+fn render_content_blocks(content: &[ContentBlock]) -> String {
+    content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text(text) => text.clone(),
+            ContentBlock::ToolUse { name, input, .. } => {
+                format!(
+                    "Tool call `{name}`\n{}",
+                    serde_json::to_string_pretty(input).unwrap_or_default()
+                )
+            }
+            ContentBlock::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+            } => {
+                let label = if *is_error {
+                    "Tool error"
+                } else {
+                    "Tool result"
+                };
+                format!("{label} `{}`\n{content}", tool_call_id.0)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn transcript_entry_from_message(message: &caduceus_storage::StoredMessage) -> TranscriptEntry {
+    TranscriptEntry {
+        role: format!("{:?}", message.message.role),
+        content: render_content_blocks(&message.message.content),
+        tokens: message.tokens,
+        timestamp: message.timestamp.to_rfc3339(),
+    }
+}
+
+fn transcript_markdown(entries: &[TranscriptEntry], session: &SessionState) -> String {
+    let mut output = vec![
+        format!("# Session Export {}", session.id),
+        format!("- Project: {}", session.project_root.display()),
+        format!("- Model: {}", session.model_id.0),
+        format!("- Provider: {}", session.provider_id.0),
+        String::new(),
+    ];
+
+    for entry in entries {
+        output.push(format!("## {} · {}", entry.role, entry.timestamp));
+        output.push(String::new());
+        output.push(entry.content.clone());
+        output.push(String::new());
+    }
+
+    output.join("\n")
+}
+
+fn project_init_summary(paths: &[PathBuf]) -> String {
+    let rendered = paths
+        .iter()
+        .map(|path| format!("- {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Initialized Caduceus project files:\n{rendered}")
+}
+
+fn initialize_project(project_root: &Path, config: &CaduceusConfig) -> Result<String, String> {
+    let caduceus_dir = project_root.join(".caduceus");
+    let dirs = [
+        caduceus_dir.clone(),
+        caduceus_dir.join("agents"),
+        caduceus_dir.join("skills"),
+        caduceus_dir.join("automations"),
+        caduceus_dir.join("instructions"),
+        caduceus_dir.join("exports"),
+    ];
+    for dir in &dirs {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+
+    let config_path = caduceus_dir.join("config.toml");
+    if !config_path.exists() {
+        let config_body = format!(
+            "default_provider = \"{}\"\ndefault_model = \"{}\"\nmax_context_tokens = {}\n",
+            config.default_provider.0, config.default_model.0, config.max_context_tokens
+        );
+        std::fs::write(&config_path, config_body).map_err(|e| e.to_string())?;
+    }
+
+    let ignore_path = project_root.join(".caduceusignore");
+    if !ignore_path.exists() {
+        std::fs::write(
+            &ignore_path,
+            "# Ignore secrets and generated files\n.env\n*.pem\n*.key\nnode_modules/\ntarget/\n",
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    let mut created = dirs.to_vec();
+    created.push(config_path);
+    created.push(ignore_path);
+    Ok(project_init_summary(&created))
+}
+
+async fn export_session(
+    state: &AppState,
     session: &SessionState,
+    args: &str,
+) -> Result<String, String> {
+    let messages = state
+        .storage
+        .list_messages(&session.id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let entries = messages
+        .iter()
+        .map(transcript_entry_from_message)
+        .collect::<Vec<_>>();
+    let mut parts = args.split_whitespace();
+    let first = parts.next();
+    let (format, custom_path) = match first {
+        Some("json") | Some("markdown") => (
+            first,
+            parts.next().map(|_| {
+                args.split_whitespace()
+                    .skip(1)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }),
+        ),
+        Some(other) if !other.is_empty() => (None, Some(args.to_string())),
+        _ => (None, None),
+    };
+
+    let export_dir = session_export_base(session.project_root.as_path());
+    std::fs::create_dir_all(&export_dir).map_err(|e| e.to_string())?;
+
+    let default_stem = format!("session-{}", session.id);
+    let json_path = match format {
+        Some("markdown") => None,
+        _ => Some(match custom_path.as_deref() {
+            Some(path) if format == Some("json") => {
+                resolve_under_workspace(session.project_root.as_path(), path)?
+            }
+            _ => export_dir.join(format!("{default_stem}.json")),
+        }),
+    };
+    let markdown_path = match format {
+        Some("json") => None,
+        _ => Some(match custom_path.as_deref() {
+            Some(path) if format == Some("markdown") => {
+                resolve_under_workspace(session.project_root.as_path(), path)?
+            }
+            _ => export_dir.join(format!("{default_stem}.md")),
+        }),
+    };
+
+    if let Some(path) = json_path.as_ref() {
+        let content = serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(path, content).map_err(|e| e.to_string())?;
+    }
+
+    if let Some(path) = markdown_path.as_ref() {
+        let content = transcript_markdown(&entries, session);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(path, content).map_err(|e| e.to_string())?;
+    }
+
+    match (json_path, markdown_path) {
+        (Some(json), Some(markdown)) => Ok(format!(
+            "Exported session to:\n- {}\n- {}",
+            json.display(),
+            markdown.display()
+        )),
+        (Some(json), None) => Ok(format!("Exported session JSON to {}", json.display())),
+        (None, Some(markdown)) => Ok(format!(
+            "Exported session Markdown to {}",
+            markdown.display()
+        )),
+        (None, None) => Err("No export target selected.".to_string()),
+    }
+}
+
+fn set_config_value(config: &mut CaduceusConfig, key: &str, value: &str) -> Result<(), String> {
+    match key {
+        "default_provider" | "provider" => config.default_provider = ProviderId::new(value),
+        "default_model" | "model" => config.default_model = ModelId::new(value),
+        "storage_path" => config.storage_path = PathBuf::from(value),
+        "log_level" => config.log_level = value.to_string(),
+        "max_context_tokens" => {
+            config.max_context_tokens = value
+                .parse::<u32>()
+                .map_err(|_| format!("Invalid max_context_tokens value: {value}"))?
+        }
+        other => return Err(format!("Unsupported config key: {other}")),
+    }
+    Ok(())
+}
+
+async fn execute_slash_command(
+    state: &AppState,
+    session: &mut SessionState,
     user_input: &str,
 ) -> Result<Option<AgentTurnResponse>, String> {
     let Some(command) = SlashCommand::parse(user_input) else {
@@ -344,6 +563,8 @@ fn execute_slash_command(
                 ),
                 input_tokens: 0,
                 output_tokens: 0,
+                warning: None,
+                session: None,
             }
         }
         SlashCommand::Checkpoint(CheckpointCommand::List) => {
@@ -368,6 +589,8 @@ fn execute_slash_command(
                 content,
                 input_tokens: 0,
                 output_tokens: 0,
+                warning: None,
+                session: None,
             }
         }
         SlashCommand::Checkpoint(CheckpointCommand::Restore(id)) => {
@@ -381,6 +604,8 @@ fn execute_slash_command(
                 content: format!("Restored checkpoint {id}."),
                 input_tokens: 0,
                 output_tokens: 0,
+                warning: None,
+                session: None,
             }
         }
         SlashCommand::Kanban(KanbanCommand::Open) => {
@@ -389,6 +614,8 @@ fn execute_slash_command(
                 content: format_kanban_summary(&board),
                 input_tokens: 0,
                 output_tokens: 0,
+                warning: None,
+                session: None,
             }
         }
         SlashCommand::Kanban(KanbanCommand::Add(title)) => {
@@ -406,12 +633,104 @@ fn execute_slash_command(
                 content: format!("Added '{}' to the backlog.", title),
                 input_tokens: 0,
                 output_tokens: 0,
+                warning: None,
+                session: None,
+            }
+        }
+        SlashCommand::Config(args) if args.trim().is_empty() => AgentTurnResponse {
+            content: serde_json::to_string_pretty(&load_config(state)?)
+                .map_err(|e| e.to_string())?,
+            input_tokens: 0,
+            output_tokens: 0,
+            warning: None,
+            session: Some(session_info_from_state(&state.storage, session.clone()).await?),
+        },
+        SlashCommand::Config(args) if args.trim().starts_with("set ") => {
+            let raw = args.trim().trim_start_matches("set ").trim();
+            let mut parts = raw.splitn(2, ' ');
+            let key = parts.next().unwrap_or_default().trim();
+            let value = parts.next().unwrap_or_default().trim();
+            if key.is_empty() || value.is_empty() {
+                return Err("Usage: /config set <key> <value>".to_string());
+            }
+            let mut config = load_config(state)?;
+            set_config_value(&mut config, key, value)?;
+            state
+                .config_loader
+                .save(&config)
+                .map_err(|e| e.to_string())?;
+            if let Ok(mut guard) = state.config.lock() {
+                *guard = config.clone();
+            }
+            AgentTurnResponse {
+                content: format!("Updated config: {key} = {value}"),
+                input_tokens: 0,
+                output_tokens: 0,
+                warning: None,
+                session: Some(session_info_from_state(&state.storage, session.clone()).await?),
+            }
+        }
+        SlashCommand::Init => AgentTurnResponse {
+            content: initialize_project(session.project_root.as_path(), &load_config(state)?)?,
+            input_tokens: 0,
+            output_tokens: 0,
+            warning: None,
+            session: Some(session_info_from_state(&state.storage, session.clone()).await?),
+        },
+        SlashCommand::Export(args) => AgentTurnResponse {
+            content: export_session(state, session, &args).await?,
+            input_tokens: 0,
+            output_tokens: 0,
+            warning: None,
+            session: Some(session_info_from_state(&state.storage, session.clone()).await?),
+        },
+        SlashCommand::Model(model) => {
+            if model.trim().is_empty() {
+                return Err("Usage: /model <name>".to_string());
+            }
+            session.model_id = ModelId::new(model.trim());
+            state
+                .storage
+                .update_session(session)
+                .await
+                .map_err(|e| e.to_string())?;
+            AgentTurnResponse {
+                content: format!("Switched active model to {}", session.model_id.0),
+                input_tokens: 0,
+                output_tokens: 0,
+                warning: None,
+                session: Some(session_info_from_state(&state.storage, session.clone()).await?),
+            }
+        }
+        SlashCommand::Fork => {
+            let forked_id = state
+                .storage
+                .fork_session(&session.id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let forked_session = state
+                .storage
+                .load_session(&forked_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("forked session not found: {forked_id}"))?;
+            AgentTurnResponse {
+                content: format!(
+                    "Forked session {} into new session {}.",
+                    session.id, forked_session.id
+                ),
+                input_tokens: 0,
+                output_tokens: 0,
+                warning: None,
+                session: Some(session_info_from_state(&state.storage, forked_session).await?),
             }
         }
         SlashCommand::Unknown(command) => AgentTurnResponse {
             content: format!("Unknown slash command: {command}"),
             input_tokens: 0,
             output_tokens: 0,
+            warning: None,
+            session: None,
         },
         _ => return Ok(None),
     };
@@ -454,6 +773,23 @@ async fn session_list(state: State<'_, AppState>) -> Result<Vec<SessionInfo>, St
 }
 
 #[tauri::command]
+async fn session_messages(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<TranscriptEntry>, String> {
+    let session_id = parse_session_id(&session_id)?;
+    let messages = state
+        .storage
+        .list_messages(&session_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(messages
+        .iter()
+        .map(transcript_entry_from_message)
+        .collect::<Vec<_>>())
+}
+
+#[tauri::command]
 async fn session_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let session_id = parse_session_id(&id)?;
     state
@@ -486,33 +822,55 @@ async fn agent_turn(
     let cancel = cancellation_token(&state, &request.session_id)?;
     cancel.store(false, Ordering::SeqCst);
 
+    let slash_command = SlashCommand::parse(&request.user_input);
+    session.project_root = resolve_under_workspace(
+        &state.workspace_root,
+        &session.project_root.to_string_lossy(),
+    )?;
+    if let Some(response) = execute_slash_command(&state, &mut session, &request.user_input).await?
+    {
+        let target_session_id = match (&slash_command, &response.session) {
+            (Some(SlashCommand::Fork), Some(session_info)) => parse_session_id(&session_info.id)?,
+            _ => session.id.clone(),
+        };
+        state
+            .storage
+            .save_message(
+                &target_session_id,
+                &LlmMessage::user(&request.user_input),
+                None,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        state
+            .storage
+            .save_message(
+                &target_session_id,
+                &LlmMessage::assistant(&response.content),
+                Some(response.output_tokens),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(response);
+    }
+
     state
         .storage
         .save_message(&session.id, &LlmMessage::user(&request.user_input), None)
         .await
         .map_err(|e| e.to_string())?;
 
-    session.project_root = resolve_under_workspace(
-        &state.workspace_root,
-        &session.project_root.to_string_lossy(),
-    )?;
-    if let Some(response) = execute_slash_command(&session, &request.user_input)? {
-        state
-            .storage
-            .save_message(
-                &session.id,
-                &LlmMessage::assistant(&response.content),
-                Some(0),
+    let freshness_warning = GitRepo::discover(&session.project_root)
+        .ok()
+        .and_then(|repo| repo.check_freshness().ok().flatten())
+        .filter(|freshness| freshness.is_stale())
+        .map(|freshness| {
+            format!(
+                "Warning: branch '{}' is behind {} by {} commit(s).",
+                freshness.branch, freshness.upstream, freshness.behind
             )
-            .await
-            .map_err(|e| e.to_string())?;
-        state
-            .storage
-            .update_session(&session)
-            .await
-            .map_err(|e| e.to_string())?;
-        return Ok(response);
-    }
+        });
+
     let config = load_config(&state)?;
     let provider = build_provider(&config, &session.provider_id)?;
     let tools = default_registry_with_root(&session.project_root);
@@ -578,6 +936,8 @@ async fn agent_turn(
         content,
         input_tokens,
         output_tokens,
+        warning: freshness_warning,
+        session: Some(session_info_from_state(&state.storage, session.clone()).await?),
     })
 }
 
@@ -944,6 +1304,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             session_create,
             session_list,
+            session_messages,
             session_delete,
             agent_turn,
             agent_abort,
@@ -1139,6 +1500,7 @@ async fn session_info_from_state(
         message_count,
         provider_id: session.provider_id.0,
         model_id: session.model_id.0,
+        token_budget: session.token_budget,
     })
 }
 
