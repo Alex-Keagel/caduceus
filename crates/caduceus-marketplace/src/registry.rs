@@ -121,7 +121,7 @@ impl MarketplaceRegistry {
         for entry in WalkDir::new(skills_dir).max_depth(2).min_depth(1) {
             let entry = entry.map_err(|e| MarketplaceError::Io(e.to_string()))?;
             let path = entry.path();
-            if path.is_file() && path.extension().map_or(false, |e| e == "md") {
+            if path.is_file() && path.extension().is_some_and(|e| e == "md") {
                 if let Ok(skill) = parse_skill_frontmatter(path) {
                     self.register_skill(skill);
                     count += 1;
@@ -140,7 +140,7 @@ impl MarketplaceRegistry {
         for entry in WalkDir::new(agents_dir).max_depth(2).min_depth(1) {
             let entry = entry.map_err(|e| MarketplaceError::Io(e.to_string()))?;
             let path = entry.path();
-            if path.is_file() && path.extension().map_or(false, |e| e == "md") {
+            if path.is_file() && path.extension().is_some_and(|e| e == "md") {
                 if let Ok(agent) = parse_agent_frontmatter(path) {
                     self.register_agent(agent);
                     count += 1;
@@ -203,10 +203,7 @@ fn parse_skill_frontmatter(path: &Path) -> Result<SkillEntry, MarketplaceError> 
     let version = yaml_field(yaml, "version").unwrap_or("1.0").to_string();
 
     let raw_cats = yaml_list_field(yaml, "categories");
-    let categories = raw_cats
-        .iter()
-        .filter_map(|c| Category::from_str(c))
-        .collect();
+    let categories = raw_cats.iter().filter_map(|c| Category::parse(c)).collect();
 
     let triggers = yaml_list_field(yaml, "triggers");
     let tools = yaml_list_field(yaml, "tools");
