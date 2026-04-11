@@ -1133,8 +1133,13 @@ impl GeminiAdapter {
             .iter()
             .filter(|message| message.role != "system")
         {
+            let gemini_role = if message.role == "assistant" {
+                "model"
+            } else {
+                &message.role
+            };
             contents.push(serde_json::json!({
-                "role": message.role,
+                "role": gemini_role,
                 "parts": message
                     .content_blocks()
                     .iter()
