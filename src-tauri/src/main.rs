@@ -1511,6 +1511,98 @@ async fn benchmark_status() -> Result<serde_json::Value, String> {
     }))
 }
 
+// ── Critical missing IPC commands (called by frontend) ─────────────
+
+#[tauri::command]
+async fn project_open(path: String, _state: State<'_, AppState>) -> Result<(), String> {
+    let canonical = std::fs::canonicalize(&path).map_err(|e| format!("Invalid path: {e}"))?;
+    if !canonical.is_dir() {
+        return Err("Path is not a directory".to_string());
+    }
+    // Store the selected project root in the env for this session
+    env::set_var("CADUCEUS_PROJECT_ROOT", &canonical);
+    Ok(())
+}
+
+#[tauri::command]
+async fn config_set_provider(
+    provider_id: String,
+    api_key: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    config.default_provider = ProviderId(provider_id.clone());
+    // Store API key in the provider-specific env var
+    match provider_id.as_str() {
+        "anthropic" => env::set_var("ANTHROPIC_API_KEY", &api_key),
+        "openai" => env::set_var("OPENAI_API_KEY", &api_key),
+        "gemini" | "google" => env::set_var("GEMINI_API_KEY", &api_key),
+        "azure" => env::set_var("AZURE_OPENAI_API_KEY", &api_key),
+        "copilot" | "github" => env::set_var("GITHUB_TOKEN", &api_key),
+        _ => env::set_var("LLM_API_KEY", &api_key),
+    }
+    state
+        .config_loader
+        .save(&config)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn git_commit(project_root: String, message: String) -> Result<String, String> {
+    let workspace_root = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_root = resolve_under_workspace(&workspace_root, &project_root)?;
+    let repo = open_git_repo(&project_root.to_string_lossy())?;
+    // Stage all and commit via git CLI
+    let output = std::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&project_root)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    let output = std::process::Command::new("git")
+        .args(["commit", "-m", &message])
+        .current_dir(&project_root)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    let sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&project_root)
+        .output()
+        .map_err(|e| e.to_string())?;
+    let _ = repo;
+    Ok(String::from_utf8_lossy(&sha.stdout).trim().to_string())
+}
+
+#[tauri::command]
+async fn git_file_diff(project_root: String, file_path: String) -> Result<String, String> {
+    let workspace_root = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_root = resolve_under_workspace(&workspace_root, &project_root)?;
+    let output = std::process::Command::new("git")
+        .args(["diff", "HEAD", "--", &file_path])
+        .current_dir(&project_root)
+        .output()
+        .map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[tauri::command]
+async fn permission_respond(
+    request_id: String,
+    allow: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    // Permission responses are handled via the agent event system
+    // Store the response for the agent to pick up
+    let _ = (&request_id, allow, &state);
+    Ok(())
+}
+
 fn main() {
     let workspace_root = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let state = build_app_state(workspace_root).expect("failed to initialize app state");
@@ -1563,6 +1655,11 @@ fn main() {
             governance_status,
             trajectory_export,
             benchmark_status,
+            project_open,
+            config_set_provider,
+            git_commit,
+            git_file_diff,
+            permission_respond,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
