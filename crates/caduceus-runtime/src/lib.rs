@@ -1,3 +1,4 @@
+pub mod browser;
 pub mod sandbox;
 use caduceus_core::{CaduceusError, Result};
 use serde::{Deserialize, Serialize};

@@ -2,6 +2,7 @@ use caduceus_core::{ModelId, ProviderId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
 
 // ── Token counting ─────────────────────────────────────────────────────────────
 
@@ -392,6 +393,272 @@ impl Default for BudgetEnforcer {
     }
 }
 
+// ── OTLP Telemetry Export ──────────────────────────────────────────────────────
+
+/// A single telemetry event/metric to export.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryEvent {
+    /// Metric name following Claude Code convention, e.g. "caduceus.token.usage"
+    pub name: String,
+    pub timestamp: DateTime<Utc>,
+    /// Key/value attributes, e.g. {"type": "input", "model": "claude-sonnet-4-5"}
+    pub attributes: HashMap<String, String>,
+    /// The numeric metric value
+    pub value: f64,
+}
+
+impl TelemetryEvent {
+    pub fn new(name: impl Into<String>, value: f64) -> Self {
+        Self {
+            name: name.into(),
+            timestamp: Utc::now(),
+            attributes: HashMap::new(),
+            value,
+        }
+    }
+
+    pub fn with_attr(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.attributes.insert(key.into(), value.into());
+        self
+    }
+}
+
+/// Configuration for the OTLP exporter.
+#[derive(Debug, Clone)]
+pub struct OtelExporterConfig {
+    /// OTLP HTTP endpoint, e.g. "http://localhost:4318"
+    pub endpoint: String,
+    pub enabled: bool,
+    pub export_interval: Duration,
+    /// Privacy: do not log prompt contents by default
+    pub log_prompts: bool,
+}
+
+impl Default for OtelExporterConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://localhost:4318".into(),
+            enabled: std::env::var("CADUCEUS_ENABLE_TELEMETRY")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            export_interval: Duration::from_secs(30),
+            log_prompts: false,
+        }
+    }
+}
+
+/// OTLP JSON exporter that sends metrics to an OpenTelemetry Collector
+/// via HTTP POST to the `/v1/metrics` endpoint.
+pub struct OtelExporter {
+    pub endpoint: String,
+    pub enabled: bool,
+    pub export_interval: Duration,
+    pub log_prompts: bool,
+    client: reqwest::Client,
+    pending: tokio::sync::Mutex<Vec<TelemetryEvent>>,
+}
+
+impl OtelExporter {
+    pub fn new(config: OtelExporterConfig) -> Self {
+        Self {
+            endpoint: config.endpoint,
+            enabled: config.enabled,
+            export_interval: config.export_interval,
+            log_prompts: config.log_prompts,
+            client: reqwest::Client::new(),
+            pending: tokio::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::new(OtelExporterConfig::default())
+    }
+
+    /// Export a single metric event. Batches internally; use `flush()` to send.
+    pub async fn export_metric(&self, event: TelemetryEvent) {
+        if !self.enabled {
+            return;
+        }
+        self.pending.lock().await.push(event);
+    }
+
+    /// Export a batch of events immediately.
+    pub async fn export_batch(&self, events: Vec<TelemetryEvent>) -> anyhow::Result<()> {
+        if !self.enabled || events.is_empty() {
+            return Ok(());
+        }
+        let payload = build_otlp_payload(&events);
+        let url = format!("{}/v1/metrics", self.endpoint.trim_end_matches('/'));
+        self.client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_string(&payload)?)
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    /// Flush all pending metrics to the OTLP endpoint.
+    pub async fn flush(&self) -> anyhow::Result<()> {
+        let events: Vec<TelemetryEvent> = {
+            let mut pending = self.pending.lock().await;
+            std::mem::take(&mut *pending)
+        };
+        self.export_batch(events).await
+    }
+
+    // ── Convenience constructors ───────────────────────────────────────────────
+
+    pub fn token_usage_event(
+        token_type: &str,
+        count: u64,
+        model: &str,
+        provider: &str,
+    ) -> TelemetryEvent {
+        TelemetryEvent::new("caduceus.token.usage", count as f64)
+            .with_attr("type", token_type)
+            .with_attr("model", model)
+            .with_attr("provider", provider)
+    }
+
+    pub fn cost_event(usd: f64, model: &str, provider: &str) -> TelemetryEvent {
+        TelemetryEvent::new("caduceus.cost.usage", usd)
+            .with_attr("model", model)
+            .with_attr("provider", provider)
+    }
+
+    pub fn session_count_event(count: u64) -> TelemetryEvent {
+        TelemetryEvent::new("caduceus.session.count", count as f64)
+    }
+
+    pub fn tool_execution_event(
+        tool_name: &str,
+        duration_ms: u64,
+        success: bool,
+    ) -> TelemetryEvent {
+        TelemetryEvent::new("caduceus.tool.execution", duration_ms as f64)
+            .with_attr("tool", tool_name)
+            .with_attr("success", if success { "true" } else { "false" })
+    }
+
+    pub fn active_time_event(total_ms: u64) -> TelemetryEvent {
+        TelemetryEvent::new("caduceus.active_time.total", total_ms as f64)
+    }
+}
+
+/// Build a simplified OTLP JSON payload for the `/v1/metrics` endpoint.
+fn build_otlp_payload(events: &[TelemetryEvent]) -> serde_json::Value {
+    let data_points: Vec<serde_json::Value> = events
+        .iter()
+        .map(|e| {
+            let attrs: Vec<serde_json::Value> = e
+                .attributes
+                .iter()
+                .map(|(k, v)| {
+                    serde_json::json!({
+                        "key": k,
+                        "value": {"stringValue": v}
+                    })
+                })
+                .collect();
+
+            serde_json::json!({
+                "attributes": attrs,
+                "startTimeUnixNano": e.timestamp.timestamp_nanos_opt().unwrap_or(0).to_string(),
+                "timeUnixNano": e.timestamp.timestamp_nanos_opt().unwrap_or(0).to_string(),
+                "asDouble": e.value
+            })
+        })
+        .collect();
+
+    // Group by metric name
+    let mut grouped: std::collections::HashMap<String, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+    for (i, e) in events.iter().enumerate() {
+        grouped
+            .entry(e.name.clone())
+            .or_default()
+            .push(data_points[i].clone());
+    }
+
+    let metrics: Vec<serde_json::Value> = grouped
+        .into_iter()
+        .map(|(name, points)| {
+            serde_json::json!({
+                "name": name,
+                "gauge": {
+                    "dataPoints": points
+                }
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "resourceMetrics": [{
+            "resource": {
+                "attributes": [{
+                    "key": "service.name",
+                    "value": {"stringValue": "caduceus"}
+                }]
+            },
+            "scopeMetrics": [{
+                "scope": {"name": "caduceus-telemetry"},
+                "metrics": metrics
+            }]
+        }]
+    })
+}
+
+/// Simple in-session metrics tracker for the `/telemetry` slash command.
+#[derive(Debug, Default)]
+pub struct SessionMetrics {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost_usd: f64,
+    pub session_count: u64,
+    pub tool_executions: u64,
+    pub active_time_ms: u64,
+}
+
+impl SessionMetrics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "Session Telemetry:\n  Input tokens:      {}\n  Output tokens:     {}\n  Cache read:        {}\n  Cache write:       {}\n  Cost (USD):        ${:.6}\n  Sessions:          {}\n  Tool executions:   {}\n  Active time (ms):  {}",
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+            self.cost_usd,
+            self.session_count,
+            self.tool_executions,
+            self.active_time_ms,
+        )
+    }
+
+    pub fn to_events(&self, model: &str, provider: &str) -> Vec<TelemetryEvent> {
+        vec![
+            OtelExporter::token_usage_event("input", self.input_tokens, model, provider),
+            OtelExporter::token_usage_event("output", self.output_tokens, model, provider),
+            OtelExporter::token_usage_event("cache_read", self.cache_read_tokens, model, provider),
+            OtelExporter::token_usage_event(
+                "cache_write",
+                self.cache_write_tokens,
+                model,
+                provider,
+            ),
+            OtelExporter::cost_event(self.cost_usd, model, provider),
+            OtelExporter::session_count_event(self.session_count),
+            OtelExporter::active_time_event(self.active_time_ms),
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,5 +919,144 @@ mod tests {
         assert!(msg.contains("Budget exceeded"));
         assert!(msg.contains("0.8000"));
         assert!(msg.contains("1.0000"));
+    }
+
+    // ── OtelExporter tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn telemetry_event_new() {
+        let event = TelemetryEvent::new("caduceus.token.usage", 42.0)
+            .with_attr("type", "input")
+            .with_attr("model", "claude-sonnet-4-5");
+        assert_eq!(event.name, "caduceus.token.usage");
+        assert_eq!(event.value, 42.0);
+        assert_eq!(
+            event.attributes.get("type").map(String::as_str),
+            Some("input")
+        );
+        assert_eq!(
+            event.attributes.get("model").map(String::as_str),
+            Some("claude-sonnet-4-5")
+        );
+    }
+
+    #[test]
+    fn otel_exporter_disabled_by_default() {
+        // Without CADUCEUS_ENABLE_TELEMETRY env var, should be disabled
+        std::env::remove_var("CADUCEUS_ENABLE_TELEMETRY");
+        let config = OtelExporterConfig::default();
+        assert!(!config.enabled);
+        assert!(!config.log_prompts);
+    }
+
+    #[test]
+    fn otel_convenience_constructors() {
+        let token_ev = OtelExporter::token_usage_event("input", 1000, "sonnet", "anthropic");
+        assert_eq!(token_ev.name, "caduceus.token.usage");
+        assert_eq!(token_ev.value, 1000.0);
+        assert_eq!(
+            token_ev.attributes.get("type").map(String::as_str),
+            Some("input")
+        );
+
+        let cost_ev = OtelExporter::cost_event(0.005, "gpt-4o", "openai");
+        assert_eq!(cost_ev.name, "caduceus.cost.usage");
+        assert!((cost_ev.value - 0.005).abs() < f64::EPSILON);
+
+        let session_ev = OtelExporter::session_count_event(3);
+        assert_eq!(session_ev.name, "caduceus.session.count");
+        assert_eq!(session_ev.value, 3.0);
+
+        let tool_ev = OtelExporter::tool_execution_event("bash", 120, true);
+        assert_eq!(tool_ev.name, "caduceus.tool.execution");
+        assert_eq!(tool_ev.value, 120.0);
+        assert_eq!(
+            tool_ev.attributes.get("success").map(String::as_str),
+            Some("true")
+        );
+
+        let time_ev = OtelExporter::active_time_event(5000);
+        assert_eq!(time_ev.name, "caduceus.active_time.total");
+        assert_eq!(time_ev.value, 5000.0);
+    }
+
+    #[test]
+    fn build_otlp_payload_structure() {
+        let events = vec![
+            TelemetryEvent::new("caduceus.token.usage", 100.0).with_attr("type", "input"),
+            TelemetryEvent::new("caduceus.cost.usage", 0.001),
+        ];
+        let payload = build_otlp_payload(&events);
+        assert!(payload["resourceMetrics"].is_array());
+        let rm = &payload["resourceMetrics"][0];
+        assert_eq!(rm["resource"]["attributes"][0]["key"], "service.name");
+        let metrics = &rm["scopeMetrics"][0]["metrics"];
+        assert!(metrics.is_array());
+        assert!(metrics.as_array().unwrap().len() >= 1);
+    }
+
+    #[test]
+    fn session_metrics_summary() {
+        let mut m = SessionMetrics::new();
+        m.input_tokens = 500;
+        m.output_tokens = 200;
+        m.cost_usd = 0.0025;
+        m.tool_executions = 7;
+        let s = m.summary();
+        assert!(s.contains("500"));
+        assert!(s.contains("200"));
+        assert!(s.contains("0.002500"));
+        assert!(s.contains("7"));
+    }
+
+    #[test]
+    fn session_metrics_to_events() {
+        let mut m = SessionMetrics::new();
+        m.input_tokens = 100;
+        m.cache_read_tokens = 50;
+        m.cost_usd = 0.001;
+        m.session_count = 2;
+        let events = m.to_events("claude-sonnet-4-5", "anthropic");
+        assert_eq!(events.len(), 7);
+        let names: Vec<&str> = events.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"caduceus.token.usage"));
+        assert!(names.contains(&"caduceus.cost.usage"));
+        assert!(names.contains(&"caduceus.session.count"));
+        assert!(names.contains(&"caduceus.active_time.total"));
+    }
+
+    #[tokio::test]
+    async fn otel_exporter_disabled_does_not_queue() {
+        let config = OtelExporterConfig {
+            endpoint: "http://localhost:4318".into(),
+            enabled: false,
+            export_interval: Duration::from_secs(30),
+            log_prompts: false,
+        };
+        let exporter = OtelExporter::new(config);
+        exporter
+            .export_metric(TelemetryEvent::new("test.metric", 1.0))
+            .await;
+        let pending = exporter.pending.lock().await;
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn otel_exporter_queues_when_enabled() {
+        let config = OtelExporterConfig {
+            endpoint: "http://localhost:4318".into(),
+            enabled: true,
+            export_interval: Duration::from_secs(30),
+            log_prompts: false,
+        };
+        let exporter = OtelExporter::new(config);
+        exporter
+            .export_metric(TelemetryEvent::new("caduceus.token.usage", 99.0))
+            .await;
+        exporter
+            .export_metric(TelemetryEvent::new("caduceus.cost.usage", 0.005))
+            .await;
+        let pending = exporter.pending.lock().await;
+        assert_eq!(pending.len(), 2);
     }
 }

@@ -1,3 +1,6 @@
+pub mod automations;
+pub mod background;
+pub mod bugbot;
 pub mod headless;
 pub mod instructions;
 pub mod kanban;
@@ -231,6 +234,8 @@ pub enum SlashCommand {
     Mode(String),
     Checkpoint(CheckpointCommand),
     Kanban(KanbanCommand),
+    Review,
+    Telemetry,
     Exit,
     Unknown(String),
 }
@@ -292,6 +297,8 @@ impl SlashCommand {
             "agents" => Self::Agents,
             "skills" => Self::Skills,
             "exit" | "quit" => Self::Exit,
+            "review" => Self::Review,
+            "telemetry" => Self::Telemetry,
             "model" => Self::Model(args.to_string()),
             "provider" => Self::Provider(args.to_string()),
             "effort" => Self::Effort(args.to_string()),
@@ -353,6 +360,8 @@ impl SlashCommand {
                 format!("Add kanban card to backlog: {title}")
             }
             Self::Exit => "Exit the current session".to_string(),
+            Self::Review => "Run BugBot on current git diff".to_string(),
+            Self::Telemetry => "Show current session telemetry metrics".to_string(),
             Self::Unknown(command) => format!("Unknown slash command: {command}"),
         }
     }
