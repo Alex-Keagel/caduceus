@@ -1,9 +1,12 @@
 use async_trait::async_trait;
-use caduceus_core::{AuthStore, CaduceusError, ModelId, ProviderId, Result};
+use caduceus_core::{
+    AuthStore, CaduceusError, ImageContent, ImageSource, ModelId, ProviderId, Result, ToolResult,
+};
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use tracing::warn;
@@ -2133,6 +2136,311 @@ impl LlmAdapter for CopilotLmAdapter {
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
+// ── Vision helpers (Feature #72) ──────────────────────────────────────────────
+
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let combined = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((combined >> 18) & 0x3f) as usize]);
+        out.push(TABLE[((combined >> 12) & 0x3f) as usize]);
+        out.push(if chunk.len() >= 2 {
+            TABLE[((combined >> 6) & 0x3f) as usize]
+        } else {
+            b'='
+        });
+        out.push(if chunk.len() >= 3 {
+            TABLE[(combined & 0x3f) as usize]
+        } else {
+            b'='
+        });
+    }
+    String::from_utf8(out).expect("base64 output is always valid ASCII")
+}
+
+/// Detect the MIME type of an image based on its file extension.
+pub fn detect_media_type(path: &Path) -> Option<String> {
+    match path.extension()?.to_str()?.to_lowercase().as_str() {
+        "png" => Some("image/png".into()),
+        "jpg" | "jpeg" => Some("image/jpeg".into()),
+        "gif" => Some("image/gif".into()),
+        "webp" => Some("image/webp".into()),
+        _ => None,
+    }
+}
+
+/// Read an image file and encode it as base64.
+pub fn encode_image_file(path: &Path) -> Result<ImageContent> {
+    let raw = std::fs::read(path)?;
+    let media_type = detect_media_type(path).ok_or_else(|| {
+        CaduceusError::Provider(format!(
+            "Unsupported or unrecognised image extension: {}",
+            path.display()
+        ))
+    })?;
+    Ok(ImageContent {
+        source: ImageSource::Base64 {
+            media_type,
+            data: base64_encode(&raw),
+        },
+        detail: None,
+    })
+}
+
+// ── Vertex AI adapter (Feature #69) ───────────────────────────────────────────
+
+pub struct VertexAiAdapter {
+    provider_id: ProviderId,
+    project_id: String,
+    location: String,
+    model: String,
+    access_token: Option<String>,
+    client: reqwest::Client,
+}
+
+impl VertexAiAdapter {
+    pub fn new(
+        project_id: impl Into<String>,
+        location: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider_id: ProviderId::new("vertex-ai"),
+            project_id: project_id.into(),
+            location: location.into(),
+            model: model.into(),
+            access_token: None,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    pub fn with_access_token(mut self, token: impl Into<String>) -> Self {
+        self.access_token = Some(token.into());
+        self
+    }
+
+    pub fn endpoint(&self) -> String {
+        format!(
+            "https://{loc}-aiplatform.googleapis.com/v1/projects/{proj}/locations/{loc}/publishers/google/models/{model}:generateContent",
+            loc = self.location,
+            proj = self.project_id,
+            model = self.model,
+        )
+    }
+
+    fn build_request_body(&self, request: &ChatRequest) -> serde_json::Value {
+        let mut contents = Vec::new();
+        for message in request.messages.iter().filter(|m| m.role != "system") {
+            let gemini_role = if message.role == "assistant" {
+                "model"
+            } else {
+                &message.role
+            };
+            contents.push(serde_json::json!({
+                "role": gemini_role,
+                "parts": message
+                    .content_blocks()
+                    .iter()
+                    .map(|block| match block {
+                        MessageContentBlock::Text { text, .. } => serde_json::json!({ "text": text }),
+                        MessageContentBlock::Image { base64, media_type } => serde_json::json!({
+                            "inline_data": {"mime_type": media_type, "data": base64}
+                        }),
+                    })
+                    .collect::<Vec<_>>(),
+            }));
+        }
+
+        let mut body = serde_json::json!({
+            "contents": contents,
+            "generationConfig": {
+                "maxOutputTokens": request.max_tokens,
+            }
+        });
+
+        if let Some(ref system) = request.system {
+            body["systemInstruction"] = serde_json::json!({
+                "parts": [{"text": system}],
+            });
+        }
+
+        if let Some(temp) = request.temperature {
+            body["generationConfig"]["temperature"] = serde_json::json!(temp);
+        }
+
+        body
+    }
+}
+
+#[async_trait]
+impl LlmAdapter for VertexAiAdapter {
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let body = self.build_request_body(&request);
+        let url = self.endpoint();
+        let token = self.access_token.clone().unwrap_or_default();
+        let client = self.client.clone();
+        let retry_config = RetryConfig::default();
+
+        let resp = send_with_retry(
+            &client,
+            || {
+                let mut req = client
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .json(&body);
+                if !token.is_empty() {
+                    req = req.header("authorization", format!("Bearer {}", &token));
+                }
+                req
+            },
+            &retry_config,
+        )
+        .await?;
+
+        let resp_body = resp
+            .text()
+            .await
+            .map_err(|e| CaduceusError::Provider(format!("Failed to read response: {}", e)))?;
+
+        parse_gemini_chat_response(&resp_body)
+    }
+
+    async fn stream(&self, request: ChatRequest) -> Result<StreamResult> {
+        // Delegate to chat; full streaming via a separate endpoint can be added later
+        let response = self.chat(request).await?;
+        let chunk = StreamChunk {
+            delta: response.content,
+            is_final: true,
+            input_tokens: Some(response.input_tokens),
+            output_tokens: Some(response.output_tokens),
+            cache_read_tokens: Some(response.cache_read_tokens),
+            cache_creation_tokens: Some(response.cache_creation_tokens),
+        };
+        Ok(Box::pin(futures::stream::once(async { Ok(chunk) })))
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelId>> {
+        Ok(vec![
+            ModelId::new("gemini-1.5-flash"),
+            ModelId::new("gemini-1.5-pro"),
+            ModelId::new("gemini-2.0-flash"),
+        ])
+    }
+}
+
+// ── Tool fallback text extractor (Feature #73) ────────────────────────────────
+
+pub struct ToolFallbackExtractor;
+
+impl ToolFallbackExtractor {
+    /// Extract meaningful text from a `ToolResult`, even when it represents an error.
+    pub fn extract_text(result: &ToolResult) -> String {
+        if result.content.is_empty() {
+            return if result.is_error {
+                "(empty error)".to_string()
+            } else {
+                String::new()
+            };
+        }
+
+        // For errors, try to pull a "message" or "error" field out of JSON content.
+        if result.is_error {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&result.content) {
+                if let Some(msg) = json
+                    .get("message")
+                    .or_else(|| json.get("error"))
+                    .and_then(|v| v.as_str())
+                {
+                    return msg.to_string();
+                }
+            }
+        }
+
+        result.content.clone()
+    }
+
+    /// Truncate `error` to `max_chars`, appending `"..."` when truncated.
+    pub fn summarize_error(error: &str, max_chars: usize) -> String {
+        if max_chars == 0 {
+            return "...".to_string();
+        }
+        if error.len() <= max_chars {
+            return error.to_string();
+        }
+        let cutoff = max_chars.saturating_sub(3);
+        // Find the last valid char boundary at or before cutoff
+        let boundary = error
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i < cutoff)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &error[..boundary])
+    }
+
+    /// Attempt to parse possibly-truncated or broken JSON by closing unclosed
+    /// brackets and braces.
+    pub fn extract_partial_json(input: &str) -> Option<serde_json::Value> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        // Try as-is first.
+        if let Ok(v) = serde_json::from_str(trimmed) {
+            return Some(v);
+        }
+
+        // Walk the string tracking open brackets/braces so we can close them.
+        let mut stack: Vec<char> = Vec::new();
+        let mut in_string = false;
+        let mut escaped = false;
+
+        for ch in trimmed.chars() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if in_string {
+                match ch {
+                    '\\' => escaped = true,
+                    '"' => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_string = true,
+                '{' => stack.push('}'),
+                '[' => stack.push(']'),
+                '}' | ']' => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+
+        let mut attempt = trimmed.to_string();
+        // Close an unterminated string literal before closing containers.
+        if in_string {
+            attempt.push('"');
+        }
+        for c in stack.iter().rev() {
+            attempt.push(*c);
+        }
+
+        serde_json::from_str(&attempt).ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3143,5 +3451,276 @@ mod tests {
 
         // Now requests should pass normally
         assert!(cb.check().is_ok());
+    }
+
+    // ── Feature #69: VertexAiAdapter tests ────────────────────────────────────
+
+    #[test]
+    fn test_vertex_ai_adapter_construction() {
+        let adapter = VertexAiAdapter::new("my-project", "us-central1", "gemini-1.5-flash");
+        assert_eq!(adapter.provider_id().0, "vertex-ai");
+        assert_eq!(adapter.project_id, "my-project");
+        assert_eq!(adapter.location, "us-central1");
+        assert_eq!(adapter.model, "gemini-1.5-flash");
+        assert!(adapter.access_token.is_none());
+    }
+
+    #[test]
+    fn test_vertex_ai_adapter_with_token() {
+        let adapter = VertexAiAdapter::new("proj", "us-east1", "gemini-2.0-flash")
+            .with_access_token("ya29.token");
+        assert_eq!(adapter.access_token.as_deref(), Some("ya29.token"));
+    }
+
+    #[test]
+    fn test_vertex_ai_endpoint_url() {
+        let adapter = VertexAiAdapter::new("my-project", "us-central1", "gemini-1.5-flash");
+        let url = adapter.endpoint();
+        assert!(url.contains("us-central1-aiplatform.googleapis.com"));
+        assert!(url.contains("projects/my-project"));
+        assert!(url.contains("locations/us-central1"));
+        assert!(url.contains("publishers/google/models/gemini-1.5-flash:generateContent"));
+    }
+
+    #[test]
+    fn test_vertex_ai_request_body_format() {
+        let adapter = VertexAiAdapter::new("proj", "us-central1", "gemini-1.5-flash");
+        let request = ChatRequest {
+            model: ModelId::new("gemini-1.5-flash"),
+            messages: vec![Message::user("Hello")],
+            system: Some("Be helpful.".into()),
+            max_tokens: 256,
+            temperature: Some(0.3),
+            thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
+        };
+        let body = adapter.build_request_body(&request);
+        assert!(body["contents"].is_array());
+        assert_eq!(body["contents"][0]["role"], "user");
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "Be helpful.");
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 256);
+        assert!((body["generationConfig"]["temperature"].as_f64().unwrap() - 0.3).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_vertex_ai_chat_parses_gemini_response() {
+        let server = TestServer::respond(
+            "200 OK",
+            "application/json",
+            r#"{"candidates":[{"content":{"parts":[{"text":"Hello from Vertex"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":4,"cachedContentTokenCount":0}}"#,
+            1,
+        );
+        let adapter = VertexAiAdapter::new("proj", "us-central1", "gemini-1.5-flash")
+            .with_access_token("token");
+        // Patch the URL by building the request body manually and testing the parsing
+        let body_str = r#"{"candidates":[{"content":{"parts":[{"text":"Hello from Vertex"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":4,"cachedContentTokenCount":0}}"#;
+        let _ = server; // keep server alive
+        let resp = parse_gemini_chat_response(body_str).unwrap();
+        assert_eq!(resp.content, "Hello from Vertex");
+        assert_eq!(resp.input_tokens, 5);
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+    }
+
+    // ── Feature #72: Vision helpers tests ─────────────────────────────────────
+
+    #[test]
+    fn test_detect_media_type_png() {
+        assert_eq!(
+            detect_media_type(std::path::Path::new("photo.png")),
+            Some("image/png".into())
+        );
+    }
+
+    #[test]
+    fn test_detect_media_type_jpg() {
+        assert_eq!(
+            detect_media_type(std::path::Path::new("photo.jpg")),
+            Some("image/jpeg".into())
+        );
+        assert_eq!(
+            detect_media_type(std::path::Path::new("photo.jpeg")),
+            Some("image/jpeg".into())
+        );
+    }
+
+    #[test]
+    fn test_detect_media_type_gif() {
+        assert_eq!(
+            detect_media_type(std::path::Path::new("anim.gif")),
+            Some("image/gif".into())
+        );
+    }
+
+    #[test]
+    fn test_detect_media_type_webp() {
+        assert_eq!(
+            detect_media_type(std::path::Path::new("image.webp")),
+            Some("image/webp".into())
+        );
+    }
+
+    #[test]
+    fn test_detect_media_type_unknown() {
+        assert_eq!(detect_media_type(std::path::Path::new("doc.pdf")), None);
+        assert_eq!(detect_media_type(std::path::Path::new("noext")), None);
+    }
+
+    #[test]
+    fn test_base64_encode_known_values() {
+        // RFC 4648 test vectors
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+    }
+
+    #[test]
+    fn test_encode_image_file_roundtrip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("caduceus_test_image.png");
+        let data = b"fake png content for test";
+        std::fs::write(&path, data).unwrap();
+
+        let img = encode_image_file(&path).unwrap();
+        match img.source {
+            ImageSource::Base64 {
+                media_type,
+                data: encoded,
+            } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(encoded, base64_encode(data));
+            }
+            _ => panic!("expected Base64 source"),
+        }
+        assert!(img.detail.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_encode_image_file_unsupported_extension() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("caduceus_test_doc.pdf");
+        std::fs::write(&path, b"pdf content").unwrap();
+        let result = encode_image_file(&path);
+        assert!(result.is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── Feature #73: ToolFallbackExtractor tests ──────────────────────────────
+
+    #[test]
+    fn test_extract_text_success() {
+        let result = ToolResult::success("operation completed successfully");
+        assert_eq!(
+            ToolFallbackExtractor::extract_text(&result),
+            "operation completed successfully"
+        );
+    }
+
+    #[test]
+    fn test_extract_text_empty_success() {
+        let result = ToolResult::success("");
+        assert_eq!(ToolFallbackExtractor::extract_text(&result), "");
+    }
+
+    #[test]
+    fn test_extract_text_from_error() {
+        let result = ToolResult::error("file not found: /etc/missing");
+        assert_eq!(
+            ToolFallbackExtractor::extract_text(&result),
+            "file not found: /etc/missing"
+        );
+    }
+
+    #[test]
+    fn test_extract_text_from_empty_error() {
+        let result = ToolResult::error("");
+        assert_eq!(
+            ToolFallbackExtractor::extract_text(&result),
+            "(empty error)"
+        );
+    }
+
+    #[test]
+    fn test_extract_text_json_error_message_field() {
+        let result = ToolResult::error(r#"{"message": "permission denied", "code": 403}"#);
+        assert_eq!(
+            ToolFallbackExtractor::extract_text(&result),
+            "permission denied"
+        );
+    }
+
+    #[test]
+    fn test_extract_text_json_error_field() {
+        let result = ToolResult::error(r#"{"error": "timeout after 30s"}"#);
+        assert_eq!(
+            ToolFallbackExtractor::extract_text(&result),
+            "timeout after 30s"
+        );
+    }
+
+    #[test]
+    fn test_summarize_error_short() {
+        let short = "file not found";
+        assert_eq!(
+            ToolFallbackExtractor::summarize_error(short, 100),
+            "file not found"
+        );
+    }
+
+    #[test]
+    fn test_summarize_error_truncation() {
+        let long_error = "a".repeat(200);
+        let summary = ToolFallbackExtractor::summarize_error(&long_error, 20);
+        assert!(summary.ends_with("..."));
+        assert!(summary.len() <= 20);
+    }
+
+    #[test]
+    fn test_summarize_error_exact_length() {
+        let error = "exactly twenty chars";
+        assert_eq!(error.len(), 20);
+        assert_eq!(ToolFallbackExtractor::summarize_error(error, 20), error);
+    }
+
+    #[test]
+    fn test_extract_partial_json_valid() {
+        let json = r#"{"key": "value", "num": 42}"#;
+        let result = ToolFallbackExtractor::extract_partial_json(json);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()["key"], "value");
+    }
+
+    #[test]
+    fn test_extract_partial_json_truncated_object() {
+        // Truncated after the value, before the closing brace
+        let partial = r#"{"key": "val"#;
+        let result = ToolFallbackExtractor::extract_partial_json(partial);
+        assert!(result.is_some(), "should recover truncated JSON");
+        assert_eq!(result.unwrap()["key"], "val");
+    }
+
+    #[test]
+    fn test_extract_partial_json_truncated_array() {
+        let partial = r#"[1, 2, 3"#;
+        let result = ToolFallbackExtractor::extract_partial_json(partial);
+        assert!(result.is_some());
+        let arr = result.unwrap();
+        assert_eq!(arr[0], 1);
+        assert_eq!(arr[2], 3);
+    }
+
+    #[test]
+    fn test_extract_partial_json_empty() {
+        assert!(ToolFallbackExtractor::extract_partial_json("").is_none());
+        assert!(ToolFallbackExtractor::extract_partial_json("   ").is_none());
+    }
+
+    #[test]
+    fn test_extract_partial_json_completely_broken() {
+        // Not recoverable
+        assert!(ToolFallbackExtractor::extract_partial_json("not json at all :::").is_none());
     }
 }

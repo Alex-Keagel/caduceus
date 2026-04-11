@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // ── Agent execution modes ──────────────────────────────────────────────────────
 
@@ -150,6 +150,120 @@ impl AgentMode {
 impl std::fmt::Display for AgentMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.name())
+    }
+}
+
+// ── Agent personas ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentPersona {
+    pub name: String,
+    pub description: String,
+    pub system_prompt_prefix: String,
+    pub default_mode: String,
+    pub preferred_tools: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+}
+
+pub struct PersonaRegistry {
+    personas: HashMap<String, AgentPersona>,
+}
+
+impl PersonaRegistry {
+    pub fn new() -> Self {
+        Self {
+            personas: HashMap::new(),
+        }
+    }
+
+    pub fn register(&mut self, persona: AgentPersona) {
+        self.personas.insert(persona.name.clone(), persona);
+    }
+
+    pub fn get(&self, name: &str) -> Option<&AgentPersona> {
+        self.personas.get(name)
+    }
+
+    pub fn list(&self) -> Vec<&AgentPersona> {
+        let mut personas: Vec<&AgentPersona> = self.personas.values().collect();
+        personas.sort_by(|left, right| left.name.cmp(&right.name));
+        personas
+    }
+
+    pub fn builtin_personas() -> Self {
+        let mut registry = Self::new();
+        for persona in [
+            AgentPersona {
+                name: "builder".to_string(),
+                description: "Implementation-focused persona for making and validating code changes."
+                    .to_string(),
+                system_prompt_prefix:
+                    "You are a builder persona. Prioritize executable changes, validation, and direct progress."
+                        .to_string(),
+                default_mode: AgentMode::Act.name().to_string(),
+                preferred_tools: vec!["read_file".into(), "edit_file".into(), "bash".into()],
+                temperature: 0.2,
+                max_tokens: 4_096,
+            },
+            AgentPersona {
+                name: "planner".to_string(),
+                description: "Strategic persona for breaking work into safe, ordered steps."
+                    .to_string(),
+                system_prompt_prefix:
+                    "You are a planner persona. Focus on sequencing, risks, and crisp action plans."
+                        .to_string(),
+                default_mode: AgentMode::Plan.name().to_string(),
+                preferred_tools: vec!["read_file".into(), "glob_search".into(), "grep_search".into()],
+                temperature: 0.1,
+                max_tokens: 3_072,
+            },
+            AgentPersona {
+                name: "explorer".to_string(),
+                description: "Investigative persona for understanding unfamiliar codebases and flows."
+                    .to_string(),
+                system_prompt_prefix:
+                    "You are an explorer persona. Search broadly, connect findings, and summarize what matters."
+                        .to_string(),
+                default_mode: AgentMode::Research.name().to_string(),
+                preferred_tools: vec!["glob_search".into(), "grep_search".into(), "read_file".into()],
+                temperature: 0.4,
+                max_tokens: 4_096,
+            },
+            AgentPersona {
+                name: "reviewer".to_string(),
+                description: "Critical persona for identifying defects, regressions, and missing validation."
+                    .to_string(),
+                system_prompt_prefix:
+                    "You are a reviewer persona. Look for correctness issues, edge cases, and quality gaps."
+                        .to_string(),
+                default_mode: AgentMode::Review.name().to_string(),
+                preferred_tools: vec!["read_file".into(), "git_diff".into(), "grep_search".into()],
+                temperature: 0.1,
+                max_tokens: 3_072,
+            },
+            AgentPersona {
+                name: "researcher".to_string(),
+                description: "Evidence-driven persona for gathering context, sources, and alternatives."
+                    .to_string(),
+                system_prompt_prefix:
+                    "You are a researcher persona. Collect evidence, compare options, and surface trade-offs."
+                        .to_string(),
+                default_mode: AgentMode::Research.name().to_string(),
+                preferred_tools: vec!["web_fetch".into(), "read_file".into(), "grep_search".into()],
+                temperature: 0.3,
+                max_tokens: 6_144,
+            },
+        ] {
+            registry.register(persona);
+        }
+        registry
+    }
+}
+
+impl Default for PersonaRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -495,6 +609,66 @@ mod tests {
     fn mode_display() {
         assert_eq!(format!("{}", AgentMode::Plan), "plan");
         assert_eq!(format!("{}", AgentMode::Autopilot), "autopilot");
+    }
+
+    #[test]
+    fn builtin_personas_are_registered() {
+        let registry = PersonaRegistry::builtin_personas();
+
+        assert_eq!(registry.list().len(), 5);
+        assert_eq!(
+            registry
+                .get("builder")
+                .map(|persona| persona.default_mode.as_str()),
+            Some("act")
+        );
+        assert_eq!(
+            registry
+                .get("explorer")
+                .map(|persona| persona.default_mode.as_str()),
+            Some("research")
+        );
+    }
+
+    #[test]
+    fn persona_lookup_returns_registered_persona() {
+        let mut registry = PersonaRegistry::new();
+        registry.register(AgentPersona {
+            name: "custom".to_string(),
+            description: "Custom persona".to_string(),
+            system_prompt_prefix: "Custom prompt".to_string(),
+            default_mode: "plan".to_string(),
+            preferred_tools: vec!["read_file".to_string()],
+            temperature: 0.5,
+            max_tokens: 1_024,
+        });
+
+        let persona = registry.get("custom").unwrap();
+        assert_eq!(persona.description, "Custom persona");
+        assert_eq!(persona.preferred_tools, vec!["read_file"]);
+    }
+
+    #[test]
+    fn persona_listing_is_sorted_by_name() {
+        let mut registry = PersonaRegistry::new();
+        for name in ["reviewer", "builder", "planner"] {
+            registry.register(AgentPersona {
+                name: name.to_string(),
+                description: name.to_string(),
+                system_prompt_prefix: name.to_string(),
+                default_mode: "plan".to_string(),
+                preferred_tools: Vec::new(),
+                temperature: 0.0,
+                max_tokens: 256,
+            });
+        }
+
+        let names: Vec<&str> = registry
+            .list()
+            .iter()
+            .map(|persona| persona.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["builder", "planner", "reviewer"]);
     }
 
     // ── Orchestrator mode tests ──────────────────────────────────────────

@@ -359,6 +359,335 @@ impl GitRepo {
     }
 }
 
+// ── Feature #136: Stale-base Preflight / Git Freshness ────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitFreshness {
+    pub current_branch: String,
+    pub tracking_branch: Option<String>,
+    pub commits_behind: usize,
+    pub commits_ahead: usize,
+    pub is_diverged: bool,
+    pub last_fetch: Option<u64>,
+    pub is_stale: bool,
+}
+
+pub struct StaleBaseChecker;
+
+impl StaleBaseChecker {
+    pub fn check_freshness(repo_path: &Path) -> Result<GitFreshness> {
+        let repo = git2::Repository::discover(repo_path)
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("git discover: {e}")))?;
+
+        let head = repo
+            .head()
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("head: {e}")))?;
+
+        let current_branch = if head.is_branch() {
+            head.shorthand().unwrap_or("HEAD").to_string()
+        } else {
+            let oid = head
+                .target()
+                .ok_or_else(|| CaduceusError::Other(anyhow::anyhow!("no HEAD target")))?;
+            let sha = oid.to_string();
+            format!("HEAD ({})", &sha[..7.min(sha.len())])
+        };
+
+        let git_dir = repo.path();
+        let fetch_head = git_dir.join("FETCH_HEAD");
+        let last_fetch = fetch_head.metadata().ok().and_then(|m| {
+            m.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+        });
+
+        if !head.is_branch() {
+            return Ok(GitFreshness {
+                current_branch,
+                tracking_branch: None,
+                commits_behind: 0,
+                commits_ahead: 0,
+                is_diverged: false,
+                last_fetch,
+                is_stale: false,
+            });
+        }
+
+        let branch_name = head.shorthand().unwrap_or("HEAD");
+        let local_branch = repo
+            .find_branch(branch_name, git2::BranchType::Local)
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("find branch: {e}")))?;
+
+        let upstream = match local_branch.upstream() {
+            Ok(b) => b,
+            Err(_) => {
+                return Ok(GitFreshness {
+                    current_branch,
+                    tracking_branch: None,
+                    commits_behind: 0,
+                    commits_ahead: 0,
+                    is_diverged: false,
+                    last_fetch,
+                    is_stale: false,
+                });
+            }
+        };
+
+        let tracking_branch = upstream.name().ok().flatten().map(|s| s.to_string());
+        let local_oid = local_branch
+            .get()
+            .target()
+            .ok_or_else(|| CaduceusError::Other(anyhow::anyhow!("no local target")))?;
+        let upstream_oid = upstream
+            .get()
+            .target()
+            .ok_or_else(|| CaduceusError::Other(anyhow::anyhow!("no upstream target")))?;
+        let (ahead, behind) = repo
+            .graph_ahead_behind(local_oid, upstream_oid)
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("graph: {e}")))?;
+
+        let is_diverged = ahead > 0 && behind > 0;
+        let is_stale = behind > 0;
+
+        Ok(GitFreshness {
+            current_branch,
+            tracking_branch,
+            commits_behind: behind,
+            commits_ahead: ahead,
+            is_diverged,
+            last_fetch,
+            is_stale,
+        })
+    }
+
+    pub fn is_stale(repo_path: &Path, max_behind: usize) -> Result<bool> {
+        let freshness = Self::check_freshness(repo_path)?;
+        Ok(freshness.commits_behind > max_behind)
+    }
+
+    pub fn check_diverged(repo_path: &Path) -> Result<bool> {
+        let freshness = Self::check_freshness(repo_path)?;
+        Ok(freshness.is_diverged)
+    }
+}
+
+// ── Feature #93: Worktree Isolation ───────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeInfo {
+    pub path: PathBuf,
+    pub branch: String,
+    pub head_sha: String,
+    pub is_locked: bool,
+}
+
+pub struct WorktreeManager;
+
+impl WorktreeManager {
+    pub fn create_worktree(repo_path: &Path, branch: &str, worktree_path: &Path) -> Result<()> {
+        let output = std::process::Command::new("git")
+            .args(["worktree", "add", "-b", branch])
+            .arg(worktree_path)
+            .arg("HEAD")
+            .current_dir(repo_path)
+            .output()
+            .map_err(CaduceusError::Io)?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            return Err(CaduceusError::Other(anyhow::anyhow!(
+                "git worktree add: {err}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
+        let output = std::process::Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(worktree_path)
+            .current_dir(repo_path)
+            .output()
+            .map_err(CaduceusError::Io)?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            return Err(CaduceusError::Other(anyhow::anyhow!(
+                "git worktree remove: {err}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn list_worktrees(repo_path: &Path) -> Result<Vec<WorktreeInfo>> {
+        let output = std::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(repo_path)
+            .output()
+            .map_err(CaduceusError::Io)?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            return Err(CaduceusError::Other(anyhow::anyhow!(
+                "git worktree list: {err}"
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut worktrees = Vec::new();
+        let mut current_path: Option<PathBuf> = None;
+        let mut current_branch = String::new();
+        let mut current_sha = String::new();
+        let mut current_locked = false;
+
+        for line in stdout.lines() {
+            if line.is_empty() {
+                if let Some(path) = current_path.take() {
+                    worktrees.push(WorktreeInfo {
+                        path,
+                        branch: std::mem::take(&mut current_branch),
+                        head_sha: std::mem::take(&mut current_sha),
+                        is_locked: current_locked,
+                    });
+                    current_locked = false;
+                }
+            } else if let Some(path) = line.strip_prefix("worktree ") {
+                current_path = Some(PathBuf::from(path));
+            } else if let Some(sha) = line.strip_prefix("HEAD ") {
+                current_sha = sha.to_string();
+            } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+                current_branch = branch.to_string();
+            } else if line.starts_with("detached") {
+                current_branch = "HEAD (detached)".to_string();
+            } else if line.starts_with("locked") {
+                current_locked = true;
+            }
+        }
+
+        // Handle last entry when output has no trailing blank line
+        if let Some(path) = current_path {
+            worktrees.push(WorktreeInfo {
+                path,
+                branch: current_branch,
+                head_sha: current_sha,
+                is_locked: current_locked,
+            });
+        }
+
+        Ok(worktrees)
+    }
+}
+
+// ── Feature #163: Auto-commit / Auto-PR per task ──────────────────────────────
+
+pub struct AutoCommitter {
+    pub enabled: bool,
+    pub commit_message_template: String,
+    pub auto_pr: bool,
+}
+
+impl Default for AutoCommitter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AutoCommitter {
+    pub fn new() -> Self {
+        Self {
+            enabled: true,
+            commit_message_template: "auto: {task}".to_string(),
+            auto_pr: false,
+        }
+    }
+
+    /// Stage all changes and create a commit. Returns the commit SHA.
+    pub fn commit_changes(repo_path: &Path, message: &str) -> Result<String> {
+        let repo = git2::Repository::discover(repo_path)
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("git discover: {e}")))?;
+
+        let sig = repo
+            .signature()
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("signature: {e}")))?;
+
+        let mut index = repo
+            .index()
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("index: {e}")))?;
+
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("add all: {e}")))?;
+        index
+            .write()
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("write index: {e}")))?;
+
+        let tree_oid = index
+            .write_tree()
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("write tree: {e}")))?;
+        let tree = repo
+            .find_tree(tree_oid)
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("find tree: {e}")))?;
+
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+
+        let oid = repo
+            .commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("commit: {e}")))?;
+
+        Ok(oid.to_string())
+    }
+
+    /// Create a new branch for the task from HEAD. Returns the branch name.
+    pub fn create_task_branch(repo_path: &Path, task_name: &str) -> Result<String> {
+        let repo = git2::Repository::discover(repo_path)
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("git discover: {e}")))?;
+
+        let sanitized: String = task_name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .to_lowercase();
+        let sanitized = sanitized.trim_matches('-');
+        let branch_name = format!("task/{sanitized}");
+
+        let head_commit = repo
+            .head()
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("head: {e}")))?
+            .peel_to_commit()
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("peel: {e}")))?;
+
+        repo.branch(&branch_name, &head_commit, false)
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("create branch: {e}")))?;
+
+        Ok(branch_name)
+    }
+
+    /// Auto-generate a commit message from a list of changed file paths.
+    pub fn generate_commit_message(changes: &[String]) -> String {
+        if changes.is_empty() {
+            return "auto: no changes".to_string();
+        }
+        if changes.len() == 1 {
+            return format!("auto: update {}", changes[0]);
+        }
+        let preview: Vec<&str> = changes.iter().take(3).map(String::as_str).collect();
+        let suffix = if changes.len() > 3 {
+            format!(" and {} more", changes.len() - 3)
+        } else {
+            String::new()
+        };
+        format!("auto: update {}{}", preview.join(", "), suffix)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,5 +919,183 @@ mod tests {
         assert!(freshness.is_stale());
         assert_eq!(freshness.behind, 1);
         assert_eq!(freshness.ahead, 0);
+    }
+
+    // ── StaleBaseChecker tests ────────────────────────────────────────────
+
+    #[test]
+    fn stale_base_checker_fresh_repo_no_upstream() {
+        let (dir, _) = make_temp_repo();
+        let freshness = StaleBaseChecker::check_freshness(dir.path()).unwrap();
+        assert!(!freshness.is_stale);
+        assert_eq!(freshness.commits_behind, 0);
+        assert_eq!(freshness.commits_ahead, 0);
+        assert!(!freshness.is_diverged);
+        assert!(freshness.tracking_branch.is_none());
+    }
+
+    #[test]
+    fn stale_base_checker_is_stale_false_for_no_upstream() {
+        let (dir, _) = make_temp_repo();
+        assert!(!StaleBaseChecker::is_stale(dir.path(), 0).unwrap());
+    }
+
+    #[test]
+    fn stale_base_checker_not_diverged_no_upstream() {
+        let (dir, _) = make_temp_repo();
+        assert!(!StaleBaseChecker::check_diverged(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn stale_base_checker_detects_stale_with_upstream() {
+        let (_remote_dir, local_dir, updater_dir, _repo, updater_repo, branch) =
+            setup_remote_tracking_repo();
+
+        commit_file(
+            &updater_repo,
+            updater_dir.path(),
+            "NEWS.md",
+            "new line\n",
+            "Remote update for stale check",
+        );
+        let mut remote = updater_repo.find_remote("origin").unwrap();
+        remote
+            .push(&[format!("refs/heads/{0}:refs/heads/{0}", branch)], None)
+            .unwrap();
+
+        let local_repo = git2::Repository::open(local_dir.path()).unwrap();
+        let mut local_remote = local_repo.find_remote("origin").unwrap();
+        local_remote.fetch(&[&branch], None, None).unwrap();
+
+        let freshness = StaleBaseChecker::check_freshness(local_dir.path()).unwrap();
+        assert!(freshness.is_stale);
+        assert_eq!(freshness.commits_behind, 1);
+        assert_eq!(freshness.commits_ahead, 0);
+        assert!(!freshness.is_diverged);
+        assert!(freshness.tracking_branch.is_some());
+        assert!(freshness.last_fetch.is_some());
+
+        assert!(StaleBaseChecker::is_stale(local_dir.path(), 0).unwrap());
+        assert!(!StaleBaseChecker::is_stale(local_dir.path(), 1).unwrap());
+        assert!(!StaleBaseChecker::check_diverged(local_dir.path()).unwrap());
+    }
+
+    // ── WorktreeManager tests ─────────────────────────────────────────────
+
+    #[test]
+    fn worktree_create_and_list() {
+        let (dir, _) = make_temp_repo();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("wt-feature");
+
+        WorktreeManager::create_worktree(dir.path(), "wt-feature-branch", &wt_path).unwrap();
+
+        let worktrees = WorktreeManager::list_worktrees(dir.path()).unwrap();
+        assert!(worktrees.len() >= 2, "should have main + new worktree");
+        assert!(
+            worktrees.iter().any(|w| w.branch == "wt-feature-branch"),
+            "new worktree branch not found in list"
+        );
+        let wt = worktrees
+            .iter()
+            .find(|w| w.branch == "wt-feature-branch")
+            .unwrap();
+        assert!(!wt.head_sha.is_empty());
+        assert!(!wt.is_locked);
+    }
+
+    #[test]
+    fn worktree_remove() {
+        let (dir, _) = make_temp_repo();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("wt-removable");
+
+        WorktreeManager::create_worktree(dir.path(), "wt-removable-branch", &wt_path).unwrap();
+
+        let before = WorktreeManager::list_worktrees(dir.path()).unwrap();
+        assert!(before.iter().any(|w| w.branch == "wt-removable-branch"));
+
+        WorktreeManager::remove_worktree(dir.path(), &wt_path).unwrap();
+
+        let after = WorktreeManager::list_worktrees(dir.path()).unwrap();
+        assert!(!after.iter().any(|w| w.branch == "wt-removable-branch"));
+    }
+
+    #[test]
+    fn worktree_list_main_only() {
+        let (dir, _) = make_temp_repo();
+        let worktrees = WorktreeManager::list_worktrees(dir.path()).unwrap();
+        assert_eq!(worktrees.len(), 1, "only main worktree expected");
+        assert!(!worktrees[0].head_sha.is_empty());
+    }
+
+    // ── AutoCommitter tests ───────────────────────────────────────────────
+
+    #[test]
+    fn auto_committer_generate_message_empty() {
+        assert_eq!(
+            AutoCommitter::generate_commit_message(&[]),
+            "auto: no changes"
+        );
+    }
+
+    #[test]
+    fn auto_committer_generate_message_single() {
+        let msg = AutoCommitter::generate_commit_message(&["src/main.rs".to_string()]);
+        assert_eq!(msg, "auto: update src/main.rs");
+    }
+
+    #[test]
+    fn auto_committer_generate_message_two() {
+        let msg = AutoCommitter::generate_commit_message(&["a.rs".to_string(), "b.rs".to_string()]);
+        assert!(msg.contains("a.rs"));
+        assert!(msg.contains("b.rs"));
+    }
+
+    #[test]
+    fn auto_committer_generate_message_overflow() {
+        let changes: Vec<String> = (1..=5).map(|i| format!("file{i}.rs")).collect();
+        let msg = AutoCommitter::generate_commit_message(&changes);
+        assert!(msg.contains("file1.rs"));
+        assert!(msg.contains("and 2 more"));
+    }
+
+    #[test]
+    fn auto_committer_new_defaults() {
+        let ac = AutoCommitter::new();
+        assert!(ac.enabled);
+        assert!(!ac.auto_pr);
+        assert!(ac.commit_message_template.contains("{task}"));
+    }
+
+    #[test]
+    fn auto_committer_commit_changes() {
+        let (dir, _) = make_temp_repo();
+        std::fs::write(dir.path().join("auto_file.txt"), "auto content").unwrap();
+        let sha = AutoCommitter::commit_changes(dir.path(), "auto test commit").unwrap();
+        assert_eq!(sha.len(), 40);
+
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let commit = repo
+            .find_commit(git2::Oid::from_str(&sha).unwrap())
+            .unwrap();
+        assert_eq!(commit.message().unwrap().trim(), "auto test commit");
+    }
+
+    #[test]
+    fn auto_committer_create_task_branch() {
+        let (dir, _) = make_temp_repo();
+        let branch = AutoCommitter::create_task_branch(dir.path(), "My Feature Task!").unwrap();
+        assert_eq!(branch, "task/my-feature-task");
+
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        assert!(repo.find_branch(&branch, git2::BranchType::Local).is_ok());
+    }
+
+    #[test]
+    fn auto_committer_create_task_branch_simple() {
+        let (dir, _) = make_temp_repo();
+        let branch = AutoCommitter::create_task_branch(dir.path(), "cleanup").unwrap();
+        assert_eq!(branch, "task/cleanup");
     }
 }

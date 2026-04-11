@@ -5,7 +5,7 @@ use glob::glob;
 use regex::RegexBuilder;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
@@ -3125,6 +3125,249 @@ pub fn default_registry() -> ToolRegistry {
     default_registry_with_root(workspace_root)
 }
 
+// ── Feature #74: Tool Preset Reduction ─────────────────────────────────────
+
+/// Named tool subsets for constrained agents.
+pub struct ToolPresets;
+
+impl ToolPresets {
+    pub fn read_only() -> Vec<String> {
+        ["Read", "Glob", "Grep", "Tree", "Diagnostics"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    pub fn minimal() -> Vec<String> {
+        let mut tools = Self::read_only();
+        tools.extend(["Write", "Edit"].iter().map(|s| s.to_string()));
+        tools
+    }
+
+    pub fn standard() -> Vec<String> {
+        let mut tools = Self::minimal();
+        tools.extend(
+            ["Bash", "WebSearch", "TodoWrite"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        tools
+    }
+
+    pub fn full() -> Vec<String> {
+        default_registry()
+            .list_specs()
+            .iter()
+            .map(|t| t.name.clone())
+            .collect()
+    }
+
+    pub fn get_preset(name: &str) -> Option<Vec<String>> {
+        match name {
+            "read_only" => Some(Self::read_only()),
+            "minimal" => Some(Self::minimal()),
+            "standard" => Some(Self::standard()),
+            "full" => Some(Self::full()),
+            _ => None,
+        }
+    }
+
+    pub fn list_presets() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "read_only",
+                "Read-only tools: Read, Glob, Grep, Tree, Diagnostics",
+            ),
+            ("minimal", "read_only + Write, Edit"),
+            ("standard", "minimal + Bash, WebSearch, TodoWrite"),
+            ("full", "All registered tools"),
+        ]
+    }
+}
+
+/// Filters tool invocations based on an allowed set.
+#[derive(Debug)]
+pub struct ToolFilter {
+    allowed_tools: HashSet<String>,
+}
+
+impl ToolFilter {
+    pub fn from_preset(preset: &str) -> std::result::Result<Self, String> {
+        ToolPresets::get_preset(preset)
+            .map(Self::from_list)
+            .ok_or_else(|| format!("Unknown preset: {preset}"))
+    }
+
+    pub fn from_list(tools: Vec<String>) -> Self {
+        Self {
+            allowed_tools: tools.into_iter().collect(),
+        }
+    }
+
+    pub fn is_allowed(&self, tool_name: &str) -> bool {
+        self.allowed_tools.contains(tool_name)
+    }
+
+    pub fn allowed_count(&self) -> usize {
+        self.allowed_tools.len()
+    }
+}
+
+// ── Feature #157: Self-Verification (Agent QA) ─────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum ArtifactType {
+    TestOutput,
+    Log,
+    Screenshot,
+    Coverage,
+    Diff,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerificationArtifact {
+    pub name: String,
+    pub artifact_type: ArtifactType,
+    pub content: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerificationResult {
+    pub passed: bool,
+    pub total: usize,
+    pub failures: Vec<String>,
+    pub output: String,
+}
+
+pub struct SelfVerifier {
+    pub workspace: PathBuf,
+    pub artifacts: Vec<VerificationArtifact>,
+}
+
+impl SelfVerifier {
+    pub fn new(workspace: PathBuf) -> Self {
+        Self {
+            workspace,
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    pub fn run_tests(&mut self, command: &str) -> Result<VerificationResult> {
+        let parts: Vec<&str> = command.split_whitespace().collect();
+        if parts.is_empty() {
+            return Err(CaduceusError::Tool {
+                tool: "SelfVerifier".to_string(),
+                message: "Empty command".to_string(),
+            });
+        }
+        let output = std::process::Command::new(parts[0])
+            .args(&parts[1..])
+            .current_dir(&self.workspace)
+            .output()
+            .map_err(|e| CaduceusError::Tool {
+                tool: "SelfVerifier".to_string(),
+                message: e.to_string(),
+            })?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let combined = format!("{stdout}{stderr}");
+        let passed = output.status.success();
+
+        let failures: Vec<String> = combined
+            .lines()
+            .filter(|l| l.contains("FAILED") || l.contains("test FAILED"))
+            .map(String::from)
+            .collect();
+
+        let total = combined
+            .lines()
+            .filter(|l| {
+                l.contains("test ")
+                    && (l.contains(" ok") || l.contains("FAILED") || l.contains("ignored"))
+            })
+            .count();
+
+        let result = VerificationResult {
+            passed,
+            total: total.max(1),
+            failures,
+            output: combined.clone(),
+        };
+
+        self.artifacts.push(VerificationArtifact {
+            name: format!("test-{}", Self::now_secs()),
+            artifact_type: ArtifactType::TestOutput,
+            content: combined,
+            timestamp: Self::now_secs(),
+        });
+
+        Ok(result)
+    }
+
+    pub fn capture_log(&mut self, name: &str, content: &str) {
+        self.artifacts.push(VerificationArtifact {
+            name: name.to_string(),
+            artifact_type: ArtifactType::Log,
+            content: content.to_string(),
+            timestamp: Self::now_secs(),
+        });
+    }
+
+    pub fn capture_diff(&mut self, before: &str, after: &str) -> String {
+        let mut diff = String::from("--- before\n+++ after\n");
+        for line in before.lines() {
+            diff.push_str(&format!("-{line}\n"));
+        }
+        for line in after.lines() {
+            diff.push_str(&format!("+{line}\n"));
+        }
+        self.artifacts.push(VerificationArtifact {
+            name: format!("diff-{}", Self::now_secs()),
+            artifact_type: ArtifactType::Diff,
+            content: diff.clone(),
+            timestamp: Self::now_secs(),
+        });
+        diff
+    }
+
+    pub fn generate_report(&self) -> String {
+        let mut report = String::from("# Verification Report\n\n");
+        report.push_str(&format!("Total artifacts: {}\n\n", self.artifacts.len()));
+        for artifact in &self.artifacts {
+            let type_name = match artifact.artifact_type {
+                ArtifactType::TestOutput => "TestOutput",
+                ArtifactType::Log => "Log",
+                ArtifactType::Screenshot => "Screenshot",
+                ArtifactType::Coverage => "Coverage",
+                ArtifactType::Diff => "Diff",
+            };
+            report.push_str(&format!("## {} ({})\n", artifact.name, type_name));
+            report.push_str(&format!("Timestamp: {}\n", artifact.timestamp));
+            report.push_str(&format!("```\n{}\n```\n\n", artifact.content));
+        }
+        report
+    }
+
+    pub fn all_passed(&self) -> bool {
+        self.artifacts.iter().all(|a| {
+            if matches!(a.artifact_type, ArtifactType::TestOutput) {
+                !a.content.contains("FAILED")
+            } else {
+                true
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3951,5 +4194,185 @@ mod tests {
             result.is_error,
             "empty query should be handled gracefully as an error"
         );
+    }
+
+    // ── Feature #74: Tool Preset Reduction tests ─────────────────────────────
+
+    #[test]
+    fn test_preset_read_only_contents() {
+        let tools = ToolPresets::read_only();
+        assert!(tools.contains(&"Read".to_string()));
+        assert!(tools.contains(&"Glob".to_string()));
+        assert!(tools.contains(&"Grep".to_string()));
+        assert!(tools.contains(&"Tree".to_string()));
+        assert!(tools.contains(&"Diagnostics".to_string()));
+        assert_eq!(tools.len(), 5);
+    }
+
+    #[test]
+    fn test_preset_minimal_contains_read_only() {
+        let minimal = ToolPresets::minimal();
+        let read_only = ToolPresets::read_only();
+        for t in &read_only {
+            assert!(
+                minimal.contains(t),
+                "minimal should include read_only tool {t}"
+            );
+        }
+        assert!(minimal.contains(&"Write".to_string()));
+        assert!(minimal.contains(&"Edit".to_string()));
+    }
+
+    #[test]
+    fn test_preset_standard_contains_minimal() {
+        let standard = ToolPresets::standard();
+        let minimal = ToolPresets::minimal();
+        for t in &minimal {
+            assert!(
+                standard.contains(t),
+                "standard should include minimal tool {t}"
+            );
+        }
+        assert!(standard.contains(&"Bash".to_string()));
+        assert!(standard.contains(&"WebSearch".to_string()));
+        assert!(standard.contains(&"TodoWrite".to_string()));
+    }
+
+    #[test]
+    fn test_preset_full_nonempty() {
+        let full = ToolPresets::full();
+        assert!(
+            !full.is_empty(),
+            "full preset should have at least one tool"
+        );
+    }
+
+    #[test]
+    fn test_get_preset_known() {
+        assert!(ToolPresets::get_preset("read_only").is_some());
+        assert!(ToolPresets::get_preset("minimal").is_some());
+        assert!(ToolPresets::get_preset("standard").is_some());
+        assert!(ToolPresets::get_preset("full").is_some());
+    }
+
+    #[test]
+    fn test_get_preset_unknown() {
+        assert!(ToolPresets::get_preset("superadmin").is_none());
+    }
+
+    #[test]
+    fn test_list_presets_nonempty() {
+        let presets = ToolPresets::list_presets();
+        assert!(!presets.is_empty());
+        for (name, desc) in &presets {
+            assert!(!name.is_empty());
+            assert!(!desc.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_filter_from_preset_allow_deny() {
+        let filter = ToolFilter::from_preset("read_only").unwrap();
+        assert!(filter.is_allowed("Read"));
+        assert!(filter.is_allowed("Grep"));
+        assert!(!filter.is_allowed("Bash"));
+        assert!(!filter.is_allowed("Write"));
+        assert_eq!(filter.allowed_count(), 5);
+    }
+
+    #[test]
+    fn test_filter_from_list() {
+        let filter = ToolFilter::from_list(vec!["Foo".to_string(), "Bar".to_string()]);
+        assert!(filter.is_allowed("Foo"));
+        assert!(filter.is_allowed("Bar"));
+        assert!(!filter.is_allowed("Baz"));
+        assert_eq!(filter.allowed_count(), 2);
+    }
+
+    #[test]
+    fn test_filter_from_unknown_preset() {
+        let result = ToolFilter::from_preset("nonexistent_preset");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("nonexistent_preset"));
+    }
+
+    // ── Feature #157: Self-Verification tests ───────────────────────────────
+
+    #[test]
+    fn test_verifier_capture_log() {
+        let mut verifier = SelfVerifier::new(PathBuf::from("."));
+        verifier.capture_log("my-log", "some log content");
+        assert_eq!(verifier.artifacts.len(), 1);
+        assert_eq!(verifier.artifacts[0].name, "my-log");
+        assert_eq!(verifier.artifacts[0].content, "some log content");
+        assert!(matches!(
+            verifier.artifacts[0].artifact_type,
+            ArtifactType::Log
+        ));
+    }
+
+    #[test]
+    fn test_verifier_capture_diff() {
+        let mut verifier = SelfVerifier::new(PathBuf::from("."));
+        let diff = verifier.capture_diff("old line", "new line");
+        assert!(diff.contains("-old line"));
+        assert!(diff.contains("+new line"));
+        assert_eq!(verifier.artifacts.len(), 1);
+        assert!(matches!(
+            verifier.artifacts[0].artifact_type,
+            ArtifactType::Diff
+        ));
+    }
+
+    #[test]
+    fn test_verifier_generate_report() {
+        let mut verifier = SelfVerifier::new(PathBuf::from("."));
+        verifier.capture_log("app.log", "started");
+        let report = verifier.generate_report();
+        assert!(report.contains("Verification Report"));
+        assert!(report.contains("app.log"));
+        assert!(report.contains("started"));
+        assert!(report.contains("Total artifacts: 1"));
+    }
+
+    #[test]
+    fn test_verifier_all_passed_no_failures() {
+        let mut verifier = SelfVerifier::new(PathBuf::from("."));
+        verifier.capture_log("ok-log", "everything is fine");
+        assert!(verifier.all_passed());
+    }
+
+    #[test]
+    fn test_verifier_all_passed_with_failure_artifact() {
+        let mut verifier = SelfVerifier::new(PathBuf::from("."));
+        verifier.artifacts.push(VerificationArtifact {
+            name: "test-run".to_string(),
+            artifact_type: ArtifactType::TestOutput,
+            content: "test foo ... FAILED".to_string(),
+            timestamp: 0,
+        });
+        assert!(!verifier.all_passed());
+    }
+
+    #[test]
+    fn test_verifier_run_tests_echo() {
+        let mut verifier = SelfVerifier::new(PathBuf::from("."));
+        let result = verifier.run_tests("echo hello").unwrap();
+        assert!(result.passed);
+        assert!(result.output.contains("hello"));
+        // artifact captured
+        assert_eq!(verifier.artifacts.len(), 1);
+        assert!(matches!(
+            verifier.artifacts[0].artifact_type,
+            ArtifactType::TestOutput
+        ));
+    }
+
+    #[test]
+    fn test_verifier_run_tests_failing_command() {
+        let mut verifier = SelfVerifier::new(PathBuf::from("."));
+        let result = verifier.run_tests("false").unwrap();
+        assert!(!result.passed);
     }
 }

@@ -659,6 +659,325 @@ impl SessionMetrics {
     }
 }
 
+pub struct SloMonitor {
+    objectives: Vec<Slo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Slo {
+    pub name: String,
+    pub description: String,
+    pub target: f64,
+    pub window_secs: u64,
+    pub metric: SloMetric,
+    pub measurements: Vec<SloMeasurement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SloMetric {
+    SuccessRate,
+    Latency { p99_ms: u64 },
+    ErrorRate,
+    Availability,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SloMeasurement {
+    pub timestamp: u64,
+    pub value: f64,
+    pub is_good: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SloStatus {
+    pub name: String,
+    pub target: f64,
+    pub current: f64,
+    pub is_met: bool,
+    pub error_budget_remaining: f64,
+}
+
+impl SloMonitor {
+    pub fn new() -> Self {
+        Self {
+            objectives: Vec::new(),
+        }
+    }
+
+    pub fn add_slo(&mut self, slo: Slo) {
+        self.objectives.push(slo);
+    }
+
+    pub fn record_measurement(&mut self, slo_name: &str, value: f64) {
+        let timestamp = self
+            .objectives
+            .iter()
+            .flat_map(|slo| {
+                slo.measurements
+                    .iter()
+                    .map(|measurement| measurement.timestamp)
+            })
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        if let Some(slo) = self.objectives.iter_mut().find(|slo| slo.name == slo_name) {
+            let is_good = slo.metric.is_good(value, slo.target);
+            slo.measurements.push(SloMeasurement {
+                timestamp,
+                value,
+                is_good,
+            });
+        }
+    }
+
+    pub fn check_slo(&self, name: &str) -> Option<SloStatus> {
+        self.objectives
+            .iter()
+            .find(|slo| slo.name == name)
+            .map(Slo::status)
+    }
+
+    pub fn all_statuses(&self) -> Vec<SloStatus> {
+        self.objectives.iter().map(Slo::status).collect()
+    }
+
+    pub fn error_budget_remaining(&self, name: &str) -> Option<f64> {
+        self.check_slo(name)
+            .map(|status| status.error_budget_remaining)
+    }
+}
+
+impl Default for SloMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Slo {
+    fn windowed_measurements(&self) -> &[SloMeasurement] {
+        let Some(latest) = self
+            .measurements
+            .last()
+            .map(|measurement| measurement.timestamp)
+        else {
+            return &self.measurements;
+        };
+        let window_start = latest.saturating_sub(self.window_secs.saturating_sub(1));
+        let first_in_window = self
+            .measurements
+            .iter()
+            .position(|measurement| measurement.timestamp >= window_start)
+            .unwrap_or(self.measurements.len());
+        &self.measurements[first_in_window..]
+    }
+
+    fn compliance_ratio(&self) -> f64 {
+        let measurements = self.windowed_measurements();
+        if measurements.is_empty() {
+            return 0.0;
+        }
+
+        let good = measurements
+            .iter()
+            .filter(|measurement| measurement.is_good)
+            .count() as f64;
+        good / measurements.len() as f64
+    }
+
+    fn error_budget_remaining(&self, current: f64) -> f64 {
+        if self.target >= 1.0 {
+            return if current >= 1.0 { 1.0 } else { 0.0 };
+        }
+
+        ((current - self.target) / (1.0 - self.target)).clamp(0.0, 1.0)
+    }
+
+    fn status(&self) -> SloStatus {
+        let current = self.compliance_ratio();
+        SloStatus {
+            name: self.name.clone(),
+            target: self.target,
+            current,
+            is_met: current >= self.target,
+            error_budget_remaining: self.error_budget_remaining(current),
+        }
+    }
+}
+
+impl SloMetric {
+    fn is_good(&self, value: f64, target: f64) -> bool {
+        match self {
+            Self::SuccessRate | Self::Availability => value >= target,
+            Self::Latency { p99_ms } => value <= *p99_ms as f64,
+            Self::ErrorRate => value <= (1.0 - target).clamp(0.0, 1.0),
+        }
+    }
+}
+
+pub struct GovernanceAttestor {
+    controls: Vec<GovernanceControl>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GovernanceControl {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub status: ControlStatus,
+    pub evidence: Vec<String>,
+    pub last_verified: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlStatus {
+    Active,
+    Inactive,
+    Degraded,
+    Unknown,
+}
+
+impl GovernanceAttestor {
+    pub fn new() -> Self {
+        Self {
+            controls: Vec::new(),
+        }
+    }
+
+    pub fn register_control(&mut self, control: GovernanceControl) {
+        self.controls.push(control);
+    }
+
+    pub fn verify_control(&mut self, id: &str) -> ControlStatus {
+        let next_verified = self
+            .controls
+            .iter()
+            .map(|control| control.last_verified)
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        if let Some(control) = self.controls.iter_mut().find(|control| control.id == id) {
+            control.last_verified = next_verified;
+            control.status = match control.status {
+                ControlStatus::Unknown if control.evidence.is_empty() => ControlStatus::Inactive,
+                ControlStatus::Unknown => ControlStatus::Active,
+                status => status,
+            };
+            control.status
+        } else {
+            ControlStatus::Unknown
+        }
+    }
+
+    pub fn generate_report(&self) -> String {
+        let mut report = format!(
+            "# Governance Attestation\n\nCompliance: {:.1}%\n\n| ID | Name | Status | Last Verified | Evidence |\n| --- | --- | --- | --- | --- |\n",
+            self.compliance_percentage()
+        );
+
+        for control in &self.controls {
+            let evidence = if control.evidence.is_empty() {
+                "None".to_string()
+            } else {
+                control.evidence.join("<br/>")
+            };
+            report.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                control.id,
+                control.name,
+                control.status.as_str(),
+                control.last_verified,
+                evidence
+            ));
+            report.push_str(&format!(
+                "\n- **{}**: {}\n",
+                control.name, control.description
+            ));
+        }
+
+        report
+    }
+
+    pub fn compliance_percentage(&self) -> f64 {
+        if self.controls.is_empty() {
+            return 0.0;
+        }
+
+        let compliant = self
+            .controls
+            .iter()
+            .filter(|control| control.status == ControlStatus::Active)
+            .count() as f64;
+        (compliant / self.controls.len() as f64) * 100.0
+    }
+
+    pub fn active_controls(&self) -> Vec<&GovernanceControl> {
+        self.controls
+            .iter()
+            .filter(|control| control.status == ControlStatus::Active)
+            .collect()
+    }
+
+    pub fn default_controls() -> Self {
+        let mut attestor = Self::new();
+        for control in [
+            GovernanceControl {
+                id: "policy-enforcement".to_string(),
+                name: "Policy Enforcement".to_string(),
+                description: "Critical policy checks run before agent actions execute.".to_string(),
+                status: ControlStatus::Active,
+                evidence: vec!["Policy engine enabled".to_string()],
+                last_verified: 1,
+            },
+            GovernanceControl {
+                id: "audit-logging".to_string(),
+                name: "Audit Logging".to_string(),
+                description: "Agent actions are captured in an immutable audit log.".to_string(),
+                status: ControlStatus::Active,
+                evidence: vec!["Audit sink configured".to_string()],
+                last_verified: 1,
+            },
+            GovernanceControl {
+                id: "approval-gates".to_string(),
+                name: "Approval Gates".to_string(),
+                description: "High-risk operations require explicit approval gates.".to_string(),
+                status: ControlStatus::Active,
+                evidence: vec!["Manual approval workflow present".to_string()],
+                last_verified: 1,
+            },
+            GovernanceControl {
+                id: "model-allowlist".to_string(),
+                name: "Model Allowlist".to_string(),
+                description: "Only approved models can be used in production flows.".to_string(),
+                status: ControlStatus::Degraded,
+                evidence: vec!["Fallback model entered degraded mode".to_string()],
+                last_verified: 1,
+            },
+        ] {
+            attestor.register_control(control);
+        }
+        attestor
+    }
+}
+
+impl Default for GovernanceAttestor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ControlStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "Active",
+            Self::Inactive => "Inactive",
+            Self::Degraded => "Degraded",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1058,5 +1377,128 @@ mod tests {
             .await;
         let pending = exporter.pending.lock().await;
         assert_eq!(pending.len(), 2);
+    }
+    #[test]
+    fn slo_monitor_records_measurements() {
+        let mut monitor = SloMonitor::new();
+        monitor.add_slo(Slo {
+            name: "success".to_string(),
+            description: "Successful agent runs".to_string(),
+            target: 0.75,
+            window_secs: 10,
+            metric: SloMetric::SuccessRate,
+            measurements: Vec::new(),
+        });
+
+        monitor.record_measurement("success", 0.8);
+        monitor.record_measurement("success", 0.7);
+
+        let status = monitor.check_slo("success").unwrap();
+        assert!((status.current - 0.5).abs() < 1e-9);
+        assert!(!status.is_met);
+    }
+
+    #[test]
+    fn slo_monitor_checks_status_and_windowed_budget() {
+        let mut monitor = SloMonitor::new();
+        monitor.add_slo(Slo {
+            name: "latency".to_string(),
+            description: "P99 latency under 250ms".to_string(),
+            target: 0.5,
+            window_secs: 2,
+            metric: SloMetric::Latency { p99_ms: 250 },
+            measurements: Vec::new(),
+        });
+
+        monitor.record_measurement("latency", 200.0);
+        monitor.record_measurement("latency", 300.0);
+        monitor.record_measurement("latency", 180.0);
+
+        let status = monitor.check_slo("latency").unwrap();
+        assert!((status.current - 0.5).abs() < 1e-9);
+        assert!(status.is_met);
+        assert_eq!(monitor.all_statuses().len(), 1);
+    }
+
+    #[test]
+    fn slo_monitor_calculates_error_budget_remaining() {
+        let mut monitor = SloMonitor::new();
+        monitor.add_slo(Slo {
+            name: "availability".to_string(),
+            description: "Availability target".to_string(),
+            target: 0.8,
+            window_secs: 10,
+            metric: SloMetric::Availability,
+            measurements: Vec::new(),
+        });
+
+        monitor.record_measurement("availability", 0.95);
+        monitor.record_measurement("availability", 0.85);
+        monitor.record_measurement("availability", 0.90);
+        monitor.record_measurement("availability", 0.10);
+
+        let remaining = monitor.error_budget_remaining("availability").unwrap();
+        assert!((remaining - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn governance_attestor_registers_and_verifies_controls() {
+        let mut attestor = GovernanceAttestor::new();
+        attestor.register_control(GovernanceControl {
+            id: "ctrl-1".to_string(),
+            name: "Control One".to_string(),
+            description: "Verifies policy wiring.".to_string(),
+            status: ControlStatus::Unknown,
+            evidence: vec!["checklist complete".to_string()],
+            last_verified: 0,
+        });
+
+        let status = attestor.verify_control("ctrl-1");
+        assert_eq!(status, ControlStatus::Active);
+        assert_eq!(attestor.active_controls().len(), 1);
+    }
+
+    #[test]
+    fn governance_attestor_generates_markdown_report() {
+        let mut attestor = GovernanceAttestor::new();
+        attestor.register_control(GovernanceControl {
+            id: "ctrl-2".to_string(),
+            name: "Audit Trail".to_string(),
+            description: "Captures user and agent actions.".to_string(),
+            status: ControlStatus::Active,
+            evidence: vec!["logs enabled".to_string()],
+            last_verified: 7,
+        });
+
+        let report = attestor.generate_report();
+        assert!(report.contains("# Governance Attestation"));
+        assert!(report.contains("Audit Trail"));
+        assert!(report.contains("logs enabled"));
+    }
+
+    #[test]
+    fn governance_attestor_reports_compliance_percentage() {
+        let mut attestor = GovernanceAttestor::new();
+        attestor.register_control(GovernanceControl {
+            id: "ctrl-a".to_string(),
+            name: "A".to_string(),
+            description: "A".to_string(),
+            status: ControlStatus::Active,
+            evidence: vec![],
+            last_verified: 1,
+        });
+        attestor.register_control(GovernanceControl {
+            id: "ctrl-b".to_string(),
+            name: "B".to_string(),
+            description: "B".to_string(),
+            status: ControlStatus::Degraded,
+            evidence: vec![],
+            last_verified: 1,
+        });
+
+        assert!((attestor.compliance_percentage() - 50.0).abs() < 1e-9);
+
+        let defaults = GovernanceAttestor::default_controls();
+        assert_eq!(defaults.active_controls().len(), 3);
     }
 }

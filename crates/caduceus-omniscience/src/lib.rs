@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -54,6 +55,215 @@ pub struct CodeChunk {
 pub struct SearchResult {
     pub chunk: CodeChunk,
     pub score: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError {
+    pub line: usize,
+    pub message: String,
+    pub severity: ParseErrorSeverity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseErrorSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredChunk {
+    pub content: String,
+    pub score: f64,
+    pub has_errors: bool,
+    pub file_path: String,
+}
+
+pub struct ParseErrorDownRanker {
+    penalty_factor: f64,
+}
+
+impl ParseErrorDownRanker {
+    pub fn new(penalty: f64) -> Self {
+        Self {
+            penalty_factor: penalty.clamp(0.0, 1.0),
+        }
+    }
+
+    pub fn adjust_score(&self, base_score: f64, has_parse_error: bool) -> f64 {
+        if !has_parse_error {
+            return base_score;
+        }
+
+        let multiplier = 1.0 - self.penalty_factor;
+        if base_score >= 0.0 {
+            base_score * multiplier
+        } else {
+            base_score * (1.0 + self.penalty_factor)
+        }
+    }
+
+    pub fn detect_parse_errors(content: &str, language: &str) -> Vec<ParseError> {
+        detect_delimiter_errors(content, language)
+    }
+
+    #[allow(clippy::ptr_arg)]
+    pub fn rank_chunks(&self, chunks: &mut Vec<ScoredChunk>) {
+        for chunk in chunks.iter_mut() {
+            let language = detect_language(Path::new(&chunk.file_path));
+            let has_errors = !Self::detect_parse_errors(&chunk.content, &language).is_empty();
+            chunk.has_errors = has_errors;
+            chunk.score = self.adjust_score(chunk.score, has_errors);
+        }
+
+        chunks.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.file_path.cmp(&b.file_path))
+                .then_with(|| a.content.cmp(&b.content))
+        });
+    }
+}
+
+fn delimiter_pair(open: char) -> char {
+    match open {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        _ => open,
+    }
+}
+
+fn detect_delimiter_errors(content: &str, language: &str) -> Vec<ParseError> {
+    let supports_slash_comments = matches!(
+        language,
+        "rust" | "typescript" | "javascript" | "go" | "java"
+    );
+    let supports_hash_comments = language == "python";
+    let mut errors = Vec::new();
+    let mut stack: Vec<(char, usize)> = Vec::new();
+    let mut chars = content.chars().peekable();
+    let mut line = 1usize;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut string_delim: Option<char> = None;
+    let mut escape = false;
+
+    while let Some(ch) = chars.next() {
+        if ch == '\n' {
+            line += 1;
+            in_line_comment = false;
+            escape = false;
+            continue;
+        }
+
+        if in_line_comment {
+            continue;
+        }
+
+        if in_block_comment {
+            if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                in_block_comment = false;
+            }
+            continue;
+        }
+
+        if let Some(delim) = string_delim {
+            if escape {
+                escape = false;
+                continue;
+            }
+
+            if ch == '\\' {
+                escape = true;
+                continue;
+            }
+
+            if ch == delim {
+                string_delim = None;
+            }
+            continue;
+        }
+
+        if supports_slash_comments && ch == '/' {
+            match chars.peek().copied() {
+                Some('/') => {
+                    chars.next();
+                    in_line_comment = true;
+                    continue;
+                }
+                Some('*') => {
+                    chars.next();
+                    in_block_comment = true;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        if supports_hash_comments && ch == '#' {
+            in_line_comment = true;
+            continue;
+        }
+
+        if matches!(ch, '\'' | '"' | '`') {
+            string_delim = Some(ch);
+            continue;
+        }
+
+        match ch {
+            '(' | '[' | '{' => stack.push((ch, line)),
+            ')' | ']' | '}' => {
+                if let Some((open, open_line)) = stack.pop() {
+                    if delimiter_pair(open) != ch {
+                        errors.push(ParseError {
+                            line,
+                            message: format!(
+                                "mismatched delimiter: expected '{}' to close '{}' from line {}",
+                                delimiter_pair(open),
+                                open,
+                                open_line
+                            ),
+                            severity: ParseErrorSeverity::Error,
+                        });
+                    }
+                } else {
+                    errors.push(ParseError {
+                        line,
+                        message: format!("unexpected closing delimiter '{ch}'"),
+                        severity: ParseErrorSeverity::Error,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(delim) = string_delim {
+        errors.push(ParseError {
+            line,
+            message: format!("unterminated string literal starting with '{delim}'"),
+            severity: ParseErrorSeverity::Warning,
+        });
+    }
+
+    if in_block_comment {
+        errors.push(ParseError {
+            line,
+            message: "unterminated block comment".to_string(),
+            severity: ParseErrorSeverity::Warning,
+        });
+    }
+
+    for (open, open_line) in stack {
+        errors.push(ParseError {
+            line: open_line,
+            message: format!("unclosed delimiter '{open}'"),
+            severity: ParseErrorSeverity::Error,
+        });
+    }
+
+    errors
 }
 
 // ── Tool spec types ──────────────────────────────────────────────────────────
@@ -755,10 +965,120 @@ impl CodeChunker {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingModelConfig {
+    pub model_name: String,
+    pub dimensions: usize,
+    pub provider: EmbeddingProvider,
+    pub batch_size: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbeddingProvider {
+    OpenAI { model: String },
+    Local { path: String },
+    HuggingFace { model_id: String },
+    Mock,
+}
+
+pub struct EmbeddingSelector {
+    models: HashMap<String, EmbeddingModelConfig>,
+    active: String,
+}
+
+impl EmbeddingSelector {
+    pub fn new() -> Self {
+        Self {
+            models: HashMap::new(),
+            active: String::new(),
+        }
+    }
+
+    pub fn register_model(&mut self, name: &str, config: EmbeddingModelConfig) {
+        self.models.insert(name.to_string(), config);
+        if self.active.is_empty() {
+            self.active = name.to_string();
+        }
+    }
+
+    pub fn set_active(&mut self, name: &str) -> Result<(), String> {
+        if self.models.contains_key(name) {
+            self.active = name.to_string();
+            Ok(())
+        } else {
+            Err(format!("embedding model '{name}' is not registered"))
+        }
+    }
+
+    pub fn get_active(&self) -> &EmbeddingModelConfig {
+        static FALLBACK_MODEL: OnceLock<EmbeddingModelConfig> = OnceLock::new();
+
+        self.models.get(&self.active).unwrap_or_else(|| {
+            FALLBACK_MODEL.get_or_init(|| EmbeddingModelConfig {
+                model_name: "unconfigured".to_string(),
+                dimensions: 0,
+                provider: EmbeddingProvider::Mock,
+                batch_size: 0,
+            })
+        })
+    }
+
+    pub fn list_models(&self) -> Vec<&EmbeddingModelConfig> {
+        let mut models: Vec<&EmbeddingModelConfig> = self.models.values().collect();
+        models.sort_by(|a, b| a.model_name.cmp(&b.model_name));
+        models
+    }
+
+    pub fn default_models() -> Self {
+        let mut selector = Self::new();
+        selector.register_model(
+            "text-embedding-3-small",
+            EmbeddingModelConfig {
+                model_name: "text-embedding-3-small".to_string(),
+                dimensions: 1536,
+                provider: EmbeddingProvider::OpenAI {
+                    model: "text-embedding-3-small".to_string(),
+                },
+                batch_size: 64,
+            },
+        );
+        selector.register_model(
+            "ada-002",
+            EmbeddingModelConfig {
+                model_name: "ada-002".to_string(),
+                dimensions: 1536,
+                provider: EmbeddingProvider::OpenAI {
+                    model: "text-embedding-ada-002".to_string(),
+                },
+                batch_size: 64,
+            },
+        );
+        selector.register_model(
+            "local-minilm",
+            EmbeddingModelConfig {
+                model_name: "local-minilm".to_string(),
+                dimensions: 384,
+                provider: EmbeddingProvider::Local {
+                    path: "models/all-MiniLM-L6-v2.onnx".to_string(),
+                },
+                batch_size: 32,
+            },
+        );
+        selector.active = "text-embedding-3-small".to_string();
+        selector
+    }
+}
+
+impl Default for EmbeddingSelector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Embedding provider ───────────────────────────────────────────────────────
 
 #[async_trait]
-pub trait EmbeddingProvider: Send + Sync {
+pub trait EmbeddingBackend: Send + Sync {
     async fn embed(&self, texts: Vec<String>) -> caduceus_core::Result<Vec<Vec<f32>>>;
     fn dimensions(&self) -> usize;
 }
@@ -776,7 +1096,7 @@ impl DummyEmbedder {
 }
 
 #[async_trait]
-impl EmbeddingProvider for DummyEmbedder {
+impl EmbeddingBackend for DummyEmbedder {
     async fn embed(&self, texts: Vec<String>) -> caduceus_core::Result<Vec<Vec<f32>>> {
         Ok(texts
             .iter()
@@ -834,7 +1154,7 @@ impl OpenAiEmbedder {
 }
 
 #[async_trait]
-impl EmbeddingProvider for OpenAiEmbedder {
+impl EmbeddingBackend for OpenAiEmbedder {
     async fn embed(&self, texts: Vec<String>) -> caduceus_core::Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -896,12 +1216,12 @@ impl EmbeddingProvider for OpenAiEmbedder {
 
 pub struct SemanticIndex {
     entries: Vec<(CodeChunk, Vec<f32>)>,
-    embedder: Box<dyn EmbeddingProvider>,
+    embedder: Box<dyn EmbeddingBackend>,
     chunker: CodeChunker,
 }
 
 impl SemanticIndex {
-    pub fn new(embedder: Box<dyn EmbeddingProvider>) -> Self {
+    pub fn new(embedder: Box<dyn EmbeddingBackend>) -> Self {
         Self {
             entries: Vec::new(),
             embedder,
@@ -1365,5 +1685,123 @@ def decorated():
 
         let c3 = chunker.chunk_file("a.rs", "pub fn bar() {}\n");
         assert_ne!(c1[0].content_hash, c3[0].content_hash);
+    }
+    #[test]
+    fn parse_error_downranker_reduces_scores_for_error_chunks() {
+        let ranker = ParseErrorDownRanker::new(0.25);
+        let adjusted = ranker.adjust_score(0.8, true);
+        assert!((adjusted - 0.6).abs() < 1e-9);
+
+        let errors = ParseErrorDownRanker::detect_parse_errors(
+            "pub fn broken() {\n    println!(\"oops\");\n",
+            "rust",
+        );
+        assert!(!errors.is_empty());
+        assert_eq!(errors[0].severity, ParseErrorSeverity::Error);
+    }
+
+    #[test]
+    fn parse_error_downranker_leaves_clean_chunks_unchanged() {
+        let ranker = ParseErrorDownRanker::new(0.4);
+        assert!((ranker.adjust_score(0.8, false) - 0.8).abs() < 1e-9);
+
+        let errors = ParseErrorDownRanker::detect_parse_errors(
+            "pub fn clean() -> i32 {\n    42\n}\n",
+            "rust",
+        );
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn parse_error_downranker_ranks_clean_chunks_first() {
+        let ranker = ParseErrorDownRanker::new(0.5);
+        let mut chunks = vec![
+            ScoredChunk {
+                content: "pub fn broken() {".to_string(),
+                score: 0.9,
+                has_errors: false,
+                file_path: "broken.rs".to_string(),
+            },
+            ScoredChunk {
+                content: "pub fn clean() -> i32 {\n    42\n}\n".to_string(),
+                score: 0.8,
+                has_errors: false,
+                file_path: "clean.rs".to_string(),
+            },
+        ];
+
+        ranker.rank_chunks(&mut chunks);
+
+        assert_eq!(chunks[0].file_path, "clean.rs");
+        assert!(!chunks[0].has_errors);
+        assert_eq!(chunks[1].file_path, "broken.rs");
+        assert!(chunks[1].has_errors);
+        assert!(chunks[1].score < chunks[0].score);
+    }
+
+    #[test]
+    fn embedding_selector_registers_selects_and_lists_models() {
+        let mut selector = EmbeddingSelector::new();
+        selector.register_model(
+            "mock-large",
+            EmbeddingModelConfig {
+                model_name: "mock-large".to_string(),
+                dimensions: 768,
+                provider: EmbeddingProvider::Mock,
+                batch_size: 16,
+            },
+        );
+        selector.register_model(
+            "hf-small",
+            EmbeddingModelConfig {
+                model_name: "hf-small".to_string(),
+                dimensions: 384,
+                provider: EmbeddingProvider::HuggingFace {
+                    model_id: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+                },
+                batch_size: 8,
+            },
+        );
+
+        selector.set_active("hf-small").unwrap();
+        assert_eq!(selector.get_active().model_name, "hf-small");
+
+        let names: Vec<&str> = selector
+            .list_models()
+            .iter()
+            .map(|config| config.model_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["hf-small", "mock-large"]);
+    }
+
+    #[test]
+    fn embedding_selector_exposes_default_models() {
+        let selector = EmbeddingSelector::default_models();
+        let names: Vec<&str> = selector
+            .list_models()
+            .iter()
+            .map(|config| config.model_name.as_str())
+            .collect();
+
+        assert_eq!(selector.get_active().model_name, "text-embedding-3-small");
+        assert!(names.contains(&"text-embedding-3-small"));
+        assert!(names.contains(&"ada-002"));
+        assert!(names.contains(&"local-minilm"));
+    }
+
+    #[test]
+    fn embedding_selector_rejects_unknown_active_model() {
+        let mut selector = EmbeddingSelector::default_models();
+        let err = selector.set_active("missing-model").unwrap_err();
+        assert!(err.contains("missing-model"));
+    }
+
+    #[test]
+    fn embedding_selector_returns_mock_when_unconfigured() {
+        let selector = EmbeddingSelector::new();
+        let active = selector.get_active();
+
+        assert_eq!(active.model_name, "unconfigured");
+        assert_eq!(active.provider, EmbeddingProvider::Mock);
     }
 }

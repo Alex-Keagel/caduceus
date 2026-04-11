@@ -360,6 +360,15 @@ fn render_content_blocks(content: &[ContentBlock]) -> String {
                 };
                 format!("{label} `{}`\n{content}", tool_call_id.0)
             }
+            ContentBlock::Image(img) => {
+                let src = match &img.source {
+                    caduceus_core::ImageSource::Url(u) => u.clone(),
+                    caduceus_core::ImageSource::Base64 { media_type, .. } => {
+                        format!("[base64 image: {media_type}]")
+                    }
+                };
+                format!("Image: {src}")
+            }
         })
         .collect::<Vec<_>>()
         .join("\n\n")

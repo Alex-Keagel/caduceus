@@ -11,6 +11,7 @@ use caduceus_core::{ModelId, ProviderId, TokenUsage};
 use caduceus_providers::{ChatRequest, LlmAdapter, Message};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::sync::RwLock;
@@ -709,6 +710,374 @@ pub async fn run_team(
     }
 }
 
+// ── Task decomposition ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Complexity {
+    Simple,
+    Medium,
+    Complex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecomposedTask {
+    pub id: usize,
+    pub title: String,
+    pub description: String,
+    pub estimated_complexity: Complexity,
+    pub depends_on: Vec<usize>,
+}
+
+pub struct TaskDecomposer;
+
+impl TaskDecomposer {
+    pub fn decompose(description: &str) -> Vec<DecomposedTask> {
+        let mut steps = split_description_into_steps(description);
+        if steps.is_empty() && !description.trim().is_empty() {
+            steps.push(description.trim().to_string());
+        }
+
+        steps
+            .into_iter()
+            .enumerate()
+            .map(|(index, step)| DecomposedTask {
+                id: index,
+                title: build_task_title(&step),
+                description: step.clone(),
+                estimated_complexity: classify_complexity(&step),
+                depends_on: if index == 0 {
+                    Vec::new()
+                } else {
+                    vec![index - 1]
+                },
+            })
+            .collect()
+    }
+
+    pub fn build_dependency_graph(tasks: &[DecomposedTask]) -> Vec<(usize, usize)> {
+        let known_ids: HashSet<usize> = tasks.iter().map(|task| task.id).collect();
+        let mut edges = Vec::new();
+
+        for task in tasks {
+            for dependency in &task.depends_on {
+                if known_ids.contains(dependency) {
+                    edges.push((*dependency, task.id));
+                }
+            }
+        }
+
+        edges
+    }
+
+    pub fn topological_sort(tasks: &[DecomposedTask], deps: &[(usize, usize)]) -> Vec<usize> {
+        let mut indegree = HashMap::new();
+        let mut adjacency: HashMap<usize, Vec<usize>> = HashMap::new();
+
+        for task in tasks {
+            indegree.insert(task.id, 0usize);
+            adjacency.entry(task.id).or_default();
+        }
+
+        for (from, to) in deps {
+            if indegree.contains_key(from) && indegree.contains_key(to) {
+                adjacency.entry(*from).or_default().push(*to);
+                *indegree.entry(*to).or_default() += 1;
+            }
+        }
+
+        let mut ready: Vec<usize> = indegree
+            .iter()
+            .filter_map(|(id, degree)| (*degree == 0).then_some(*id))
+            .collect();
+        ready.sort_unstable();
+
+        let mut queue: VecDeque<usize> = ready.into();
+        let mut ordered = Vec::new();
+
+        while let Some(node) = queue.pop_front() {
+            ordered.push(node);
+
+            if let Some(children) = adjacency.get(&node) {
+                let mut next_ready = Vec::new();
+                for child in children {
+                    if let Some(degree) = indegree.get_mut(child) {
+                        *degree = degree.saturating_sub(1);
+                        if *degree == 0 {
+                            next_ready.push(*child);
+                        }
+                    }
+                }
+                next_ready.sort_unstable();
+                queue.extend(next_ready);
+            }
+        }
+
+        if ordered.len() == tasks.len() {
+            ordered
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+fn split_description_into_steps(description: &str) -> Vec<String> {
+    description
+        .lines()
+        .flat_map(|line| line.split(';'))
+        .flat_map(|line| line.split('.'))
+        .flat_map(|line| line.split(" and then "))
+        .flat_map(|line| line.split(" then "))
+        .map(str::trim)
+        .map(|line| {
+            line.trim_start_matches(|ch: char| {
+                ch.is_ascii_digit() || matches!(ch, '.' | '-' | '*' | ')' | ' ')
+            })
+        })
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn build_task_title(step: &str) -> String {
+    let title_words = step.split_whitespace().take(5).collect::<Vec<_>>();
+    if title_words.is_empty() {
+        "Untitled task".to_string()
+    } else {
+        title_words.join(" ")
+    }
+}
+
+fn classify_complexity(step: &str) -> Complexity {
+    let word_count = step.split_whitespace().count();
+    if word_count >= 12 {
+        Complexity::Complex
+    } else if word_count >= 6 {
+        Complexity::Medium
+    } else {
+        Complexity::Simple
+    }
+}
+
+// ── Notification routing ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NotificationSeverity {
+    Info,
+    Warning,
+    Error,
+    Critical,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotificationChannel {
+    Terminal,
+    Desktop,
+    Webhook(String),
+    Log,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationRoute {
+    pub min_severity: NotificationSeverity,
+    pub channels: Vec<NotificationChannel>,
+    pub pattern: Option<String>,
+}
+
+pub struct NotificationRouter {
+    routes: Vec<NotificationRoute>,
+}
+
+impl NotificationRouter {
+    pub fn new() -> Self {
+        Self { routes: Vec::new() }
+    }
+
+    pub fn add_route(&mut self, route: NotificationRoute) {
+        self.routes.push(route);
+    }
+
+    pub fn route(
+        &self,
+        severity: NotificationSeverity,
+        message: &str,
+    ) -> Vec<&NotificationChannel> {
+        let normalized_message = message.to_lowercase();
+        let mut selected = Vec::new();
+
+        for route in &self.routes {
+            let pattern_matches = route
+                .pattern
+                .as_ref()
+                .map(|pattern| normalized_message.contains(&pattern.to_lowercase()))
+                .unwrap_or(true);
+
+            if severity >= route.min_severity && pattern_matches {
+                for channel in &route.channels {
+                    if selected.iter().all(|existing| *existing != channel) {
+                        selected.push(channel);
+                    }
+                }
+            }
+        }
+
+        selected
+    }
+
+    pub fn default_routes() -> Self {
+        let mut router = Self::new();
+        router.add_route(NotificationRoute {
+            min_severity: NotificationSeverity::Info,
+            channels: vec![NotificationChannel::Terminal],
+            pattern: None,
+        });
+        router.add_route(NotificationRoute {
+            min_severity: NotificationSeverity::Warning,
+            channels: vec![NotificationChannel::Log],
+            pattern: None,
+        });
+        router.add_route(NotificationRoute {
+            min_severity: NotificationSeverity::Error,
+            channels: vec![NotificationChannel::Desktop],
+            pattern: None,
+        });
+        router.add_route(NotificationRoute {
+            min_severity: NotificationSeverity::Critical,
+            channels: vec![NotificationChannel::Webhook(
+                "critical://alerts".to_string(),
+            )],
+            pattern: None,
+        });
+        router
+    }
+}
+
+impl Default for NotificationRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Multi-repo workspace ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub branch: String,
+    pub is_active: bool,
+}
+
+pub struct MultiRepoWorkspace {
+    repos: Vec<RepoEntry>,
+    active_repo: Option<usize>,
+}
+
+impl MultiRepoWorkspace {
+    pub fn new() -> Self {
+        Self {
+            repos: Vec::new(),
+            active_repo: None,
+        }
+    }
+
+    pub fn add_repo(&mut self, name: &str, path: PathBuf) -> Result<(), String> {
+        if self.repos.iter().any(|repo| repo.name == name) {
+            return Err(format!("Repository '{name}' already exists"));
+        }
+        if self.repos.iter().any(|repo| repo.path == path) {
+            return Err(format!(
+                "Repository path '{}' already exists",
+                path.display()
+            ));
+        }
+
+        let should_activate = self.active_repo.is_none();
+        self.repos.push(RepoEntry {
+            name: name.to_string(),
+            branch: detect_branch(&path),
+            path,
+            is_active: should_activate,
+        });
+        if should_activate {
+            self.active_repo = Some(self.repos.len() - 1);
+        }
+        Ok(())
+    }
+
+    pub fn remove_repo(&mut self, name: &str) -> Result<(), String> {
+        let index = self
+            .repos
+            .iter()
+            .position(|repo| repo.name == name)
+            .ok_or_else(|| format!("Repository '{name}' not found"))?;
+
+        self.repos.remove(index);
+
+        match self.active_repo {
+            Some(active) if active == index => {
+                self.active_repo = None;
+                if let Some(first_repo) = self.repos.first_mut() {
+                    first_repo.is_active = true;
+                    self.active_repo = Some(0);
+                }
+            }
+            Some(active) if active > index => {
+                self.active_repo = Some(active - 1);
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    pub fn set_active(&mut self, name: &str) -> Result<(), String> {
+        let index = self
+            .repos
+            .iter()
+            .position(|repo| repo.name == name)
+            .ok_or_else(|| format!("Repository '{name}' not found"))?;
+
+        for repo in &mut self.repos {
+            repo.is_active = false;
+        }
+        if let Some(repo) = self.repos.get_mut(index) {
+            repo.is_active = true;
+        }
+        self.active_repo = Some(index);
+        Ok(())
+    }
+
+    pub fn get_active(&self) -> Option<&RepoEntry> {
+        self.active_repo.and_then(|index| self.repos.get(index))
+    }
+
+    pub fn list_repos(&self) -> &[RepoEntry] {
+        &self.repos
+    }
+
+    pub fn find_by_path(&self, path: &Path) -> Option<&RepoEntry> {
+        self.repos
+            .iter()
+            .filter(|repo| path.starts_with(&repo.path))
+            .max_by_key(|repo| repo.path.components().count())
+    }
+}
+
+impl Default for MultiRepoWorkspace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn detect_branch(path: &Path) -> String {
+    let head_path = path.join(".git").join("HEAD");
+    std::fs::read_to_string(head_path)
+        .ok()
+        .and_then(|head| head.trim().rsplit('/').next().map(ToString::to_string))
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -896,5 +1265,151 @@ Here is the task plan:
         assert_eq!(cfg.model.0, "gpt-4o");
         assert_eq!(cfg.tools.len(), 2);
         assert_eq!(cfg.max_turns, 5);
+    }
+
+    #[test]
+    fn task_decomposer_splits_description_into_linked_tasks() {
+        let tasks = TaskDecomposer::decompose(
+            "Analyze the bug. Implement the fix. Run the regression tests.",
+        );
+
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].depends_on, Vec::<usize>::new());
+        assert_eq!(tasks[1].depends_on, vec![0]);
+        assert_eq!(tasks[2].depends_on, vec![1]);
+    }
+
+    #[test]
+    fn task_decomposer_builds_dependency_graph() {
+        let tasks = vec![
+            DecomposedTask {
+                id: 0,
+                title: "First".to_string(),
+                description: "First".to_string(),
+                estimated_complexity: Complexity::Simple,
+                depends_on: Vec::new(),
+            },
+            DecomposedTask {
+                id: 1,
+                title: "Second".to_string(),
+                description: "Second".to_string(),
+                estimated_complexity: Complexity::Medium,
+                depends_on: vec![0],
+            },
+        ];
+
+        assert_eq!(TaskDecomposer::build_dependency_graph(&tasks), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn task_decomposer_topological_sort_and_cycle_detection() {
+        let tasks = vec![
+            DecomposedTask {
+                id: 0,
+                title: "First".to_string(),
+                description: "First".to_string(),
+                estimated_complexity: Complexity::Simple,
+                depends_on: Vec::new(),
+            },
+            DecomposedTask {
+                id: 1,
+                title: "Second".to_string(),
+                description: "Second".to_string(),
+                estimated_complexity: Complexity::Simple,
+                depends_on: vec![0],
+            },
+            DecomposedTask {
+                id: 2,
+                title: "Third".to_string(),
+                description: "Third".to_string(),
+                estimated_complexity: Complexity::Simple,
+                depends_on: vec![1],
+            },
+        ];
+
+        let deps = TaskDecomposer::build_dependency_graph(&tasks);
+        assert_eq!(
+            TaskDecomposer::topological_sort(&tasks, &deps),
+            vec![0, 1, 2]
+        );
+
+        let cyclic = TaskDecomposer::topological_sort(&tasks, &[(0, 1), (1, 2), (2, 0)]);
+        assert!(cyclic.is_empty());
+    }
+
+    #[test]
+    fn notification_router_routes_by_severity_and_pattern() {
+        let mut router = NotificationRouter::new();
+        router.add_route(NotificationRoute {
+            min_severity: NotificationSeverity::Warning,
+            channels: vec![NotificationChannel::Terminal],
+            pattern: None,
+        });
+        router.add_route(NotificationRoute {
+            min_severity: NotificationSeverity::Error,
+            channels: vec![NotificationChannel::Webhook("ops".to_string())],
+            pattern: Some("deploy".to_string()),
+        });
+
+        let warning_channels = router.route(NotificationSeverity::Warning, "minor warning");
+        let error_channels = router.route(NotificationSeverity::Error, "deploy failed");
+
+        assert_eq!(warning_channels, vec![&NotificationChannel::Terminal]);
+        assert_eq!(
+            error_channels,
+            vec![
+                &NotificationChannel::Terminal,
+                &NotificationChannel::Webhook("ops".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn notification_router_default_routes_cover_critical_alerts() {
+        let router = NotificationRouter::default_routes();
+        let channels = router.route(NotificationSeverity::Critical, "disk full");
+
+        assert!(channels.contains(&&NotificationChannel::Terminal));
+        assert!(channels.contains(&&NotificationChannel::Log));
+        assert!(channels.contains(&&NotificationChannel::Desktop));
+        assert!(channels.contains(&&NotificationChannel::Webhook(
+            "critical://alerts".to_string()
+        )));
+    }
+
+    #[test]
+    fn multi_repo_workspace_add_remove_and_activate() {
+        let mut workspace = MultiRepoWorkspace::new();
+        workspace
+            .add_repo("api", PathBuf::from("/workspace/api"))
+            .unwrap();
+        workspace
+            .add_repo("web", PathBuf::from("/workspace/web"))
+            .unwrap();
+
+        assert_eq!(workspace.list_repos().len(), 2);
+        assert_eq!(
+            workspace.get_active().map(|repo| repo.name.as_str()),
+            Some("api")
+        );
+
+        workspace.set_active("web").unwrap();
+        assert_eq!(
+            workspace.get_active().map(|repo| repo.name.as_str()),
+            Some("web")
+        );
+        assert_eq!(
+            workspace
+                .find_by_path(Path::new("/workspace/web/src/lib.rs"))
+                .map(|repo| repo.name.as_str()),
+            Some("web")
+        );
+
+        workspace.remove_repo("web").unwrap();
+        assert_eq!(workspace.list_repos().len(), 1);
+        assert_eq!(
+            workspace.get_active().map(|repo| repo.name.as_str()),
+            Some("api")
+        );
     }
 }
