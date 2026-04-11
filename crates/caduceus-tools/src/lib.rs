@@ -3591,6 +3591,820 @@ impl NotebookCellTool {
     }
 }
 
+// ── Security analysis features ─────────────────────────────────────────────────
+
+use caduceus_permissions::VulnSeverity;
+
+// ── #218: SAST Vulnerability Scanner ──────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VulnCategory {
+    Secrets,
+    Injection,
+    XSS,
+    SQLi,
+    SSRF,
+    SSTI,
+    IDOR,
+    WeakCrypto,
+    InsecureDeserialize,
+    PathTraversal,
+    AuthBypass,
+}
+
+pub struct SastRule {
+    pub id: String,
+    pub category: VulnCategory,
+    pub pattern: String,
+    pub description: String,
+    pub severity: VulnSeverity,
+    pub remediation: String,
+}
+
+pub struct SastFinding {
+    pub rule_id: String,
+    pub category: VulnCategory,
+    pub severity: VulnSeverity,
+    pub file: String,
+    pub line: usize,
+    pub snippet: String,
+    pub description: String,
+    pub remediation: String,
+}
+
+pub struct SastScanner {
+    rules: Vec<SastRule>,
+}
+
+impl Default for SastScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SastScanner {
+    pub fn new() -> Self {
+        Self {
+            rules: Self::default_rules(),
+        }
+    }
+
+    pub fn add_rule(&mut self, rule: SastRule) {
+        self.rules.push(rule);
+    }
+
+    pub fn scan_content(&self, file: &str, content: &str) -> Vec<SastFinding> {
+        let mut findings = Vec::new();
+        for (i, line) in content.lines().enumerate() {
+            let lineno = i + 1;
+            let lower = line.to_lowercase();
+            for rule in &self.rules {
+                let pat_lower = rule.pattern.to_lowercase();
+                if lower.contains(&pat_lower) || line.contains(&rule.pattern) {
+                    findings.push(SastFinding {
+                        rule_id: rule.id.clone(),
+                        category: rule.category.clone(),
+                        severity: rule.severity.clone(),
+                        file: file.to_string(),
+                        line: lineno,
+                        snippet: line.trim().to_string(),
+                        description: rule.description.clone(),
+                        remediation: rule.remediation.clone(),
+                    });
+                }
+            }
+        }
+        findings
+    }
+
+    pub fn scan_diff(&self, diff: &str) -> Vec<SastFinding> {
+        let mut findings = Vec::new();
+        let mut current_file = String::new();
+        let mut line_num: usize = 0;
+        for line in diff.lines() {
+            if let Some(stripped) = line.strip_prefix("+++ b/") {
+                current_file = stripped.to_string();
+            } else if line.starts_with("@@ ") {
+                if let Some(plus_part) = line.split('+').nth(1) {
+                    let num_str = plus_part.split([',', ' ']).next().unwrap_or("0");
+                    line_num = num_str.parse::<usize>().unwrap_or(1).saturating_sub(1);
+                }
+            } else if line.starts_with('+') && !line.starts_with("+++") {
+                line_num += 1;
+                let content_line = &line[1..];
+                let lower = content_line.to_lowercase();
+                for rule in &self.rules {
+                    let pat_lower = rule.pattern.to_lowercase();
+                    if lower.contains(&pat_lower) || content_line.contains(&rule.pattern) {
+                        findings.push(SastFinding {
+                            rule_id: rule.id.clone(),
+                            category: rule.category.clone(),
+                            severity: rule.severity.clone(),
+                            file: current_file.clone(),
+                            line: line_num,
+                            snippet: content_line.trim().to_string(),
+                            description: rule.description.clone(),
+                            remediation: rule.remediation.clone(),
+                        });
+                    }
+                }
+            } else if line.starts_with(' ') {
+                line_num += 1;
+            }
+        }
+        findings
+    }
+
+    pub fn default_rules() -> Vec<SastRule> {
+        vec![
+            SastRule {
+                id: "SEC-001".into(),
+                category: VulnCategory::Secrets,
+                pattern: "API_KEY=".into(),
+                description: "Hardcoded API key detected".into(),
+                severity: VulnSeverity::Critical,
+                remediation: "Store API keys in environment variables or a secrets manager".into(),
+            },
+            SastRule {
+                id: "SEC-002".into(),
+                category: VulnCategory::Secrets,
+                pattern: "PASSWORD=".into(),
+                description: "Hardcoded password detected".into(),
+                severity: VulnSeverity::Critical,
+                remediation: "Never hardcode passwords; use environment variables".into(),
+            },
+            SastRule {
+                id: "SEC-003".into(),
+                category: VulnCategory::Secrets,
+                pattern: "-----BEGIN RSA".into(),
+                description: "Private RSA key material detected in source".into(),
+                severity: VulnSeverity::Critical,
+                remediation: "Remove private keys from source; use a secrets manager".into(),
+            },
+            SastRule {
+                id: "SEC-004".into(),
+                category: VulnCategory::Injection,
+                pattern: "eval(".into(),
+                description: "Use of eval() is a code injection risk".into(),
+                severity: VulnSeverity::High,
+                remediation: "Avoid eval(); use safe alternatives".into(),
+            },
+            SastRule {
+                id: "SEC-005".into(),
+                category: VulnCategory::Injection,
+                pattern: "exec(".into(),
+                description: "Use of exec() can execute arbitrary code".into(),
+                severity: VulnSeverity::High,
+                remediation: "Validate and sanitize inputs before exec(); prefer safe APIs".into(),
+            },
+            SastRule {
+                id: "SEC-006".into(),
+                category: VulnCategory::Injection,
+                pattern: "system(".into(),
+                description: "Shell command injection risk via system()".into(),
+                severity: VulnSeverity::High,
+                remediation: "Avoid system(); use parameterized APIs; sanitize inputs".into(),
+            },
+            SastRule {
+                id: "SEC-007".into(),
+                category: VulnCategory::XSS,
+                pattern: "innerHTML".into(),
+                description: "Direct innerHTML assignment may cause XSS".into(),
+                severity: VulnSeverity::High,
+                remediation: "Use textContent or sanitize HTML before assignment".into(),
+            },
+            SastRule {
+                id: "SEC-008".into(),
+                category: VulnCategory::Injection,
+                pattern: ".raw(".into(),
+                description: "Raw SQL/template usage detected; injection risk".into(),
+                severity: VulnSeverity::High,
+                remediation: "Use parameterized queries instead of raw string interpolation".into(),
+            },
+            SastRule {
+                id: "SEC-009".into(),
+                category: VulnCategory::SQLi,
+                pattern: "SELECT".into(),
+                description: "Potential SQL injection: raw SELECT statement detected".into(),
+                severity: VulnSeverity::High,
+                remediation: "Use parameterized queries or an ORM".into(),
+            },
+            SastRule {
+                id: "SEC-010".into(),
+                category: VulnCategory::SSRF,
+                pattern: "requests.get(user_input)".into(),
+                description: "SSRF risk: user-controlled URL passed to HTTP request".into(),
+                severity: VulnSeverity::High,
+                remediation: "Validate and allowlist URLs before making requests".into(),
+            },
+            SastRule {
+                id: "SEC-011".into(),
+                category: VulnCategory::InsecureDeserialize,
+                pattern: "pickle.loads".into(),
+                description: "Insecure deserialization via pickle.loads".into(),
+                severity: VulnSeverity::High,
+                remediation:
+                    "Avoid pickle for untrusted data; use JSON or authenticated serialization"
+                        .into(),
+            },
+            SastRule {
+                id: "SEC-012".into(),
+                category: VulnCategory::Injection,
+                pattern: "yaml.load(".into(),
+                description: "Unsafe YAML deserialization; use yaml.safe_load instead".into(),
+                severity: VulnSeverity::High,
+                remediation: "Replace yaml.load with yaml.safe_load".into(),
+            },
+            SastRule {
+                id: "SEC-013".into(),
+                category: VulnCategory::SSRF,
+                pattern: "curl".into(),
+                description: "curl command with potentially user-controlled URL".into(),
+                severity: VulnSeverity::Medium,
+                remediation: "Validate URLs and use allowlists for curl-based requests".into(),
+            },
+        ]
+    }
+}
+
+// ── #219: Audit Scope Tool ─────────────────────────────────────────────────────
+
+pub struct AuditScopeTool;
+
+pub struct DiffFile {
+    pub path: String,
+    pub added_lines: Vec<(usize, String)>,
+    pub removed_lines: Vec<(usize, String)>,
+}
+
+impl AuditScopeTool {
+    pub fn is_valid_git_ref(ref_str: &str) -> bool {
+        if ref_str.contains("..") {
+            return false;
+        }
+        !ref_str.is_empty()
+            && ref_str
+                .chars()
+                .all(|c| c.is_alphanumeric() || "-_./".contains(c))
+    }
+
+    pub fn get_diff_args(
+        base: Option<&str>,
+        head: Option<&str>,
+    ) -> std::result::Result<Vec<String>, String> {
+        let mut args = vec!["diff".to_string()];
+        if let Some(b) = base {
+            if !Self::is_valid_git_ref(b) {
+                return Err(format!("Invalid git ref: {b}"));
+            }
+            args.push(b.to_string());
+        }
+        if let Some(h) = head {
+            if !Self::is_valid_git_ref(h) {
+                return Err(format!("Invalid git ref: {h}"));
+            }
+            args.push(h.to_string());
+        }
+        Ok(args)
+    }
+
+    pub fn parse_diff_files(diff: &str) -> Vec<DiffFile> {
+        let mut files: Vec<DiffFile> = Vec::new();
+        let mut current: Option<DiffFile> = None;
+        let mut add_line: usize = 0;
+        let mut rem_line: usize = 0;
+        for line in diff.lines() {
+            if let Some(stripped) = line.strip_prefix("+++ b/") {
+                if let Some(f) = current.take() {
+                    files.push(f);
+                }
+                current = Some(DiffFile {
+                    path: stripped.to_string(),
+                    added_lines: Vec::new(),
+                    removed_lines: Vec::new(),
+                });
+                add_line = 0;
+                rem_line = 0;
+            } else if line.starts_with("@@ ") {
+                let parts: Vec<&str> = line.split(' ').collect();
+                if parts.len() >= 3 {
+                    let rem_part = parts[1].trim_start_matches('-');
+                    let add_part = parts[2].trim_start_matches('+');
+                    rem_line = rem_part
+                        .split(',')
+                        .next()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .saturating_sub(1);
+                    add_line = add_part
+                        .split(',')
+                        .next()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .saturating_sub(1);
+                }
+            } else if line.starts_with('+') && !line.starts_with("+++") {
+                add_line += 1;
+                if let Some(ref mut f) = current {
+                    f.added_lines.push((add_line, line[1..].to_string()));
+                }
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                rem_line += 1;
+                if let Some(ref mut f) = current {
+                    f.removed_lines.push((rem_line, line[1..].to_string()));
+                }
+            } else if line.starts_with(' ') {
+                add_line += 1;
+                rem_line += 1;
+            }
+        }
+        if let Some(f) = current.take() {
+            files.push(f);
+        }
+        files
+    }
+}
+
+// ── #220: Line Number Finder ───────────────────────────────────────────────────
+
+pub struct LineNumberFinder;
+
+pub struct SnippetLocation {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub start_col: usize,
+}
+
+impl LineNumberFinder {
+    pub fn find_snippet(content: &str, snippet: &str) -> Option<SnippetLocation> {
+        Self::find_all_snippets(content, snippet).into_iter().next()
+    }
+
+    pub fn find_all_snippets(content: &str, snippet: &str) -> Vec<SnippetLocation> {
+        let mut results = Vec::new();
+        let snippet_lines: Vec<&str> = snippet.lines().collect();
+        let content_lines: Vec<&str> = content.lines().collect();
+        if snippet_lines.is_empty() || content_lines.is_empty() {
+            return results;
+        }
+        let snippet_line_count = snippet_lines.len();
+        'outer: for (i, content_line) in content_lines.iter().enumerate() {
+            if let Some(col) = content_line.find(snippet_lines[0]) {
+                if snippet_line_count > 1 {
+                    if i + snippet_line_count > content_lines.len() {
+                        continue;
+                    }
+                    for (j, snippet_line) in snippet_lines.iter().enumerate().skip(1) {
+                        if !content_lines[i + j].contains(snippet_line) {
+                            continue 'outer;
+                        }
+                    }
+                }
+                results.push(SnippetLocation {
+                    start_line: i + 1,
+                    end_line: i + snippet_line_count,
+                    start_col: col,
+                });
+            }
+        }
+        results
+    }
+}
+
+// ── #222: Dependency Vulnerability Scanner ────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockFileType {
+    Npm,
+    Yarn,
+    Pip,
+    Gemfile,
+    GoMod,
+    CargoLock,
+    Composer,
+    Gradle,
+}
+
+pub struct DepVulnerability {
+    pub package: String,
+    pub version: String,
+    pub cve_id: Option<String>,
+    pub severity: VulnSeverity,
+    pub description: String,
+    pub fix_version: Option<String>,
+}
+
+pub struct DepScanner;
+
+impl DepScanner {
+    pub fn detect_lock_files(dir: &str) -> Vec<(String, LockFileType)> {
+        let candidates: &[(&str, LockFileType)] = &[
+            ("package-lock.json", LockFileType::Npm),
+            ("yarn.lock", LockFileType::Yarn),
+            ("requirements.txt", LockFileType::Pip),
+            ("Pipfile.lock", LockFileType::Pip),
+            ("Gemfile.lock", LockFileType::Gemfile),
+            ("go.sum", LockFileType::GoMod),
+            ("Cargo.lock", LockFileType::CargoLock),
+            ("composer.lock", LockFileType::Composer),
+            ("gradle.lockfile", LockFileType::Gradle),
+        ];
+        let mut found = Vec::new();
+        for (name, kind) in candidates {
+            let path = format!("{dir}/{name}");
+            if std::path::Path::new(&path).exists() {
+                found.push((path, kind.clone()));
+            }
+        }
+        found
+    }
+
+    pub fn parse_osv_output(json: &str) -> Vec<DepVulnerability> {
+        let mut vulns = Vec::new();
+        let Ok(v) = serde_json::from_str::<Value>(json) else {
+            return vulns;
+        };
+        let Some(results) = v.get("results").and_then(|r| r.as_array()) else {
+            return vulns;
+        };
+        for result in results {
+            let Some(pkgs) = result.get("packages").and_then(|p| p.as_array()) else {
+                continue;
+            };
+            for pkg in pkgs {
+                let package = pkg
+                    .get("package")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let version = pkg
+                    .get("package")
+                    .and_then(|p| p.get("version"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let Some(vuln_list) = pkg.get("vulnerabilities").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for vuln in vuln_list {
+                    let id = vuln
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let summary = vuln
+                        .get("summary")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let severity_str = vuln
+                        .get("database_specific")
+                        .and_then(|d| d.get("severity"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("MEDIUM");
+                    let severity = match severity_str.to_uppercase().as_str() {
+                        "CRITICAL" => VulnSeverity::Critical,
+                        "HIGH" => VulnSeverity::High,
+                        "LOW" => VulnSeverity::Low,
+                        _ => VulnSeverity::Medium,
+                    };
+                    let fix_version = vuln
+                        .get("affected")
+                        .and_then(|a| a.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|a| a.get("ranges"))
+                        .and_then(|r| r.as_array())
+                        .and_then(|r| r.first())
+                        .and_then(|r| r.get("events"))
+                        .and_then(|e| e.as_array())
+                        .and_then(|e| e.iter().find(|ev| ev.get("fixed").is_some()))
+                        .and_then(|ev| ev.get("fixed"))
+                        .and_then(|f| f.as_str())
+                        .map(|s| s.to_string());
+                    vulns.push(DepVulnerability {
+                        package: package.clone(),
+                        version: version.clone(),
+                        cve_id: if id.starts_with("CVE") {
+                            Some(id)
+                        } else {
+                            None
+                        },
+                        severity,
+                        description: summary,
+                        fix_version,
+                    });
+                }
+            }
+        }
+        vulns
+    }
+
+    pub fn build_osv_command(lock_file: &str) -> Vec<String> {
+        vec![
+            "osv-scanner".to_string(),
+            "--lockfile".to_string(),
+            lock_file.to_string(),
+        ]
+    }
+}
+
+// ── #224: PII Flow Tracer ──────────────────────────────────────────────────────
+
+pub struct PiiPattern {
+    pub name: String,
+    pub category: String,
+    pub pattern: String,
+}
+
+pub struct PiiFlow {
+    pub source: String,
+    pub sink: String,
+    pub pii_type: String,
+    pub file: String,
+    pub line: usize,
+}
+
+pub struct PiiTracer {
+    pii_patterns: Vec<PiiPattern>,
+}
+
+impl Default for PiiTracer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PiiTracer {
+    pub fn new() -> Self {
+        Self {
+            pii_patterns: vec![
+                PiiPattern {
+                    name: "email".into(),
+                    category: "contact".into(),
+                    pattern: "email".into(),
+                },
+                PiiPattern {
+                    name: "ssn".into(),
+                    category: "identity".into(),
+                    pattern: "ssn".into(),
+                },
+                PiiPattern {
+                    name: "phone".into(),
+                    category: "contact".into(),
+                    pattern: "phone".into(),
+                },
+                PiiPattern {
+                    name: "creditCard".into(),
+                    category: "financial".into(),
+                    pattern: "credit_card".into(),
+                },
+                PiiPattern {
+                    name: "apiKey".into(),
+                    category: "credential".into(),
+                    pattern: "api_key".into(),
+                },
+                PiiPattern {
+                    name: "password".into(),
+                    category: "credential".into(),
+                    pattern: "password".into(),
+                },
+            ],
+        }
+    }
+
+    pub fn trace_content(&self, file: &str, content: &str) -> Vec<PiiFlow> {
+        let mut flows = Vec::new();
+        for (i, line) in content.lines().enumerate() {
+            let lineno = i + 1;
+            if let Some(pii_type) = self.is_pii_source(line) {
+                if Self::is_pii_sink(line) {
+                    flows.push(PiiFlow {
+                        source: line.trim().to_string(),
+                        sink: line.trim().to_string(),
+                        pii_type,
+                        file: file.to_string(),
+                        line: lineno,
+                    });
+                }
+            }
+        }
+        flows
+    }
+
+    pub fn is_pii_source(&self, text: &str) -> Option<String> {
+        let lower = text.to_lowercase();
+        for pattern in &self.pii_patterns {
+            if lower.contains(&pattern.pattern) {
+                return Some(pattern.name.clone());
+            }
+        }
+        None
+    }
+
+    pub fn is_pii_sink(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        let sink_patterns = [
+            "console.log",
+            "logger.",
+            "log.",
+            "analytics.",
+            "send(",
+            "post(",
+            "fetch(",
+            "axios.",
+            "http.",
+        ];
+        sink_patterns.iter().any(|p| lower.contains(p))
+    }
+}
+
+// ── #226: Security Report Generator ───────────────────────────────────────────
+
+pub struct SecurityReport {
+    pub title: String,
+    pub timestamp: u64,
+    pub total_findings: usize,
+    pub critical: usize,
+    pub high: usize,
+    pub medium: usize,
+    pub low: usize,
+    pub findings: Vec<ReportFinding>,
+}
+
+pub struct ReportFinding {
+    pub severity: String,
+    pub category: String,
+    pub location: String,
+    pub description: String,
+    pub evidence: String,
+    pub remediation: String,
+}
+
+pub struct SecurityReportGenerator;
+
+impl SecurityReportGenerator {
+    pub fn generate_markdown(report: &SecurityReport) -> String {
+        let mut md = format!("# {}\n\n", report.title);
+        md.push_str(&format!("**Generated:** {}\n\n", report.timestamp));
+        md.push_str(&format!("## Summary\n\n{}\n\n", Self::summary_line(report)));
+        md.push_str(&format!(
+            "**Total Findings:** {}\n\n",
+            report.total_findings
+        ));
+        md.push_str("## Findings\n\n");
+        for finding in &report.findings {
+            md.push_str(&format!(
+                "### [{severity}] {category} — {location}\n\n",
+                severity = finding.severity,
+                category = finding.category,
+                location = finding.location,
+            ));
+            md.push_str(&format!("**Description:** {}\n\n", finding.description));
+            md.push_str(&format!(
+                "**Evidence:**\n```\n{}\n```\n\n",
+                finding.evidence
+            ));
+            md.push_str(&format!("**Remediation:** {}\n\n", finding.remediation));
+            md.push_str("---\n\n");
+        }
+        md
+    }
+
+    pub fn generate_json(report: &SecurityReport) -> String {
+        serde_json::json!({
+            "title": report.title,
+            "timestamp": report.timestamp,
+            "summary": {
+                "total": report.total_findings,
+                "critical": report.critical,
+                "high": report.high,
+                "medium": report.medium,
+                "low": report.low,
+            },
+            "findings": report.findings.iter().map(|f| serde_json::json!({
+                "severity": f.severity,
+                "category": f.category,
+                "location": f.location,
+                "description": f.description,
+                "evidence": f.evidence,
+                "remediation": f.remediation,
+            })).collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+
+    pub fn summary_line(report: &SecurityReport) -> String {
+        format!(
+            "{} Critical, {} High, {} Medium, {} Low",
+            report.critical, report.high, report.medium, report.low
+        )
+    }
+}
+
+// ── #227: Crypto Weakness Detector ────────────────────────────────────────────
+
+pub struct CryptoPattern {
+    pub name: String,
+    pub pattern: String,
+    pub severity: VulnSeverity,
+    pub alternative: String,
+}
+
+pub struct CryptoFinding {
+    pub pattern_name: String,
+    pub file: String,
+    pub line: usize,
+    pub severity: VulnSeverity,
+    pub alternative: String,
+}
+
+pub struct CryptoWeaknessDetector {
+    weak_patterns: Vec<CryptoPattern>,
+}
+
+impl Default for CryptoWeaknessDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CryptoWeaknessDetector {
+    pub fn new() -> Self {
+        Self {
+            weak_patterns: vec![
+                CryptoPattern {
+                    name: "DES".into(),
+                    pattern: "DES".into(),
+                    severity: VulnSeverity::Critical,
+                    alternative: "AES-256-GCM".into(),
+                },
+                CryptoPattern {
+                    name: "TripleDES".into(),
+                    pattern: "TripleDES".into(),
+                    severity: VulnSeverity::High,
+                    alternative: "AES-256-GCM".into(),
+                },
+                CryptoPattern {
+                    name: "3DES".into(),
+                    pattern: "3DES".into(),
+                    severity: VulnSeverity::High,
+                    alternative: "AES-256-GCM".into(),
+                },
+                CryptoPattern {
+                    name: "RC4".into(),
+                    pattern: "RC4".into(),
+                    severity: VulnSeverity::Critical,
+                    alternative: "ChaCha20-Poly1305 or AES-256-GCM".into(),
+                },
+                CryptoPattern {
+                    name: "ECB".into(),
+                    pattern: "ECB".into(),
+                    severity: VulnSeverity::High,
+                    alternative: "AES-256-GCM (authenticated)".into(),
+                },
+                CryptoPattern {
+                    name: "MD5".into(),
+                    pattern: "MD5".into(),
+                    severity: VulnSeverity::High,
+                    alternative: "SHA-256 or SHA-3".into(),
+                },
+                CryptoPattern {
+                    name: "SHA1".into(),
+                    pattern: "SHA1".into(),
+                    severity: VulnSeverity::Medium,
+                    alternative: "SHA-256 or SHA-3".into(),
+                },
+                CryptoPattern {
+                    name: "AES-128".into(),
+                    pattern: "AES-128".into(),
+                    severity: VulnSeverity::Low,
+                    alternative: "AES-256".into(),
+                },
+            ],
+        }
+    }
+
+    pub fn scan_content(&self, file: &str, content: &str) -> Vec<CryptoFinding> {
+        let mut findings = Vec::new();
+        for (i, line) in content.lines().enumerate() {
+            let lineno = i + 1;
+            for pattern in &self.weak_patterns {
+                if line.contains(&pattern.pattern) {
+                    findings.push(CryptoFinding {
+                        pattern_name: pattern.name.clone(),
+                        file: file.to_string(),
+                        line: lineno,
+                        severity: pattern.severity.clone(),
+                        alternative: pattern.alternative.clone(),
+                    });
+                }
+            }
+        }
+        findings
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4743,5 +5557,321 @@ mod tests {
         let reparsed = NotebookCellTool::parse_notebook(&json).unwrap();
         assert_eq!(reparsed.len(), 2);
         assert_eq!(reparsed[0].source, "x = 1");
+    }
+
+    // ── #218: SastScanner tests ────────────────────────────────────────────────
+
+    #[test]
+    fn sast_scanner_detects_hardcoded_api_key() {
+        let scanner = SastScanner::new();
+        let findings = scanner.scan_content("test.py", "API_KEY=supersecret123");
+        assert!(!findings.is_empty());
+        assert_eq!(findings[0].rule_id, "SEC-001");
+        assert_eq!(findings[0].severity, VulnSeverity::Critical);
+    }
+
+    #[test]
+    fn sast_scanner_detects_eval() {
+        let scanner = SastScanner::new();
+        let findings = scanner.scan_content("test.js", "eval(userInput)");
+        assert!(findings.iter().any(|f| f.rule_id == "SEC-004"));
+    }
+
+    #[test]
+    fn sast_scanner_detects_pickle_loads() {
+        let scanner = SastScanner::new();
+        let findings = scanner.scan_content("test.py", "data = pickle.loads(raw)");
+        assert!(findings.iter().any(|f| f.rule_id == "SEC-011"));
+    }
+
+    #[test]
+    fn sast_scanner_clean_content_returns_no_findings() {
+        let scanner = SastScanner::new();
+        let findings = scanner.scan_content("test.py", "def safe_fn():\n    return 42");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn sast_scanner_scan_diff_only_added_lines() {
+        let scanner = SastScanner::new();
+        let diff = "--- a/app.py\n+++ b/app.py\n@@ -1,2 +1,3 @@\n context line\n+eval(user_input)\n-old_line\n";
+        let findings = scanner.scan_diff(diff);
+        assert!(!findings.is_empty());
+        assert_eq!(findings[0].file, "app.py");
+    }
+
+    #[test]
+    fn sast_scanner_add_custom_rule() {
+        let mut scanner = SastScanner::new();
+        scanner.add_rule(SastRule {
+            id: "CUSTOM-001".into(),
+            category: VulnCategory::AuthBypass,
+            pattern: "bypass_auth(".into(),
+            description: "Auth bypass detected".into(),
+            severity: VulnSeverity::Critical,
+            remediation: "Fix authentication".into(),
+        });
+        let findings = scanner.scan_content("test.py", "bypass_auth(user)");
+        assert!(findings.iter().any(|f| f.rule_id == "CUSTOM-001"));
+    }
+
+    #[test]
+    fn sast_scanner_default_rules_not_empty() {
+        let rules = SastScanner::default_rules();
+        assert!(rules.len() >= 13);
+    }
+
+    // ── #219: AuditScopeTool tests ─────────────────────────────────────────────
+
+    #[test]
+    fn audit_scope_valid_git_refs() {
+        assert!(AuditScopeTool::is_valid_git_ref("main"));
+        assert!(AuditScopeTool::is_valid_git_ref("feature/my-branch"));
+        assert!(AuditScopeTool::is_valid_git_ref("v1.2.3"));
+        assert!(AuditScopeTool::is_valid_git_ref("abc123def456"));
+    }
+
+    #[test]
+    fn audit_scope_invalid_git_refs() {
+        assert!(!AuditScopeTool::is_valid_git_ref("main..HEAD"));
+        assert!(!AuditScopeTool::is_valid_git_ref("ref with spaces"));
+        assert!(!AuditScopeTool::is_valid_git_ref(""));
+    }
+
+    #[test]
+    fn audit_scope_get_diff_args_both() {
+        let args = AuditScopeTool::get_diff_args(Some("main"), Some("HEAD")).unwrap();
+        assert_eq!(args, vec!["diff", "main", "HEAD"]);
+    }
+
+    #[test]
+    fn audit_scope_get_diff_args_invalid_ref_errors() {
+        let result = AuditScopeTool::get_diff_args(Some("main..evil"), None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn audit_scope_parse_diff_files() {
+        let diff = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,2 +1,3 @@\n fn main() {}\n+let x = 1;\n-let y = 2;\n";
+        let files = AuditScopeTool::parse_diff_files(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/main.rs");
+        assert!(!files[0].added_lines.is_empty());
+    }
+
+    // ── #220: LineNumberFinder tests ───────────────────────────────────────────
+
+    #[test]
+    fn line_number_finder_finds_single_line_snippet() {
+        let content = "line one\nline two\nline three";
+        let loc = LineNumberFinder::find_snippet(content, "line two").unwrap();
+        assert_eq!(loc.start_line, 2);
+        assert_eq!(loc.end_line, 2);
+    }
+
+    #[test]
+    fn line_number_finder_finds_all_occurrences() {
+        let content = "foo\nbar\nfoo\nbaz";
+        let locs = LineNumberFinder::find_all_snippets(content, "foo");
+        assert_eq!(locs.len(), 2);
+        assert_eq!(locs[0].start_line, 1);
+        assert_eq!(locs[1].start_line, 3);
+    }
+
+    #[test]
+    fn line_number_finder_returns_none_for_missing() {
+        let content = "hello world";
+        assert!(LineNumberFinder::find_snippet(content, "not found").is_none());
+    }
+
+    #[test]
+    fn line_number_finder_start_col_correct() {
+        let content = "  let x = 1;";
+        let loc = LineNumberFinder::find_snippet(content, "let x").unwrap();
+        assert_eq!(loc.start_col, 2);
+    }
+
+    // ── #222: DepScanner tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn dep_scanner_build_osv_command() {
+        let cmd = DepScanner::build_osv_command("Cargo.lock");
+        assert_eq!(cmd[0], "osv-scanner");
+        assert!(cmd.contains(&"Cargo.lock".to_string()));
+    }
+
+    #[test]
+    fn dep_scanner_parse_osv_output_empty_json() {
+        let vulns = DepScanner::parse_osv_output("{}");
+        assert!(vulns.is_empty());
+    }
+
+    #[test]
+    fn dep_scanner_parse_osv_output_with_vuln() {
+        let json = r#"{"results":[{"packages":[{"package":{"name":"lodash","version":"4.17.20"},"vulnerabilities":[{"id":"CVE-2021-23337","summary":"Prototype pollution","database_specific":{"severity":"HIGH"}}]}]}]}"#;
+        let vulns = DepScanner::parse_osv_output(json);
+        assert_eq!(vulns.len(), 1);
+        assert_eq!(vulns[0].package, "lodash");
+        assert_eq!(vulns[0].severity, VulnSeverity::High);
+        assert_eq!(vulns[0].cve_id, Some("CVE-2021-23337".to_string()));
+    }
+
+    #[test]
+    fn dep_scanner_detect_lock_files_nonexistent_dir() {
+        let found = DepScanner::detect_lock_files("/nonexistent/path/xyz");
+        assert!(found.is_empty());
+    }
+
+    // ── #224: PiiTracer tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn pii_tracer_detects_email_source() {
+        let tracer = PiiTracer::new();
+        assert_eq!(
+            tracer.is_pii_source("user.email = input"),
+            Some("email".to_string())
+        );
+    }
+
+    #[test]
+    fn pii_tracer_detects_sink() {
+        assert!(PiiTracer::is_pii_sink("console.log(userData)"));
+        assert!(PiiTracer::is_pii_sink("analytics.track(event)"));
+        assert!(!PiiTracer::is_pii_sink("let x = compute()"));
+    }
+
+    #[test]
+    fn pii_tracer_trace_content_finds_flow() {
+        let tracer = PiiTracer::new();
+        let code = "let emailData = user.email;\nconsole.log(emailData);";
+        let flows = tracer.trace_content("app.js", code);
+        assert!(!flows.is_empty());
+        assert_eq!(flows[0].pii_type, "email");
+    }
+
+    #[test]
+    fn pii_tracer_no_flow_for_clean_code() {
+        let tracer = PiiTracer::new();
+        let code = "let x = compute_value();\nreturn x;";
+        let flows = tracer.trace_content("app.js", code);
+        assert!(flows.is_empty());
+    }
+
+    // ── #226: SecurityReportGenerator tests ───────────────────────────────────
+
+    #[test]
+    fn security_report_summary_line() {
+        let report = SecurityReport {
+            title: "Test Report".into(),
+            timestamp: 0,
+            total_findings: 11,
+            critical: 3,
+            high: 5,
+            medium: 2,
+            low: 1,
+            findings: vec![],
+        };
+        assert_eq!(
+            SecurityReportGenerator::summary_line(&report),
+            "3 Critical, 5 High, 2 Medium, 1 Low"
+        );
+    }
+
+    #[test]
+    fn security_report_generate_markdown_contains_title() {
+        let report = SecurityReport {
+            title: "My Security Audit".into(),
+            timestamp: 1234567890,
+            total_findings: 1,
+            critical: 1,
+            high: 0,
+            medium: 0,
+            low: 0,
+            findings: vec![ReportFinding {
+                severity: "CRITICAL".into(),
+                category: "Secrets".into(),
+                location: "src/config.py:5".into(),
+                description: "API key found".into(),
+                evidence: "API_KEY=abc123".into(),
+                remediation: "Use env vars".into(),
+            }],
+        };
+        let md = SecurityReportGenerator::generate_markdown(&report);
+        assert!(md.contains("# My Security Audit"));
+        assert!(md.contains("CRITICAL"));
+        assert!(md.contains("API_KEY=abc123"));
+    }
+
+    #[test]
+    fn security_report_generate_json_is_valid() {
+        let report = SecurityReport {
+            title: "Test".into(),
+            timestamp: 0,
+            total_findings: 0,
+            critical: 0,
+            high: 0,
+            medium: 0,
+            low: 0,
+            findings: vec![],
+        };
+        let json_str = SecurityReportGenerator::generate_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["title"], "Test");
+        assert_eq!(parsed["summary"]["total"], 0);
+    }
+
+    // ── #227: CryptoWeaknessDetector tests ────────────────────────────────────
+
+    #[test]
+    fn crypto_detector_finds_des() {
+        let detector = CryptoWeaknessDetector::new();
+        let findings = detector.scan_content("crypto.py", "cipher = DES.new(key)");
+        assert!(!findings.is_empty());
+        assert_eq!(findings[0].severity, VulnSeverity::Critical);
+        assert!(findings[0].alternative.contains("AES-256"));
+    }
+
+    #[test]
+    fn crypto_detector_finds_md5() {
+        let detector = CryptoWeaknessDetector::new();
+        let findings = detector.scan_content("hash.py", "hashlib.MD5(data)");
+        assert!(findings.iter().any(|f| f.pattern_name == "MD5"));
+    }
+
+    #[test]
+    fn crypto_detector_finds_rc4() {
+        let detector = CryptoWeaknessDetector::new();
+        let findings = detector.scan_content("enc.py", "RC4.encrypt(data)");
+        assert!(findings.iter().any(|f| f.pattern_name == "RC4"));
+        assert_eq!(
+            findings
+                .iter()
+                .find(|f| f.pattern_name == "RC4")
+                .unwrap()
+                .severity,
+            VulnSeverity::Critical
+        );
+    }
+
+    #[test]
+    fn crypto_detector_finds_sha1() {
+        let detector = CryptoWeaknessDetector::new();
+        let findings = detector.scan_content("hash.py", "SHA1.digest(data)");
+        assert!(findings.iter().any(|f| f.pattern_name == "SHA1"));
+        assert_eq!(
+            findings
+                .iter()
+                .find(|f| f.pattern_name == "SHA1")
+                .unwrap()
+                .severity,
+            VulnSeverity::Medium
+        );
+    }
+
+    #[test]
+    fn crypto_detector_clean_content_no_findings() {
+        let detector = CryptoWeaknessDetector::new();
+        let findings = detector.scan_content("enc.py", "cipher = AES256_GCM.new(key, nonce)");
+        assert!(findings.is_empty());
     }
 }
