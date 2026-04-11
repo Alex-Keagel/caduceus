@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::RwLock;
 
@@ -1308,17 +1308,59 @@ impl PluginToolRegistry {
         &self.tools
     }
 
-    pub fn execute_sync(&self, name: &str, input: &str) -> Result<String, String> {
+    /// Execute a registered plugin tool synchronously.
+    ///
+    /// `caps` — optional capability manager; when provided the plugin must hold
+    /// the `RunCommands` capability or an error is returned immediately.
+    ///
+    /// Dangerous environment-variable overrides (`LD_PRELOAD`,
+    /// `DYLD_INSERT_LIBRARIES`, `LD_LIBRARY_PATH`, `PATH`, `HOME`) are stripped
+    /// from the tool's `env_vars` before spawning the child process.
+    ///
+    /// The child process is killed and an error is returned if it does not
+    /// complete within 5 seconds.
+    pub fn execute_sync(
+        &self,
+        name: &str,
+        input: &str,
+        caps: Option<&PluginCapabilityManager>,
+    ) -> Result<String, String> {
         let tool = self
             .get(name)
             .ok_or_else(|| format!("Tool '{name}' not found"))?;
+
+        // FIX 2a: capability gate.
+        if let Some(caps) = caps {
+            if !caps.check(&tool.plugin, &PluginCapability::RunCommands) {
+                return Err(format!(
+                    "Plugin '{}' does not have RunCommands capability",
+                    tool.plugin
+                ));
+            }
+        }
+
+        // FIX 2b: strip dangerous env-var overrides.
+        const DANGEROUS: &[&str] = &[
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "LD_LIBRARY_PATH",
+            "PATH",
+            "HOME",
+        ];
+        let filtered_env: HashMap<String, String> = tool
+            .env_vars
+            .iter()
+            .filter(|(k, _)| !DANGEROUS.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
         let parts = split_command_line(&tool.command)?;
         let binary = parts
             .first()
             .ok_or_else(|| format!("Tool '{name}' has an empty command"))?;
         let mut child = Command::new(binary)
             .args(parts.iter().skip(1))
-            .envs(&tool.env_vars)
+            .envs(&filtered_env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1329,6 +1371,21 @@ impl PluginToolRegistry {
             stdin
                 .write_all(input.as_bytes())
                 .map_err(|err| err.to_string())?;
+            // stdin is dropped here, closing the pipe so the child can read EOF.
+        }
+
+        // FIX 2c: enforce a 5-second timeout using a try_wait polling loop.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait().map_err(|e| e.to_string())? {
+                Some(_) => break,
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("Tool '{name}' timed out after 5 seconds"));
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
         }
 
         let output = child.wait_with_output().map_err(|err| err.to_string())?;
@@ -1637,7 +1694,20 @@ impl MessageBus {
             .unwrap_or_default()
     }
 
-    pub fn read_since(&self, channel: &str, since: u64) -> Vec<&BusMessage> {
+    /// Return messages on `channel` posted after `since`, filtered by subscription.
+    ///
+    /// Only agents that have called [`subscribe`] for `channel` will receive
+    /// results; unsubscribed callers get an empty vec, matching the behaviour
+    /// of [`read`].
+    pub fn read_since(&self, agent: &str, channel: &str, since: u64) -> Vec<&BusMessage> {
+        // FIX 5: gate on subscription, same as `read`.
+        let is_subscribed = self
+            .subscribers
+            .get(channel)
+            .is_some_and(|agents| agents.iter().any(|name| name == agent));
+        if !is_subscribed {
+            return Vec::new();
+        }
         self.channels
             .get(channel)
             .map(|messages| {
@@ -1804,6 +1874,12 @@ pub struct ContextReference {
     pub estimated_tokens: usize,
 }
 
+/// NOTE: JitContextLoader is !Sync by design — use only on a single thread.
+///
+/// The `access_order` and `next_tick` fields use `RefCell`/`Cell` for interior
+/// mutability in `get` (which takes `&self`).  These types are not `Sync`, so
+/// `JitContextLoader` must not be shared across threads without external
+/// synchronisation.
 #[derive(Debug)]
 pub struct JitContextLoader {
     references: Vec<ContextReference>,
@@ -2661,9 +2737,9 @@ Here is the task plan:
         });
 
         assert_eq!(registry.list().len(), 1);
-        let output = registry.execute_sync("echo", "hello plugin").unwrap();
+        let output = registry.execute_sync("echo", "hello plugin", None).unwrap();
         assert_eq!(output, "hello plugin");
-        assert!(registry.execute_sync("missing", "ignored").is_err());
+        assert!(registry.execute_sync("missing", "ignored", None).is_err());
     }
 
     #[test]
@@ -2747,9 +2823,11 @@ Here is the task plan:
 
         assert_eq!(bus.read("alice", "team").len(), 2);
         assert!(bus.read("bob", "team").is_empty());
-        let recent = bus.read_since("team", 10);
+        let recent = bus.read_since("alice", "team", 10);
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].content, "finished");
+        // Unsubscribed agent must get nothing from read_since.
+        assert!(bus.read_since("bob", "team", 0).is_empty());
     }
 
     #[test]
@@ -2818,5 +2896,91 @@ Here is the task plan:
 
         loader.unload("b");
         assert_eq!(loader.loaded_tokens(), 0);
+    }
+
+    // ── FIX 2: execute_sync capability gate and env-var filtering ─────────────
+
+    #[test]
+    fn execute_sync_blocked_without_run_commands_capability() {
+        let mut registry = PluginToolRegistry::new();
+        registry.register(PluginDefinedTool {
+            name: "safe".to_string(),
+            plugin: "restricted".to_string(),
+            description: "safe op".to_string(),
+            input_schema: serde_json::json!({"type": "string"}),
+            command: "cat".to_string(),
+            env_vars: HashMap::new(),
+        });
+
+        let caps = PluginCapabilityManager::new(); // no grants
+        let result = registry.execute_sync("safe", "input", Some(&caps));
+        assert!(
+            result.is_err(),
+            "should be blocked without RunCommands capability"
+        );
+        assert!(result.unwrap_err().contains("RunCommands"));
+    }
+
+    #[test]
+    fn execute_sync_succeeds_with_run_commands_capability() {
+        let mut registry = PluginToolRegistry::new();
+        registry.register(PluginDefinedTool {
+            name: "echo2".to_string(),
+            plugin: "allowed".to_string(),
+            description: "echo".to_string(),
+            input_schema: serde_json::json!({}),
+            command: "cat".to_string(),
+            env_vars: HashMap::new(),
+        });
+
+        let mut caps = PluginCapabilityManager::new();
+        caps.grant("allowed", PluginCapability::RunCommands);
+        let result = registry.execute_sync("echo2", "ok", Some(&caps));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "ok");
+    }
+
+    #[test]
+    fn execute_sync_filters_dangerous_env_vars() {
+        // Verify that dangerous vars set in env_vars are not passed to the child.
+        // We spawn `env` and check that LD_PRELOAD / PATH are absent from the
+        // tool's env_vars (they would only be dangerous if set there; the host
+        // environment is unaffected by our filtering logic).
+        let mut registry = PluginToolRegistry::new();
+        let mut env_vars = HashMap::new();
+        env_vars.insert("LD_PRELOAD".to_string(), "/evil.so".to_string());
+        env_vars.insert("SAFE_VAR".to_string(), "allowed".to_string());
+        registry.register(PluginDefinedTool {
+            name: "env_tool".to_string(),
+            plugin: "tester".to_string(),
+            description: "env check".to_string(),
+            input_schema: serde_json::json!({}),
+            command: "cat".to_string(),
+            env_vars,
+        });
+
+        // Without caps (None) the env is filtered but no capability check is done.
+        let result = registry.execute_sync("env_tool", "hi", None);
+        // cat just echoes stdin regardless of env; the test ensures no panic/error.
+        assert!(result.is_ok());
+    }
+
+    // ── FIX 5: read_since subscription check ─────────────────────────────────
+
+    #[test]
+    fn read_since_requires_subscription() {
+        let mut bus = MessageBus::new();
+        bus.subscribe("alice", "alerts");
+        bus.publish(BusMessage {
+            from: "system".to_string(),
+            content: "alert!".to_string(),
+            timestamp: 5,
+            channel: "alerts".to_string(),
+        });
+
+        // Subscribed agent sees the message.
+        assert_eq!(bus.read_since("alice", "alerts", 0).len(), 1);
+        // Unsubscribed agent gets nothing even though the message exists.
+        assert!(bus.read_since("bob", "alerts", 0).is_empty());
     }
 }

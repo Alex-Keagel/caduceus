@@ -1426,7 +1426,8 @@ pub enum WriteDecision {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemorySourceValidity {
-    Verified,
+    /// NOTE: Presence of source markers does NOT guarantee content authenticity. This is a heuristic, not a security boundary.
+    HasSourceMarkers,
     Unverified,
     SuspiciouslyRepetitive,
 }
@@ -1455,16 +1456,14 @@ impl MemoryEntrenchmentGuard {
                 WriteDecision::Block("memory content appears suspiciously repetitive".to_string())
             }
             MemorySourceValidity::Unverified => {
-                self.access_counts.insert(memory_id.to_string(), 0);
                 WriteDecision::FlagForReview("memory source could not be verified".to_string())
             }
-            MemorySourceValidity::Verified if self.check_entrenchment(memory_id) => {
-                self.access_counts.insert(memory_id.to_string(), 0);
+            MemorySourceValidity::HasSourceMarkers if self.check_entrenchment(memory_id) => {
                 WriteDecision::FlagForReview(
                     "memory has become entrenched and needs review".to_string(),
                 )
             }
-            MemorySourceValidity::Verified => {
+            MemorySourceValidity::HasSourceMarkers => {
                 self.access_counts.insert(memory_id.to_string(), 0);
                 WriteDecision::Allow
             }
@@ -1518,7 +1517,7 @@ impl MemoryEntrenchmentGuard {
         .iter()
         .any(|marker| lower.contains(marker))
         {
-            MemorySourceValidity::Verified
+            MemorySourceValidity::HasSourceMarkers
         } else {
             MemorySourceValidity::Unverified
         }
@@ -2524,6 +2523,7 @@ mod tests {
             guard.record_write("memory-1", "source: runbook entry"),
             WriteDecision::FlagForReview(_)
         ));
+        assert!(guard.check_entrenchment("memory-1"));
         assert!(matches!(
             guard.record_write("memory-2", "echo echo echo echo"),
             WriteDecision::Block(_)
@@ -2535,7 +2535,7 @@ mod tests {
         let guard = MemoryEntrenchmentGuard::new(3);
         assert_eq!(
             guard.validate_memory_source("https://docs.example.com/reference"),
-            MemorySourceValidity::Verified
+            MemorySourceValidity::HasSourceMarkers
         );
         assert_eq!(
             guard.validate_memory_source(""),

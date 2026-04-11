@@ -1503,14 +1503,25 @@ impl BranchReflector {
             ErrorCategory::Unknown => "low".to_string(),
         };
 
-        // Extract file paths referenced in the error log (lines with "src/" or ".rs")
+        // Extract file paths referenced in the error log (lines with "src/" or "-->")
         let affected_files: Vec<String> = error_log
             .lines()
             .filter_map(|line| {
-                // Look for patterns like "src/foo.rs" or "---> file.rs:42"
-                if let Some(start) = line.find("src/").or_else(|| line.find("-->")) {
+                // Direct "src/" match (covers most Rust compiler output)
+                if let Some(start) = line.find("src/") {
                     let segment = &line[start..];
                     let path: String = segment
+                        .chars()
+                        .take_while(|c| !c.is_whitespace() && *c != ':' && *c != ')')
+                        .collect();
+                    if path.ends_with(".rs") || path.ends_with(".go") || path.ends_with(".ts") {
+                        return Some(path);
+                    }
+                }
+                // "--> path:line" pattern — strip the arrow prefix before extracting
+                if let Some(arrow_pos) = line.find("-->") {
+                    let after_arrow = line[arrow_pos + 3..].trim_start();
+                    let path: String = after_arrow
                         .chars()
                         .take_while(|c| !c.is_whitespace() && *c != ':' && *c != ')')
                         .collect();

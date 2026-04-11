@@ -32,9 +32,9 @@ export default function ImageRenderer({
   const sourceLabel = useMemo(() => {
     if (src.startsWith("data:")) return "data URL";
     if (src.startsWith("blob:")) return "blob";
+    if (typeof window === "undefined") return "image";
     try {
-      const url = new URL(src, window.location.href);
-      return url.protocol.replace(":", "");
+      return new URL(src, window.location.href).protocol.replace(":", "");
     } catch {
       return "image";
     }
@@ -132,6 +132,9 @@ export default function ImageRenderer({
         <img
           src={src}
           alt={alt}
+          loading="lazy"
+          decoding="async"
+          referrerPolicy="no-referrer"
           onLoad={() => {
             setLoading(false);
             setError(false);

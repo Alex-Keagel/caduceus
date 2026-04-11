@@ -882,7 +882,8 @@ fn fnv1a_hash(s: &str) -> u64 {
 #[derive(Debug, Clone)]
 pub struct AgentIdentity {
     pub did: String,
-    pub public_key: String,
+    /// WARNING: FNV-1a is NOT cryptographic. This provides tamper-detection only, not security. For production use, replace with ed25519.
+    pub verification_hash: String,
     pub created_at: u64,
     pub metadata: HashMap<String, String>,
 }
@@ -896,14 +897,14 @@ impl AgentIdentity {
             fnv1a_hash(&(seed.clone() + "2"))
         );
         let did = format!("did:caduceus:{}", hex);
-        let public_key = format!("{:016x}", fnv1a_hash(&did));
+        let verification_hash = format!("{:016x}", fnv1a_hash(&did));
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         Self {
             did,
-            public_key,
+            verification_hash,
             created_at,
             metadata: HashMap::new(),
         }
@@ -913,11 +914,13 @@ impl AgentIdentity {
         &self.did
     }
 
+    /// WARNING: FNV-1a is NOT cryptographic. This provides tamper-detection only, not security. For production use, replace with ed25519.
     pub fn sign(&self, message: &str) -> String {
-        let input = format!("{}:{}", self.public_key, message);
+        let input = format!("{}:{}", self.verification_hash, message);
         format!("{:016x}", fnv1a_hash(&input))
     }
 
+    /// WARNING: FNV-1a is NOT cryptographic. This provides tamper-detection only, not security. For production use, replace with ed25519.
     pub fn verify_signature(&self, message: &str, signature: &str) -> bool {
         self.sign(message) == signature
     }
@@ -966,6 +969,7 @@ impl Default for AgentIdentityRegistry {
 pub struct BridgeConfig {
     pub host: String,
     pub port: u16,
+    pub tls: bool,
     pub auth_token: Option<String>,
     pub max_connections: usize,
 }
@@ -999,13 +1003,15 @@ impl BridgeConfig {
         Self {
             host: host.to_string(),
             port,
+            tls: true,
             auth_token: None,
             max_connections: 100,
         }
     }
 
     pub fn websocket_url(&self) -> String {
-        format!("ws://{}:{}", self.host, self.port)
+        let scheme = if self.tls { "wss" } else { "ws" };
+        format!("{}://{}:{}", scheme, self.host, self.port)
     }
 
     pub fn with_auth(mut self, token: &str) -> Self {
@@ -1024,11 +1030,22 @@ pub struct SshSessionConfig {
     pub auth_method: SshAuthMethod,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum SshAuthMethod {
+    /// WARNING: Password stored in plaintext. In production, use a secret manager or zeroize-on-drop wrapper.
     Password(String),
     PrivateKey(String),
     Agent,
+}
+
+impl fmt::Debug for SshAuthMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Password(_) => write!(f, "Password(***REDACTED***)"),
+            Self::PrivateKey(path) => f.debug_tuple("PrivateKey").field(path).finish(),
+            Self::Agent => write!(f, "Agent"),
+        }
+    }
 }
 
 impl SshSessionConfig {
@@ -1080,6 +1097,7 @@ impl AcpMessage {
         }
     }
 
+    /// By design, this returns a serialized JSON-RPC response string for the ACP wire format instead of `Self`.
     pub fn response(id: u64, result: serde_json::Value) -> String {
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -1089,6 +1107,7 @@ impl AcpMessage {
         .to_string()
     }
 
+    /// By design, this returns a serialized JSON-RPC error string for the ACP wire format instead of `Self`.
     pub fn error(id: u64, code: i32, message: &str) -> String {
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -1147,10 +1166,12 @@ impl OpLog {
 
     pub fn merge(&mut self, other: &OpLog) {
         for op in &other.ops {
-            let is_dup = self
-                .ops
-                .iter()
-                .any(|e| e.timestamp == op.timestamp && e.author == op.author && e.path == op.path);
+            let is_dup = self.ops.iter().any(|e| {
+                e.timestamp == op.timestamp
+                    && e.author == op.author
+                    && e.path == op.path
+                    && e.op_type == op.op_type
+            });
             if !is_dup {
                 self.ops.push(op.clone());
             }
@@ -1644,6 +1665,13 @@ log_level = "debug"
     #[test]
     fn bridge_config_websocket_url() {
         let cfg = BridgeConfig::new("localhost", 8080);
+        assert_eq!(cfg.websocket_url(), "wss://localhost:8080");
+    }
+
+    #[test]
+    fn bridge_config_websocket_url_without_tls() {
+        let mut cfg = BridgeConfig::new("localhost", 8080);
+        cfg.tls = false;
         assert_eq!(cfg.websocket_url(), "ws://localhost:8080");
     }
 
@@ -1656,6 +1684,7 @@ log_level = "debug"
     #[test]
     fn bridge_config_defaults() {
         let cfg = BridgeConfig::new("host", 80);
+        assert!(cfg.tls);
         assert!(cfg.auth_token.is_none());
         assert_eq!(cfg.max_connections, 100);
     }
@@ -1805,6 +1834,30 @@ log_level = "debug"
         });
         log_a.merge(&log_b);
         assert_eq!(log_a.len(), 2); // duplicate not added
+    }
+
+    #[test]
+    fn oplog_merge_keeps_same_time_different_type_ops() {
+        let mut log_a = OpLog::new();
+        let mut log_b = OpLog::new();
+        log_a.append(DeferredOp {
+            op_type: OpType::Insert,
+            path: "shared.rs".to_string(),
+            content: Some("before".to_string()),
+            timestamp: 42,
+            author: "dave".to_string(),
+        });
+        log_b.append(DeferredOp {
+            op_type: OpType::Replace,
+            path: "shared.rs".to_string(),
+            content: Some("after".to_string()),
+            timestamp: 42,
+            author: "dave".to_string(),
+        });
+
+        log_a.merge(&log_b);
+
+        assert_eq!(log_a.len(), 2);
     }
 
     // ── Feature #132: Remote Cursors tests ─────────────────────────────────────
