@@ -33,19 +33,19 @@
 | 4 | Slash command palette | Autocomplete-enabled command input with `/` prefix | Claw, Claurst | ✅ | P0 | `caduceus-orchestrator` |
 | 5 | PTY output rendering | Faithful rendering of subprocess PTY output in the terminal | Hermes | ✅ | P0 | `caduceus-runtime` |
 | 6 | Syntax highlighting (syntect) | Language-aware syntax coloring for code blocks and diffs | Claurst | 📋 | P1 | `caduceus-ui` |
-| 7 | Diff viewer | Side-by-side / unified diff display for file edits | Hermes, Claurst | 📋 | P1 | `caduceus-ui` |
-| 8 | Model picker (searchable) | Fuzzy-searchable model selector with provider grouping | Claurst, Hermes | 📋 | P1 | `caduceus-ui` |
-| 9 | Session browser / resume | List, search, and resume past conversation sessions | Claurst, Claw | 📋 | P1 | `caduceus-ui` |
+| 7 | Diff viewer | Side-by-side / unified diff display for file edits | Hermes, Claurst | ✅ | P1 | `caduceus-ui` |
+| 8 | Model picker (searchable) | Fuzzy-searchable model selector with provider grouping | Claurst, Hermes | ✅ | P1 | `caduceus-ui` |
+| 9 | Session browser / resume | List, search, and resume past conversation sessions | Claurst, Claw | ✅ | P1 | `caduceus-ui` |
 | 10 | Status line | Persistent footer showing model, token count, git branch, cost | Claurst | 📋 | P1 | `caduceus-ui` |
 | 11 | Split terminal layout | Multiple terminal panes with drag-to-resize | Hermes | 📋 | P1 | `caduceus-app` |
-| 12 | Headless mode (`--print`) | Non-interactive single-shot mode for scripting and CI | Claw, Claurst | 📋 | P1 | `caduceus-cli` |
-| 13 | Output formats (text/json/stream) | Selectable output serialization for programmatic consumption | Claw, Claurst | 📋 | P1 | `caduceus-cli` |
-| 14 | Tauri shell + IPC | Native desktop window with Rust↔JS IPC bridge | Hermes | 📋 | P1 | `caduceus-app` |
+| 12 | Headless mode (`--print`) | Non-interactive single-shot mode for scripting and CI | Claw, Claurst | ✅ | P1 | `caduceus-cli` |
+| 13 | Output formats (text/json/stream) | Selectable output serialization for programmatic consumption | Claw, Claurst | ✅ | P1 | `caduceus-cli` |
+| 14 | Tauri shell + IPC | Native desktop window with Rust↔JS IPC bridge | Hermes | ✅ | P1 | `caduceus-app` |
 | 15 | Context visualizer (`/ctx_viz`) | Visual breakdown of context window usage by category | Claurst | 📋 | P2 | `caduceus-ui` |
 | 16 | Theme picker | Switchable color themes with preview | Claurst, Hermes | 📋 | P2 | `caduceus-ui` |
 | 17 | Vim mode (modal editing) | Modal key bindings for the input area | Claurst | 📋 | P2 | `caduceus-ui` |
 | 18 | Desktop notifications | OS-native notifications on task completion / errors | Hermes | 📋 | P2 | `caduceus-app` |
-| 19 | Keybinding configurator | User-customizable key mappings via config file | Claurst | 📋 | P2 | `caduceus-ui` |
+| 19 | Keybinding configurator | User-customizable key mappings via config file | Claurst | ✅ | P2 | `caduceus-ui` |
 | 20 | Image rendering (Sixel/Kitty) | Inline image display using terminal graphics protocols | Claurst | 💡 | P3 | `caduceus-ui` |
 | 21 | Buddy / companion sprite | Animated ASCII/pixel companion that reflects agent state | Claurst | 💡 | P3 | `caduceus-companion` |
 | 22 | Voice input (Deepgram STT) | Speech-to-text input via streaming microphone capture | Claurst | 💡 | P3 | `caduceus-ui` |
@@ -65,22 +65,22 @@
 | 28 | Model registry (bundled + refresh) | Bundled model catalog with runtime refresh from provider APIs | Claurst | ✅ | P0 | `caduceus-providers` |
 | 29 | Provider capability detection | Introspect provider support for vision, tools, streaming, thinking | Claurst | ✅ | P0 | `caduceus-providers` |
 | 30 | Slash command registry | Extensible registry of `/commands` with argument parsing | Claw, Claurst | ✅ | P0 | `caduceus-orchestrator` |
-| 31 | Configuration layering | Merge config from CLI flags → env vars → project → global defaults | Claurst | 🔧 | P0 | `caduceus-core` |
-| 32 | Retry logic (exponential backoff) | Automatic retries with jitter for transient API failures | Claurst, Multi-Agent | 📋 | P0 | `caduceus-providers` |
-| 33 | Cancellation token | Cooperative cancellation of in-flight LLM calls and tool executions | Claurst, Multi-Agent | 📋 | P0 | `caduceus-orchestrator` |
-| 34 | Effort levels (Min → Max) | Adjustable reasoning depth that tunes system prompt and model params | Claurst | 📋 | P1 | `caduceus-orchestrator` |
-| 35 | Query configuration | Per-query overrides for model, temperature, max_tokens | Claurst | 📋 | P1 | `caduceus-orchestrator` |
-| 36 | Parallel tool execution | Execute independent tool calls concurrently with join semantics | Claurst, Multi-Agent | 📋 | P1 | `caduceus-tools` |
-| 37 | Tool round limiting | Cap the number of tool-use rounds per turn to prevent runaway loops | Claurst | 📋 | P1 | `caduceus-orchestrator` |
-| 38 | Max turns limit | Hard limit on total conversation turns for automated runs | Claurst, Multi-Agent | 📋 | P1 | `caduceus-orchestrator` |
-| 39 | Extended thinking (`--thinking`) | Enable chain-of-thought / thinking mode for supported models | Claurst | 📋 | P1 | `caduceus-orchestrator` |
-| 40 | Structured output validation + retry | Validate LLM JSON output against schema; retry on failure | Multi-Agent | 📋 | P1 | `caduceus-orchestrator` |
-| 41 | Loop detection (fingerprint-based) | Detect repetitive tool-call patterns and break agentic loops | Multi-Agent | 📋 | P1 | `caduceus-orchestrator` |
-| 42 | Hook system (~27 lifecycle events) | Pre/post hooks for tool calls, turns, sessions, errors | Claurst | 📋 | P1 | `caduceus-permissions` |
-| 43 | Budget USD limit | Hard-stop when cumulative session cost exceeds a user-set dollar cap | Claurst | 📋 | P1 | `caduceus-telemetry` |
-| 44 | Permission modes | Switchable modes: default (ask), plan (read-only), bypass (trusted) | Claurst | 🔧 | P1 | `caduceus-permissions` |
-| 45 | Provider connection (`/connect`) | Interactive flow to add API keys for new providers | Claurst | 📋 | P1 | `caduceus-providers` |
-| 46 | MCP client (tool discovery) | Discover and invoke tools from external MCP servers | Claurst | 📋 | P1 | `caduceus-mcp` |
+| 31 | Configuration layering | Merge config from CLI flags → env vars → project → global defaults | Claurst | ✅ | P0 | `caduceus-core` |
+| 32 | Retry logic (exponential backoff) | Automatic retries with jitter for transient API failures | Claurst, Multi-Agent | ✅ | P0 | `caduceus-providers` |
+| 33 | Cancellation token | Cooperative cancellation of in-flight LLM calls and tool executions | Claurst, Multi-Agent | ✅ | P0 | `caduceus-orchestrator` |
+| 34 | Effort levels (Min → Max) | Adjustable reasoning depth that tunes system prompt and model params | Claurst | ✅ | P1 | `caduceus-orchestrator` |
+| 35 | Query configuration | Per-query overrides for model, temperature, max_tokens | Claurst | ✅ | P1 | `caduceus-orchestrator` |
+| 36 | Parallel tool execution | Execute independent tool calls concurrently with join semantics | Claurst, Multi-Agent | ✅ | P1 | `caduceus-tools` |
+| 37 | Tool round limiting | Cap the number of tool-use rounds per turn to prevent runaway loops | Claurst | ✅ | P1 | `caduceus-orchestrator` |
+| 38 | Max turns limit | Hard limit on total conversation turns for automated runs | Claurst, Multi-Agent | ✅ | P1 | `caduceus-orchestrator` |
+| 39 | Extended thinking (`--thinking`) | Enable chain-of-thought / thinking mode for supported models | Claurst | ✅ | P1 | `caduceus-orchestrator` |
+| 40 | Structured output validation + retry | Validate LLM JSON output against schema; retry on failure | Multi-Agent | ✅ | P1 | `caduceus-orchestrator` |
+| 41 | Loop detection (fingerprint-based) | Detect repetitive tool-call patterns and break agentic loops | Multi-Agent | ✅ | P1 | `caduceus-orchestrator` |
+| 42 | Hook system (~27 lifecycle events) | Pre/post hooks for tool calls, turns, sessions, errors | Claurst | ✅ | P1 | `caduceus-permissions` |
+| 43 | Budget USD limit | Hard-stop when cumulative session cost exceeds a user-set dollar cap | Claurst | ✅ | P1 | `caduceus-telemetry` |
+| 44 | Permission modes | Switchable modes: default (ask), plan (read-only), bypass (trusted) | Claurst | ✅ | P1 | `caduceus-permissions` |
+| 45 | Provider connection (`/connect`) | Interactive flow to add API keys for new providers | Claurst | ✅ | P1 | `caduceus-providers` |
+| 46 | MCP client (tool discovery) | Discover and invoke tools from external MCP servers | Claurst | ✅ | P1 | `caduceus-mcp` |
 | 47 | Model whitelisting / blacklisting | Admin-configurable allow/deny lists for model selection | Claurst | 📋 | P2 | `caduceus-providers` |
 | 48 | Tool choice control | Force or suppress specific tool use via API tool_choice param | Claurst | 📋 | P2 | `caduceus-orchestrator` |
 | 49 | Response format (JSON mode) | Request structured JSON responses from the model | Claurst | 📋 | P2 | `caduceus-orchestrator` |
@@ -97,8 +97,8 @@
 | 141 | Summary compression (line/char budgets) | Second-pass compression of compaction summaries to configurable line/character budgets | Claw | 📋 | P1 | `caduceus-orchestrator` |
 | 142 | Plugin install/enable/disable commands | `/plugins list/install/enable/disable/uninstall/update` with runtime reload detection | Claw | 📋 | P2 | `caduceus-plugin` |
 | 143 | Hook lifecycle from plugins | Enabled plugins contribute hook commands to shared hook phases; plugin hooks can deny/fail tool chains | Claw | 📋 | P2 | `caduceus-permissions` |
-| 144 | Plan & Act modes | Plan mode: agent analyzes but makes NO file modifications; Act mode: executes planned changes step-by-step | Cline | 📋 | P0 | `caduceus-orchestrator` |
-| 145 | Automations (trigger-based agents) | Always-on agents triggered by: GitHub PR, push, cron, Slack, PagerDuty, webhook; run in cloud VMs | Cursor | 📋 | P1 | `caduceus-orchestrator` |
+| 144 | Plan & Act modes | Plan mode: agent analyzes but makes NO file modifications; Act mode: executes planned changes step-by-step | Cline | ✅ | P0 | `caduceus-orchestrator` |
+| 145 | Automations (trigger-based agents) | Always-on agents triggered by: GitHub PR, push, cron, Slack, PagerDuty, webhook; run in cloud VMs | Cursor | ✅ | P1 | `caduceus-orchestrator` |
 | 146 | AI task decomposition | Sidebar chat decomposes user description into linked task cards with dependencies | Kanban | 📋 | P2 | `caduceus-orchestrator` |
 
 ### 1.3 Workers Layer (33 features)
@@ -115,10 +115,10 @@
 | 62 | File edit tool (substring replace) | Surgical search-and-replace edits within files | Claw, Claurst | ✅ | P0 | `caduceus-tools` |
 | 63 | Glob search tool | Find files by glob pattern | Claw, Claurst | ✅ | P0 | `caduceus-tools` |
 | 64 | Grep / regex search tool | Search file contents with regex patterns | Claw, Claurst | ✅ | P0 | `caduceus-tools` |
-| 65 | Azure OpenAI adapter | Azure-hosted OpenAI models with AAD auth and deployment routing | Claurst | 📋 | P1 | `caduceus-providers` |
-| 66 | Google Gemini adapter | Native Gemini API integration with streaming and function calling | Claurst | 📋 | P1 | `caduceus-providers` |
-| 67 | Web fetch tool | Retrieve and extract content from URLs | Claw | 📋 | P1 | `caduceus-tools` |
-| 68 | Apply-patch tool | Apply unified diff patches to files | Claw | 📋 | P1 | `caduceus-tools` |
+| 65 | Azure OpenAI adapter | Azure-hosted OpenAI models with AAD auth and deployment routing | Claurst | ✅ | P1 | `caduceus-providers` |
+| 66 | Google Gemini adapter | Native Gemini API integration with streaming and function calling | Claurst | ✅ | P1 | `caduceus-providers` |
+| 67 | Web fetch tool | Retrieve and extract content from URLs | Claw | ✅ | P1 | `caduceus-tools` |
+| 68 | Apply-patch tool | Apply unified diff patches to files | Claw | ✅ | P1 | `caduceus-tools` |
 | 69 | Vertex AI adapter | Google Cloud Vertex AI with service account auth | Claurst | 📋 | P2 | `caduceus-providers` |
 | 70 | AWS Bedrock adapter | Amazon Bedrock API with SigV4 auth | Claurst | 📋 | P2 | `caduceus-providers` |
 | 71 | LSP bridge tool | Language Server Protocol client for goto-def, references, diagnostics | Claurst, Hermes | 📋 | P2 | `caduceus-codeintel` |
@@ -135,7 +135,7 @@
 | 153 | Agent / subagent tool | Launch specialized background sub-agents with configurable type, model, and lifecycle events | Claw | 📋 | P1 | `caduceus-tools` |
 | 154 | Plugin-defined tools | External plugin tools: receive input on stdin, return result on stdout, with env var metadata | Claw | 📋 | P2 | `caduceus-plugin` |
 | 155 | PDF extraction helper | Lightweight text extraction from PDF files — inflate zlib streams, extract BT/ET text operators | Claw | 📋 | P2 | `caduceus-tools` |
-| 156 | Browser automation tool | Headless Chromium control: launch, click, type, scroll, screenshot, read console logs for runtime testing | Cline | 📋 | P1 | `caduceus-tools` |
+| 156 | Browser automation tool | Headless Chromium control: launch, click, type, scroll, screenshot, read console logs for runtime testing | Cline | ✅ | P1 | `caduceus-tools` |
 | 157 | Self-verification (agent QA) | Agent tests its own code, runs apps, captures logs/screenshots; attaches artifacts to session/PR | Cursor | 📋 | P1 | `caduceus-tools` |
 | 158 | Notification routing | Route agent notifications to desktop, Slack, webhook, or clawhip-style channels based on severity | Claw | 📋 | P2 | `caduceus-tools` |
 
@@ -151,12 +151,12 @@
 | 81 | SQLite persistence (WAL) | WAL-mode SQLite with migrations for all structured data | Hermes | ✅ | P0 | `caduceus-storage` |
 | 82 | Session storage (CRUD) | Full lifecycle management for conversation sessions | Claurst, Claw | ✅ | P0 | `caduceus-storage` |
 | 83 | Auth store (keychain) | Secure credential storage via OS keychain integration | Claurst | ✅ | P0 | `caduceus-permissions` |
-| 84 | Directory conventions (`~/.caduceus/`) | Standardized paths for config, data, cache, logs | Claurst | 🔧 | P0 | `caduceus-core` |
-| 85 | File watching | Watch workspace files for changes and trigger reindex | Hermes, E2B | 📋 | P1 | `caduceus-runtime` |
-| 86 | JSONL transcript export | Export full conversation transcripts as JSONL for auditing | Claurst | 📋 | P1 | `caduceus-storage` |
-| 87 | Session resumption | Resume conversations from persisted state with context reload | Claurst, Claw | 📋 | P1 | `caduceus-storage` |
-| 88 | E2B sandbox lifecycle | Create, connect, pause, resume, and kill cloud sandboxes | E2B | 📋 | P1 | `caduceus-runtime` |
-| 89 | Crash recovery / session restore | Recover in-flight sessions after unexpected process termination | Hermes | 📋 | P1 | `caduceus-storage` |
+| 84 | Directory conventions (`~/.caduceus/`) | Standardized paths for config, data, cache, logs | Claurst | ✅ | P0 | `caduceus-core` |
+| 85 | File watching | Watch workspace files for changes and trigger reindex | Hermes, E2B | ✅ | P1 | `caduceus-runtime` |
+| 86 | JSONL transcript export | Export full conversation transcripts as JSONL for auditing | Claurst | ✅ | P1 | `caduceus-storage` |
+| 87 | Session resumption | Resume conversations from persisted state with context reload | Claurst, Claw | ✅ | P1 | `caduceus-storage` |
+| 88 | E2B sandbox lifecycle | Create, connect, pause, resume, and kill cloud sandboxes | E2B | ✅ | P1 | `caduceus-runtime` |
+| 89 | Crash recovery / session restore | Recover in-flight sessions after unexpected process termination | Hermes | ✅ | P1 | `caduceus-storage` |
 | 90 | E2B template management | Create, list, and instantiate sandbox templates | E2B | 📋 | P2 | `caduceus-runtime` |
 | 91 | E2B volume management | Attach, detach, and manage persistent storage volumes | E2B | 📋 | P2 | `caduceus-runtime` |
 | 92 | E2B network controls | Port access rules, CIDR allowlists, DNS configuration | E2B | 📋 | P2 | `caduceus-runtime` |
@@ -165,7 +165,7 @@
 | 95 | E2B snapshot / restore | Capture and restore full sandbox state | E2B | 💡 | P3 | `caduceus-runtime` |
 | 159 | Bash validation pipeline | Multi-stage command validation: readOnly checks, destructive warnings, sed safety, path heuristics, semantic classification | Claw | 📋 | P1 | `caduceus-runtime` |
 | 160 | Container-first sandbox (Linux namespaces) | Namespace-based process isolation with filesystem modes (off/workspace-only/allow-list) and network isolation | Claw | 📋 | P1 | `caduceus-runtime` |
-| 161 | Checkpointing system (git shadow commits) | Snapshot project state at each tool call via git shadow commits; compare/restore to any checkpoint | Cline | 📋 | P0 | `caduceus-git` |
+| 161 | Checkpointing system (git shadow commits) | Snapshot project state at each tool call via git shadow commits; compare/restore to any checkpoint | Cline | ✅ | P0 | `caduceus-git` |
 | 162 | .caduceusignore file | Glob-based file exclusion — files the agent should never read or modify (like .gitignore syntax) | Cline | 📋 | P1 | `caduceus-runtime` |
 | 163 | Auto-commit / auto-PR per task | Enable per-task auto-commit on completion or auto-PR branch creation; skip review for trusted workflows | Kanban | 📋 | P2 | `caduceus-git` |
 
@@ -187,15 +187,15 @@
 | 107 | Incremental reindex | Reindex only files/ranges that changed since last index | TS/Q/Zed | ✅ | P0 | `caduceus-omniscience` |
 | 108 | Payload indexes / metadata filters | Filter search results by language, file path, symbol type | TS/Q/Zed | ✅ | P0 | `caduceus-omniscience` |
 | 109 | Project context (languages/frameworks) | Detect languages, frameworks, and build systems in workspace | Hermes | ✅ | P0 | `caduceus-scanner` |
-| 110 | Cache control / prompt caching | Leverage provider-side prompt caching for repeated prefixes | Claurst | 📋 | P1 | `caduceus-providers` |
+| 110 | Cache control / prompt caching | Leverage provider-side prompt caching for repeated prefixes | Claurst | ✅ | P1 | `caduceus-providers` |
 | 111 | Parser-error-aware down-ranking | Reduce relevance score for chunks containing parse errors | TS/Q/Zed | 📋 | P1 | `caduceus-omniscience` |
-| 112 | Token warning levels | Progressive warnings at 70%, 85%, 95% context utilization | Claurst | 📋 | P1 | `caduceus-orchestrator` |
+| 112 | Token warning levels | Progressive warnings at 70%, 85%, 95% context utilization | Claurst | ✅ | P1 | `caduceus-orchestrator` |
 | 113 | Context assembly / attunement | Intelligent selection and ordering of context for each prompt | Claurst | 🔧 | P1 | `caduceus-orchestrator` |
-| 114 | Memory store (project/session) | Persistent key-value memory across sessions and projects | Claurst | 📋 | P1 | `caduceus-storage` |
+| 114 | Memory store (project/session) | Persistent key-value memory across sessions and projects | Claurst | ✅ | P1 | `caduceus-storage` |
 | 115 | Embedding model selection | Configurable embedding models for vector indexing | TS/Q/Zed | 📋 | P2 | `caduceus-omniscience` |
 | 116 | Durable session tracer | OpenTelemetry-compatible trace export for session analytics | Claurst | 📋 | P2 | `caduceus-telemetry` |
 | 117 | Cross-project index federation | Search across multiple project indexes simultaneously | TS/Q/Zed | 💡 | P3 | `caduceus-omniscience` |
-| 164 | @Mentions system | `@file`, `@folder`, `@url`, `@problems`, `@git` — parse @ tokens in user input, resolve to context chunks, inject into prompt | Cline | 📋 | P1 | `caduceus-orchestrator` |
+| 164 | @Mentions system | `@file`, `@folder`, `@url`, `@problems`, `@git` — parse @ tokens in user input, resolve to context chunks, inject into prompt | Cline | ✅ | P1 | `caduceus-orchestrator` |
 | 165 | Memory Bank (structured persistent context) | Structured memory files: projectBrief.md, activeContext.md, progress.md — auto-updated by agent, loaded at session start | Cline | 📋 | P1 | `caduceus-storage` |
 | 166 | Notification routing (context-aware) | Route notifications based on severity/type to desktop, terminal, webhook, or external channels | Claw | 📋 | P2 | `caduceus-orchestrator` |
 
@@ -219,12 +219,12 @@
 | 131 | Collaboration sync (deferred-op replay) | Replay buffered operations for eventual consistency across peers | TS/Q/Zed | 💡 | P3 | `caduceus-sync` |
 | 132 | Remote selections / AI cursors | Display remote collaborator and AI agent cursor positions | TS/Q/Zed | 💡 | P3 | `caduceus-presence` |
 | 167 | Agents Window (multi-tab parallel agents) | Multiple independent agents in parallel tabs; monitor, approve, or cancel each independently | Cursor | 📋 | P1 | `caduceus-app` |
-| 168 | Background / Cloud agents | Agents persist when editor closes; hand off local → cloud and back; long-running tasks produce PRs | Cursor | 📋 | P1 | `caduceus-orchestrator` |
-| 169 | BugBot (automated PR review) | Automatically review every PR for bugs, security issues, style; multi-pass agentic architecture with fix suggestions | Cursor | 📋 | P2 | `caduceus-tools` |
+| 168 | Background / Cloud agents | Agents persist when editor closes; hand off local → cloud and back; long-running tasks produce PRs | Cursor | ✅ | P1 | `caduceus-orchestrator` |
+| 169 | BugBot (automated PR review) | Automatically review every PR for bugs, security issues, style; multi-pass agentic architecture with fix suggestions | Cursor | ✅ | P2 | `caduceus-tools` |
 | 170 | Design Mode (visual annotations) | Annotate UI elements in browser view; agent makes code changes based on visual annotations | Cursor | 💡 | P3 | `caduceus-app` |
 | 171 | Multi-repo workspace | Open and manage several repositories in unified interface; agents execute changes across repos | Cursor | 📋 | P2 | `caduceus-orchestrator` |
-| 172 | Kanban board for agent orchestration | Visual board with drag-and-drop columns (Backlog → In Progress → Review → Done) for parallel agent tasks | Kanban | 📋 | P1 | `caduceus-app` |
-| 173 | Dependency chain automation | Link task cards with ⌘+click; auto-start downstream tasks when upstream completes; DAG-based execution | Kanban | 📋 | P1 | `caduceus-orchestrator` |
+| 172 | Kanban board for agent orchestration | Visual board with drag-and-drop columns (Backlog → In Progress → Review → Done) for parallel agent tasks | Kanban | ✅ | P1 | `caduceus-app` |
+| 173 | Dependency chain automation | Link task cards with ⌘+click; auto-start downstream tasks when upstream completes; DAG-based execution | Kanban | ✅ | P1 | `caduceus-orchestrator` |
 | 174 | Per-card terminal with live status | Each kanban card shows mini-terminal preview with agent status, latest message, token usage; expandable to full view | Kanban | 📋 | P2 | `caduceus-app` |
 | 175 | Inline diff review with comments | Click kanban card to see worktree diff; click lines to leave comments that feed back into agent's next prompt | Kanban | 📋 | P2 | `caduceus-app` |
 
@@ -463,24 +463,24 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 
 > *Harden the core, add headless mode, expand provider coverage, add safety features.*
 
-- 📋 Retry logic with exponential backoff and jitter
-- 📋 Cancellation token for cooperative abort
-- 📋 Loop detection (fingerprint-based)
-- 📋 Structured output validation + retry
-- 📋 Session resumption and crash recovery
-- 📋 Headless mode (`--print`) and output formats (incl. compact)
+- ✅ Retry logic with exponential backoff and jitter
+- ✅ Cancellation token for cooperative abort
+- ✅ Loop detection (fingerprint-based)
+- ✅ Structured output validation + retry
+- ✅ Session resumption and crash recovery
+- ✅ Headless mode (`--print`) and output formats (incl. compact)
 - 📋 Interactive REPL mode with history and multiline
-- 📋 Azure OpenAI and Google Gemini adapters
-- 📋 Web fetch and apply-patch tools
-- 📋 Hook system (~27 lifecycle events)
-- 📋 JSONL transcript export
-- 📋 Configuration layering (CLI → env → project → global)
-- 📋 File watching with incremental reindex triggers
-- 📋 E2B sandbox lifecycle (create, connect, kill)
-- 📋 Budget USD limit enforcement
-- 📋 MCP client for external tool discovery
-- 📋 Plan & Act modes (agent safety)
-- 📋 Checkpointing system (git shadow commits)
+- ✅ Azure OpenAI and Google Gemini adapters
+- ✅ Web fetch and apply-patch tools
+- ✅ Hook system (~27 lifecycle events)
+- ✅ JSONL transcript export
+- ✅ Configuration layering (CLI → env → project → global)
+- ✅ File watching with incremental reindex triggers
+- ✅ E2B sandbox lifecycle (create, connect, kill)
+- ✅ Budget USD limit enforcement
+- ✅ MCP client for external tool discovery
+- ✅ Plan & Act modes (agent safety)
+- ✅ Checkpointing system (git shadow commits)
 - 📋 Bash validation pipeline (readOnly, destructive, path)
 - 📋 .caduceusignore file exclusion
 - 📋 Stale-base preflight / git freshness checks
@@ -491,22 +491,23 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 
 > *Full TUI, plugin system, multi-agent groundwork, new tools.*
 
-- 📋 Syntax highlighting, diff viewer, status line
-- 📋 Model picker and session browser
-- 📋 Extended thinking mode
-- 📋 Effort levels (Min → Max)
-- 📋 Parallel tool execution
+- 📋 Syntax highlighting, status line
+- ✅ Diff viewer
+- ✅ Model picker and session browser
+- ✅ Extended thinking mode
+- ✅ Effort levels (Min → Max)
+- ✅ Parallel tool execution
 - 📋 Agent personas (build / plan / explore)
 - 📋 E2B template and volume management
 - 📋 Plugin system with TOML/JSON manifest
 - 📋 Plugin install/enable/disable commands
 - 📋 Context assembly / attunement
-- 📋 Memory store (project / session scoped)
-- 📋 Prompt caching (provider-side)
+- ✅ Memory store (project / session scoped)
+- ✅ Prompt caching (provider-side)
 - 📋 Worktree isolation for parallel branches
 - 📋 WebSearch, TodoWrite, REPL, Agent/subagent tools
-- 📋 @Mentions system (@file, @folder, @url)
-- 📋 Browser automation tool
+- ✅ @Mentions system (@file, @folder, @url)
+- ✅ Browser automation tool
 - 📋 Self-verification (agent QA)
 - 📋 /config, /init, /model, /export slash commands
 - 📋 Memory Bank (structured persistent context)
@@ -517,22 +518,23 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 
 > *Desktop app, all providers, complete toolset, plugin ecosystem, multi-agent UI.*
 
-- 📋 Tauri desktop shell with IPC
+- ✅ Tauri desktop shell with IPC
 - 📋 All 6 provider adapters (Anthropic, OpenAI, Azure, Gemini, Vertex, Bedrock)
 - 📋 Full tool suite including LSP bridge, notebook cells, PowerShell, Sleep, StructuredOutput
 - 📋 Plugin commands, agents, and skills
 - 📋 Plugin-defined tools with external command execution
 - 📋 Feature flags and model whitelisting
-- 📋 Theme picker and keybinding configurator
+- 📋 Theme picker
+- ✅ Keybinding configurator
 - 📋 E2B network controls and snapshot/restore
 - 📋 Task DAG execution and team auto-orchestration
 - 📋 Durable session tracer (OpenTelemetry)
 - 📋 Agents Window (multi-tab parallel agents)
-- 📋 Background / cloud agents
-- 📋 Kanban board for agent orchestration
-- 📋 Dependency chain automation
-- 📋 Automations (trigger-based agents)
-- 📋 BugBot (automated PR review)
+- ✅ Background / cloud agents
+- ✅ Kanban board for agent orchestration
+- ✅ Dependency chain automation
+- ✅ Automations (trigger-based agents)
+- ✅ BugBot (automated PR review)
 - 📋 Container-first sandbox (Linux namespaces)
 - 📋 PDF extraction helper
 - 📋 Notification routing
