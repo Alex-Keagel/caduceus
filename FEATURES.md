@@ -689,6 +689,18 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 | 233 | Vector space visualizer | 2D/3D scatter plot of code embeddings with cluster labels and query-relevance highlighting | AI-Viz | ✅ | P1 | `caduceus-omniscience` |
 | 234 | Agent execution tree viz | React Flow / Mermaid flowchart of agent reasoning branches with status colors | AI-Viz | ✅ | P1 | `caduceus-orchestrator` |
 | 235 | AST overlay data model | Editor decoration data for highlighting focused/modified/referenced code regions | AI-Viz | ✅ | P1 | `caduceus-omniscience` |
+| 236 | PRD parser | Parse Product Requirements Documents into structured task hierarchies with dependencies and estimates | Agentic-Tools | 📋 | P2 | `caduceus-orchestrator` |
+| 237 | Smart task recommender | AI-powered next-task suggestions based on dependencies, priority, complexity, and agent capacity | Agentic-Tools | 📋 | P2 | `caduceus-orchestrator` |
+| 238 | Research-guided tasks | Agent performs web research, caches findings in memory, generates targeted search queries | Agentic-Tools | 📋 | P2 | `caduceus-tools` |
+| 239 | Unlimited task hierarchy | Tasks → subtasks → sub-subtasks with infinite nesting, parent-child relationships, level tracking | Agentic-Tools | 📋 | P1 | `caduceus-orchestrator` |
+| 240 | Time tracking & estimation | Estimated vs actual hours per task, complexity scoring (1-10), velocity calculation | Agentic-Tools | 📋 | P2 | `caduceus-orchestrator` |
+| 241 | Agent persistent memory | Categorized memories with relevance-scored search (title 60%, content 30%, category 20%) | Agentic-Tools | 📋 | P1 | `caduceus-storage` |
+| 242 | Azure MCP integration | Connect to 40+ Azure services via MCP (Blob, CosmosDB, K8s, App Config, DevOps) | Azure-MCP | 📋 | P2 | `caduceus-mcp` |
+| 243 | Cloud resource management | Natural language CRUD for cloud infrastructure through agent conversation | Azure-MCP | 📋 | P2 | `caduceus-tools` |
+| 244 | MCP registry browser | Browse, install, and govern MCP servers from GitHub MCP Registry (13K+ servers) | GitHub-MCP | 📋 | P2 | `caduceus-marketplace` |
+| 245 | SRE agent mode | Automated incident detection, diagnosis, and remediation for cloud infrastructure | Azure-MCP | 📋 | P3 | `caduceus-orchestrator` |
+| 246 | Progress inference | AI infers task completion percentage from code changes, test results, and commit history | Agentic-Tools | 📋 | P2 | `caduceus-orchestrator` |
+| 247 | Git-trackable task data | Task/project data stored as JSON files alongside code for version control | Agentic-Tools | 📋 | P2 | `caduceus-storage` |
 
 ---
 
