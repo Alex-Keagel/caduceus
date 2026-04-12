@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
 
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
 const BOOTSTRAP_SCHEMA_VERSION: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -120,6 +120,16 @@ const MIGRATIONS: [&str; CURRENT_SCHEMA_VERSION as usize] = [
         timestamp TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_session_trace_session_id ON session_trace(session_id, id);
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS telemetry_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        snapshot_type TEXT NOT NULL,
+        data TEXT NOT NULL,
+        timestamp TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_telemetry_session ON telemetry_snapshots(session_id);
     "#,
 ];
 
@@ -600,6 +610,69 @@ impl SqliteStorage {
                 )
                 .map_err(storage_error)?;
             Ok(total)
+        })
+    }
+
+    /// Persist a telemetry snapshot (context health, attention, degradation stage, etc.)
+    pub async fn save_telemetry_snapshot(
+        &self,
+        session_id: &SessionId,
+        snapshot_type: &str,
+        data: &serde_json::Value,
+    ) -> Result<()> {
+        let sid = session_id.to_string();
+        let stype = snapshot_type.to_string();
+        let json =
+            serde_json::to_string(data).map_err(|e| CaduceusError::Storage(e.to_string()))?;
+        let ts = Utc::now().to_rfc3339();
+        self.with_connection(move |conn| {
+            conn.execute(
+                "INSERT INTO telemetry_snapshots (session_id, snapshot_type, data, timestamp)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![sid, stype, json, ts],
+            )
+            .map_err(storage_error)?;
+            Ok(())
+        })
+    }
+
+    /// Load telemetry snapshots for a session, optionally filtered by type
+    pub async fn load_telemetry_snapshots(
+        &self,
+        session_id: &SessionId,
+        snapshot_type: Option<&str>,
+    ) -> Result<Vec<(String, serde_json::Value, String)>> {
+        let sid = session_id.to_string();
+        let stype = snapshot_type.map(|s| s.to_string());
+        self.with_connection(move |conn| {
+            let (query, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) =
+                if let Some(ref st) = stype {
+                    (
+                        "SELECT snapshot_type, data, timestamp FROM telemetry_snapshots
+                     WHERE session_id = ?1 AND snapshot_type = ?2 ORDER BY id",
+                        vec![Box::new(sid.clone()), Box::new(st.clone())],
+                    )
+                } else {
+                    (
+                        "SELECT snapshot_type, data, timestamp FROM telemetry_snapshots
+                     WHERE session_id = ?1 ORDER BY id",
+                        vec![Box::new(sid.clone())],
+                    )
+                };
+            let mut stmt = conn.prepare(query).map_err(storage_error)?;
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params_vec.iter().map(|b| b.as_ref()).collect();
+            let mut rows = stmt.query(params_refs.as_slice()).map_err(storage_error)?;
+            let mut results = Vec::new();
+            while let Some(row) = rows.next().map_err(storage_error)? {
+                let stype: String = row.get(0).map_err(storage_error)?;
+                let data_str: String = row.get(1).map_err(storage_error)?;
+                let ts: String = row.get(2).map_err(storage_error)?;
+                let data: serde_json::Value =
+                    serde_json::from_str(&data_str).unwrap_or(serde_json::Value::String(data_str));
+                results.push((stype, data, ts));
+            }
+            Ok(results)
         })
     }
 
