@@ -337,3 +337,370 @@ mod tests {
         assert_ne!(report.risk_level, "clean");
     }
 }
+
+// ── #242: Azure MCP Integration ───────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct AzureMcpConfig {
+    pub tenant_id: String,
+    pub subscription_id: String,
+    pub services: Vec<String>,
+}
+
+pub struct AzureMcpTools;
+
+impl AzureMcpTools {
+    /// All supported Azure services as `(name, description)` pairs (40+).
+    pub fn supported_services() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "blob-storage",
+                "Azure Blob Storage – scalable object storage",
+            ),
+            (
+                "cosmos-db",
+                "Azure Cosmos DB – globally distributed NoSQL database",
+            ),
+            (
+                "key-vault",
+                "Azure Key Vault – secrets, keys, and certificate management",
+            ),
+            (
+                "app-service",
+                "Azure App Service – web application hosting platform",
+            ),
+            (
+                "aks",
+                "Azure Kubernetes Service – managed Kubernetes clusters",
+            ),
+            (
+                "functions",
+                "Azure Functions – event-driven serverless compute",
+            ),
+            ("sql-db", "Azure SQL Database – managed relational database"),
+            (
+                "event-hub",
+                "Azure Event Hubs – big-data streaming platform",
+            ),
+            (
+                "service-bus",
+                "Azure Service Bus – enterprise message broker",
+            ),
+            (
+                "app-config",
+                "Azure App Configuration – centralised app settings",
+            ),
+            (
+                "container-registry",
+                "Azure Container Registry – managed OCI image store",
+            ),
+            (
+                "virtual-network",
+                "Azure Virtual Network – isolated cloud network",
+            ),
+            (
+                "load-balancer",
+                "Azure Load Balancer – distribute inbound traffic",
+            ),
+            (
+                "api-management",
+                "Azure API Management – hybrid multi-cloud API gateway",
+            ),
+            (
+                "cognitive-services",
+                "Azure Cognitive Services – AI and ML APIs",
+            ),
+            ("monitor", "Azure Monitor – full-stack observability"),
+            (
+                "log-analytics",
+                "Azure Log Analytics – log data analysis workspace",
+            ),
+            (
+                "active-directory",
+                "Azure Active Directory – identity and access management",
+            ),
+            (
+                "redis-cache",
+                "Azure Cache for Redis – managed in-memory cache",
+            ),
+            ("cdn", "Azure CDN – global content delivery network"),
+            (
+                "front-door",
+                "Azure Front Door – global load balancer and WAF",
+            ),
+            (
+                "signalr",
+                "Azure SignalR Service – managed real-time messaging",
+            ),
+            (
+                "notification-hubs",
+                "Azure Notification Hubs – push notification service",
+            ),
+            (
+                "event-grid",
+                "Azure Event Grid – fully managed event routing",
+            ),
+            (
+                "data-factory",
+                "Azure Data Factory – cloud-scale data integration",
+            ),
+            (
+                "synapse-analytics",
+                "Azure Synapse Analytics – unified analytics platform",
+            ),
+            (
+                "databricks",
+                "Azure Databricks – Apache Spark analytics platform",
+            ),
+            (
+                "machine-learning",
+                "Azure Machine Learning – end-to-end ML platform",
+            ),
+            (
+                "search",
+                "Azure AI Search – AI-powered cloud search service",
+            ),
+            (
+                "storage-tables",
+                "Azure Table Storage – NoSQL key-value store",
+            ),
+            (
+                "storage-queues",
+                "Azure Queue Storage – reliable message queue",
+            ),
+            (
+                "batch",
+                "Azure Batch – large-scale parallel and HPC compute",
+            ),
+            (
+                "container-instances",
+                "Azure Container Instances – serverless containers",
+            ),
+            (
+                "logic-apps",
+                "Azure Logic Apps – low-code workflow automation",
+            ),
+            ("devops", "Azure DevOps – developer collaboration and CI/CD"),
+            (
+                "static-web-apps",
+                "Azure Static Web Apps – static site hosting with APIs",
+            ),
+            (
+                "spring-apps",
+                "Azure Spring Apps – managed Spring Boot microservices",
+            ),
+            (
+                "managed-identity",
+                "Azure Managed Identity – Azure AD identity for services",
+            ),
+            (
+                "private-link",
+                "Azure Private Link – private connectivity to PaaS",
+            ),
+            (
+                "policy",
+                "Azure Policy – governance and compliance enforcement",
+            ),
+            ("firewall", "Azure Firewall – intelligent network security"),
+            (
+                "ddos-protection",
+                "Azure DDoS Protection – DDoS attack mitigation",
+            ),
+        ]
+    }
+
+    /// Build MCP tool definitions (list + get) for the requested services.
+    /// If `services` is empty all supported services are included.
+    pub fn build_tool_definitions(services: &[String]) -> Vec<serde_json::Value> {
+        let all = Self::supported_services();
+        let filter: std::collections::HashSet<&str> = services.iter().map(String::as_str).collect();
+
+        all.iter()
+            .filter(|(svc, _)| filter.is_empty() || filter.contains(svc))
+            .flat_map(|(svc, desc)| {
+                let svc_name = svc.replace('-', "_");
+                let desc_str = desc.to_string();
+                [
+                    serde_json::json!({
+                        "name": format!("azure_{svc_name}_list"),
+                        "description": format!("List {svc} resources. {desc_str}"),
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "subscription_id": { "type": "string" },
+                                "resource_group": { "type": "string" }
+                            }
+                        }
+                    }),
+                    serde_json::json!({
+                        "name": format!("azure_{svc_name}_get"),
+                        "description": format!("Get a {svc} resource by ID. {desc_str}"),
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "resource_id": { "type": "string" }
+                            },
+                            "required": ["resource_id"]
+                        }
+                    }),
+                ]
+            })
+            .collect()
+    }
+
+    /// Azure services grouped by functional category.
+    pub fn service_categories() -> Vec<(&'static str, Vec<&'static str>)> {
+        vec![
+            (
+                "Storage",
+                vec![
+                    "blob-storage",
+                    "storage-tables",
+                    "storage-queues",
+                    "cosmos-db",
+                    "redis-cache",
+                ],
+            ),
+            (
+                "Compute",
+                vec![
+                    "app-service",
+                    "aks",
+                    "functions",
+                    "container-instances",
+                    "batch",
+                    "spring-apps",
+                    "static-web-apps",
+                ],
+            ),
+            (
+                "Networking",
+                vec![
+                    "virtual-network",
+                    "load-balancer",
+                    "cdn",
+                    "front-door",
+                    "private-link",
+                    "api-management",
+                    "firewall",
+                    "ddos-protection",
+                ],
+            ),
+            (
+                "Security",
+                vec![
+                    "key-vault",
+                    "active-directory",
+                    "managed-identity",
+                    "policy",
+                ],
+            ),
+            (
+                "Messaging",
+                vec![
+                    "event-hub",
+                    "service-bus",
+                    "event-grid",
+                    "signalr",
+                    "notification-hubs",
+                ],
+            ),
+            (
+                "Data & Analytics",
+                vec![
+                    "sql-db",
+                    "synapse-analytics",
+                    "databricks",
+                    "data-factory",
+                    "search",
+                    "log-analytics",
+                ],
+            ),
+            ("AI & ML", vec!["cognitive-services", "machine-learning"]),
+            ("DevOps", vec!["container-registry", "devops", "logic-apps"]),
+            ("Monitoring", vec!["monitor", "app-config"]),
+        ]
+    }
+}
+
+// ── Tests for #242 ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod feature_tests_242 {
+    use super::*;
+
+    #[test]
+    fn azure_supported_services_count() {
+        let svcs = AzureMcpTools::supported_services();
+        assert!(
+            svcs.len() >= 30,
+            "expected ≥30 services, got {}",
+            svcs.len()
+        );
+    }
+
+    #[test]
+    fn azure_supported_services_contains_core() {
+        let svcs = AzureMcpTools::supported_services();
+        let names: Vec<&str> = svcs.iter().map(|(n, _)| *n).collect();
+        for required in &["blob-storage", "cosmos-db", "key-vault", "aks", "functions"] {
+            assert!(
+                names.contains(required),
+                "missing required service: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_build_tool_definitions_all() {
+        let defs = AzureMcpTools::build_tool_definitions(&[]);
+        // Two tools (list + get) per service
+        let expected = AzureMcpTools::supported_services().len() * 2;
+        assert_eq!(defs.len(), expected);
+    }
+
+    #[test]
+    fn azure_build_tool_definitions_filtered() {
+        let defs = AzureMcpTools::build_tool_definitions(&["blob-storage".to_string()]);
+        assert_eq!(defs.len(), 2);
+        let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"azure_blob_storage_list"));
+        assert!(names.contains(&"azure_blob_storage_get"));
+    }
+
+    #[test]
+    fn azure_tool_defs_have_required_fields() {
+        let defs = AzureMcpTools::build_tool_definitions(&["aks".to_string()]);
+        for def in &defs {
+            assert!(def["name"].is_string());
+            assert!(def["description"].is_string());
+            assert!(def["inputSchema"].is_object());
+        }
+    }
+
+    #[test]
+    fn azure_service_categories_cover_core_services() {
+        let cats = AzureMcpTools::service_categories();
+        let all_in_cats: Vec<&str> = cats
+            .iter()
+            .flat_map(|(_, svcs)| svcs.iter().copied())
+            .collect();
+        for svc in &["blob-storage", "aks", "key-vault", "monitor"] {
+            assert!(
+                all_in_cats.contains(svc),
+                "service {svc} not in any category"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_mcp_config_fields() {
+        let cfg = AzureMcpConfig {
+            tenant_id: "tid".to_string(),
+            subscription_id: "sid".to_string(),
+            services: vec!["blob-storage".to_string()],
+        };
+        assert_eq!(cfg.tenant_id, "tid");
+        assert_eq!(cfg.services.len(), 1);
+    }
+}

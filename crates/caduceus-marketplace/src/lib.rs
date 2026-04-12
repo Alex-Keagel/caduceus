@@ -1501,3 +1501,182 @@ mod tests {
         }
     }
 }
+
+// ── #244: MCP Registry Browser ────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct McpRegistryEntry {
+    pub name: String,
+    pub description: String,
+    pub author: String,
+    pub downloads: u64,
+    pub version: String,
+    pub tags: Vec<String>,
+    pub verified: bool,
+}
+
+#[derive(Default)]
+pub struct McpRegistryBrowser {
+    servers: Vec<McpRegistryEntry>,
+}
+
+impl McpRegistryBrowser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_entry(&mut self, entry: McpRegistryEntry) {
+        self.servers.push(entry);
+    }
+
+    /// Case-insensitive search across name, description, and tags.
+    pub fn search(&self, query: &str) -> Vec<&McpRegistryEntry> {
+        let q = query.to_lowercase();
+        self.servers
+            .iter()
+            .filter(|e| {
+                e.name.to_lowercase().contains(&q)
+                    || e.description.to_lowercase().contains(&q)
+                    || e.tags.iter().any(|t| t.to_lowercase().contains(&q))
+            })
+            .collect()
+    }
+
+    /// Entries that contain `tag` (case-insensitive exact match) in their tags.
+    pub fn filter_by_tag(&self, tag: &str) -> Vec<&McpRegistryEntry> {
+        let t = tag.to_lowercase();
+        self.servers
+            .iter()
+            .filter(|e| e.tags.iter().any(|s| s.to_lowercase() == t))
+            .collect()
+    }
+
+    /// Top `n` entries sorted by download count (descending).
+    pub fn top_downloaded(&self, n: usize) -> Vec<&McpRegistryEntry> {
+        let mut sorted: Vec<&McpRegistryEntry> = self.servers.iter().collect();
+        sorted.sort_by(|a, b| b.downloads.cmp(&a.downloads));
+        sorted.into_iter().take(n).collect()
+    }
+
+    /// Only entries marked as verified.
+    pub fn verified_only(&self) -> Vec<&McpRegistryEntry> {
+        self.servers.iter().filter(|e| e.verified).collect()
+    }
+}
+
+// ── Tests for #244 ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod feature_tests_244 {
+    use super::*;
+
+    fn make_entry(
+        name: &str,
+        desc: &str,
+        downloads: u64,
+        tags: &[&str],
+        verified: bool,
+    ) -> McpRegistryEntry {
+        McpRegistryEntry {
+            name: name.to_string(),
+            description: desc.to_string(),
+            author: "author".to_string(),
+            downloads,
+            version: "1.0.0".to_string(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            verified,
+        }
+    }
+
+    #[test]
+    fn registry_add_and_search_name() {
+        let mut browser = McpRegistryBrowser::new();
+        browser.add_entry(make_entry("filesystem-mcp", "Reads files", 100, &[], true));
+        browser.add_entry(make_entry("github-mcp", "GitHub tools", 200, &[], false));
+        let results = browser.search("github");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "github-mcp");
+    }
+
+    #[test]
+    fn registry_search_description() {
+        let mut browser = McpRegistryBrowser::new();
+        browser.add_entry(make_entry(
+            "tool",
+            "Kubernetes operator helper",
+            50,
+            &[],
+            false,
+        ));
+        let results = browser.search("kubernetes");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn registry_search_tag() {
+        let mut browser = McpRegistryBrowser::new();
+        browser.add_entry(make_entry(
+            "my-mcp",
+            "A tool",
+            10,
+            &["cloud", "azure"],
+            false,
+        ));
+        let results = browser.search("azure");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn registry_filter_by_tag_exact() {
+        let mut browser = McpRegistryBrowser::new();
+        browser.add_entry(make_entry("a", "desc", 1, &["database"], false));
+        browser.add_entry(make_entry("b", "desc", 2, &["data"], false));
+        let results = browser.filter_by_tag("database");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "a");
+    }
+
+    #[test]
+    fn registry_top_downloaded() {
+        let mut browser = McpRegistryBrowser::new();
+        browser.add_entry(make_entry("low", "x", 10, &[], false));
+        browser.add_entry(make_entry("mid", "x", 50, &[], false));
+        browser.add_entry(make_entry("high", "x", 100, &[], false));
+        let top = browser.top_downloaded(2);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].name, "high");
+        assert_eq!(top[1].name, "mid");
+    }
+
+    #[test]
+    fn registry_verified_only() {
+        let mut browser = McpRegistryBrowser::new();
+        browser.add_entry(make_entry("v1", "x", 10, &[], true));
+        browser.add_entry(make_entry("u1", "x", 20, &[], false));
+        browser.add_entry(make_entry("v2", "x", 5, &[], true));
+        let verified = browser.verified_only();
+        assert_eq!(verified.len(), 2);
+        assert!(verified.iter().all(|e| e.verified));
+    }
+
+    #[test]
+    fn registry_search_case_insensitive() {
+        let mut browser = McpRegistryBrowser::new();
+        browser.add_entry(make_entry(
+            "GitHub-MCP",
+            "GitHub integration",
+            99,
+            &[],
+            true,
+        ));
+        assert_eq!(browser.search("GITHUB").len(), 1);
+        assert_eq!(browser.search("github").len(), 1);
+    }
+
+    #[test]
+    fn registry_empty_search_no_results() {
+        let mut browser = McpRegistryBrowser::new();
+        browser.add_entry(make_entry("tool", "desc", 1, &[], false));
+        assert!(browser.search("zzznomatch").is_empty());
+    }
+}

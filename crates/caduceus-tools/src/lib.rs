@@ -5875,3 +5875,313 @@ mod tests {
         assert!(findings.is_empty());
     }
 }
+
+// ── #238: Research-Guided Tasks ───────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ResearchQuery {
+    pub query: String,
+    pub category: String,
+    pub priority: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResearchResult {
+    pub query: String,
+    pub findings: Vec<String>,
+    pub cached: bool,
+}
+
+pub struct ResearchGuide;
+
+impl ResearchGuide {
+    /// Generate research queries from a task description and optional context.
+    pub fn generate_queries(task_description: &str, context: &str) -> Vec<ResearchQuery> {
+        let stop_words = [
+            "the", "a", "an", "is", "are", "and", "or", "to", "in", "of", "for", "with", "be",
+            "at", "by", "on", "as",
+        ];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut queries: Vec<ResearchQuery> = Vec::new();
+
+        // Primary: full task description
+        if !task_description.is_empty() && seen.insert(task_description.to_string()) {
+            queries.push(ResearchQuery {
+                query: task_description.to_string(),
+                category: "primary".to_string(),
+                priority: 9,
+            });
+        }
+
+        // Secondary: bigrams from non-stop words
+        let words: Vec<&str> = task_description
+            .split_whitespace()
+            .filter(|w| {
+                let lower = w.to_lowercase();
+                let stripped = lower.trim_matches(|c: char| !c.is_alphabetic());
+                !stop_words.contains(&stripped)
+            })
+            .collect();
+
+        for window in words.windows(2) {
+            let q = window.join(" ");
+            if q.len() > 5 && seen.insert(q.clone()) {
+                queries.push(ResearchQuery {
+                    query: q,
+                    category: "secondary".to_string(),
+                    priority: 5,
+                });
+            }
+        }
+
+        // Contextual: description + context
+        if !context.is_empty() {
+            let ctx_q = format!("{task_description} {context}");
+            if seen.insert(ctx_q.clone()) {
+                queries.push(ResearchQuery {
+                    query: ctx_q,
+                    category: "contextual".to_string(),
+                    priority: 7,
+                });
+            }
+        }
+
+        queries
+    }
+
+    pub fn cache_result(
+        results: &mut std::collections::HashMap<String, ResearchResult>,
+        query: &str,
+        findings: Vec<String>,
+    ) {
+        results.insert(
+            query.to_string(),
+            ResearchResult {
+                query: query.to_string(),
+                findings,
+                cached: true,
+            },
+        );
+    }
+
+    pub fn get_cached<'a>(
+        results: &'a std::collections::HashMap<String, ResearchResult>,
+        query: &str,
+    ) -> Option<&'a ResearchResult> {
+        results.get(query)
+    }
+}
+
+// ── #243: Cloud Resource Management ──────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct CloudResource {
+    pub id: String,
+    pub name: String,
+    pub resource_type: String,
+    pub region: String,
+    pub status: String,
+    pub tags: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ResourceAction {
+    List(String),
+    Create {
+        resource_type: String,
+        name: String,
+        region: String,
+    },
+    Delete(String),
+    Describe(String),
+    Scale {
+        resource: String,
+        target: String,
+    },
+}
+
+pub struct CloudResourceManager;
+
+impl CloudResourceManager {
+    pub fn supported_actions() -> Vec<&'static str> {
+        vec!["list", "create", "delete", "describe", "scale"]
+    }
+
+    /// Parse natural-language cloud resource commands.
+    pub fn parse_resource_request(natural_language: &str) -> Option<ResourceAction> {
+        let lower = natural_language.to_lowercase();
+        let words: Vec<&str> = natural_language.split_whitespace().collect();
+        let lwords: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
+        let first = lwords.first().map(String::as_str).unwrap_or("");
+
+        if first == "list" || lower.starts_with("show all") || lower.starts_with("get all") {
+            let rest = words.get(1..).map(|s| s.join(" ")).unwrap_or_default();
+            let rt = if rest.is_empty() {
+                "all".to_string()
+            } else {
+                rest
+            };
+            return Some(ResourceAction::List(rt));
+        }
+
+        if matches!(first, "create" | "provision" | "deploy") {
+            let resource_type = words.get(1).copied().unwrap_or("resource").to_string();
+            let named_pos = lwords.iter().position(|w| w == "named" || w == "called");
+            let name = named_pos
+                .and_then(|i| words.get(i + 1))
+                .copied()
+                .unwrap_or("default")
+                .to_string();
+            let in_pos = lwords.iter().position(|w| w == "in");
+            let region = in_pos
+                .and_then(|i| words.get(i + 1))
+                .copied()
+                .unwrap_or("us-east-1")
+                .to_string();
+            return Some(ResourceAction::Create {
+                resource_type,
+                name,
+                region,
+            });
+        }
+
+        if matches!(first, "delete" | "remove" | "destroy") {
+            let id = words.get(1).copied().unwrap_or("unknown").to_string();
+            return Some(ResourceAction::Delete(id));
+        }
+
+        if matches!(first, "describe" | "inspect") {
+            let id = words.get(1).copied().unwrap_or("unknown").to_string();
+            return Some(ResourceAction::Describe(id));
+        }
+
+        if lower.contains("scale") {
+            let pos = lwords.iter().position(|w| w == "scale").unwrap_or(0);
+            let resource = words.get(pos + 1).copied().unwrap_or("unknown").to_string();
+            let to_pos = lwords.iter().position(|w| w == "to");
+            let target = to_pos
+                .and_then(|i| words.get(i + 1..))
+                .map(|s| s.join(" "))
+                .or_else(|| words.last().map(|w| (*w).to_string()))
+                .unwrap_or_else(|| "1".to_string());
+            return Some(ResourceAction::Scale { resource, target });
+        }
+
+        None
+    }
+}
+
+// ── Tests for #238, #243 ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod feature_tests_238_243 {
+    use super::*;
+
+    // ── #238 ResearchGuide ────────────────────────────────────────────────────
+
+    #[test]
+    fn research_generate_queries_primary() {
+        let qs = ResearchGuide::generate_queries("implement OAuth2 login", "");
+        assert!(!qs.is_empty());
+        assert_eq!(qs[0].category, "primary");
+        assert_eq!(qs[0].query, "implement OAuth2 login");
+        assert_eq!(qs[0].priority, 9);
+    }
+
+    #[test]
+    fn research_generate_queries_bigrams() {
+        let qs = ResearchGuide::generate_queries("implement OAuth2 login flow", "");
+        let categories: Vec<&str> = qs.iter().map(|q| q.category.as_str()).collect();
+        assert!(categories.contains(&"secondary"));
+    }
+
+    #[test]
+    fn research_generate_queries_contextual() {
+        let qs = ResearchGuide::generate_queries("OAuth2 login", "TypeScript backend");
+        let ctx = qs.iter().find(|q| q.category == "contextual");
+        assert!(ctx.is_some());
+        assert!(ctx.unwrap().query.contains("TypeScript"));
+    }
+
+    #[test]
+    fn research_cache_and_retrieve() {
+        let mut cache = std::collections::HashMap::new();
+        ResearchGuide::cache_result(&mut cache, "OAuth2", vec!["RFC 6749".to_string()]);
+        let result = ResearchGuide::get_cached(&cache, "OAuth2");
+        assert!(result.is_some());
+        assert!(result.unwrap().cached);
+        assert_eq!(result.unwrap().findings[0], "RFC 6749");
+    }
+
+    #[test]
+    fn research_get_cached_miss() {
+        let cache = std::collections::HashMap::new();
+        assert!(ResearchGuide::get_cached(&cache, "missing").is_none());
+    }
+
+    // ── #243 CloudResourceManager ─────────────────────────────────────────────
+
+    #[test]
+    fn cloud_parse_list() {
+        let action = CloudResourceManager::parse_resource_request("list s3 buckets");
+        assert!(matches!(action, Some(ResourceAction::List(rt)) if rt == "s3 buckets"));
+    }
+
+    #[test]
+    fn cloud_parse_create() {
+        let action =
+            CloudResourceManager::parse_resource_request("create vm named myvm in us-west-2");
+        match action {
+            Some(ResourceAction::Create {
+                resource_type,
+                name,
+                region,
+            }) => {
+                assert_eq!(resource_type, "vm");
+                assert_eq!(name, "myvm");
+                assert_eq!(region, "us-west-2");
+            }
+            _ => panic!("expected Create action"),
+        }
+    }
+
+    #[test]
+    fn cloud_parse_delete() {
+        let action = CloudResourceManager::parse_resource_request("delete my-bucket");
+        assert!(matches!(action, Some(ResourceAction::Delete(id)) if id == "my-bucket"));
+    }
+
+    #[test]
+    fn cloud_parse_describe() {
+        let action = CloudResourceManager::parse_resource_request("describe my-instance");
+        assert!(matches!(action, Some(ResourceAction::Describe(id)) if id == "my-instance"));
+    }
+
+    #[test]
+    fn cloud_parse_scale() {
+        let action = CloudResourceManager::parse_resource_request("scale my-app to 5 replicas");
+        match action {
+            Some(ResourceAction::Scale { resource, target }) => {
+                assert_eq!(resource, "my-app");
+                assert!(target.contains("5"));
+            }
+            _ => panic!("expected Scale action"),
+        }
+    }
+
+    #[test]
+    fn cloud_parse_unknown_returns_none() {
+        let action = CloudResourceManager::parse_resource_request("do something weird");
+        assert!(action.is_none());
+    }
+
+    #[test]
+    fn cloud_supported_actions() {
+        let actions = CloudResourceManager::supported_actions();
+        assert!(actions.contains(&"list"));
+        assert!(actions.contains(&"create"));
+        assert!(actions.contains(&"delete"));
+        assert!(actions.contains(&"describe"));
+        assert!(actions.contains(&"scale"));
+    }
+}
