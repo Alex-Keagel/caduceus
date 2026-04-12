@@ -14,8 +14,7 @@ members = [
     "crates/caduceus-crdt",
     "crates/caduceus-mcp",
     "crates/caduceus-marketplace",
-    "src-tauri",
-]
+    ]
 resolver = "2"
 
 [workspace.package]
