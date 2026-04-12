@@ -703,6 +703,12 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 | 247 | Git-trackable task data | Task/project data stored as JSON files alongside code for version control | Agentic-Tools | ✅ | P2 | `caduceus-storage` |
 | 248 | WebAuthn/FIDO2 passkey authentication | Passwordless authentication for cloud deployment using hardware security keys | OpenCode-Cloud | 💡 | P3 | `caduceus-permissions` |
 | 249 | Two-factor authentication (2FA) | TOTP/SMS second factor for enterprise deployments | OpenCode-Cloud | 💡 | P3 | `caduceus-permissions` |
+| 250 | Wiki engine | Persistent project wiki in .caduceus/wiki/ — CRUD, search, [[links]], git-tracked markdown | Karpathy | ✅ | P1 | `caduceus-storage` |
+| 251 | Wiki index | Auto-maintained index.md — catalog of all pages with categories, summaries, orphan detection | Karpathy | ✅ | P1 | `caduceus-storage` |
+| 252 | Wiki log | Append-only log.md — chronological record of ingests, queries, lints with parseable format | Karpathy | ✅ | P1 | `caduceus-storage` |
+| 253 | Wiki ingestor | Extract entities/claims from sources → generate summary + entity pages + cross-references | Karpathy | ✅ | P1 | `caduceus-storage` |
+| 254 | Wiki linter | Health check — orphan pages, broken links, empty pages, stale content detection | Karpathy | ✅ | P1 | `caduceus-storage` |
+| 255 | Wiki query engine | Search pages by TF-relevance, gather context, extract [[citations]] | Karpathy | ✅ | P1 | `caduceus-storage` |
 
 ---
 
