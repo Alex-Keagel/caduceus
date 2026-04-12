@@ -709,6 +709,9 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 | 253 | Wiki ingestor | Extract entities/claims from sources → generate summary + entity pages + cross-references | Karpathy | ✅ | P1 | `caduceus-storage` |
 | 254 | Wiki linter | Health check — orphan pages, broken links, empty pages, stale content detection | Karpathy | ✅ | P1 | `caduceus-storage` |
 | 255 | Wiki query engine | Search pages by TF-relevance, gather context, extract [[citations]] | Karpathy | ✅ | P1 | `caduceus-storage` |
+| 256 | Wiki watcher | File change detection with FNV-1a hashing, extension filtering, ignore patterns | Karpathy | ✅ | P1 | `caduceus-storage` |
+| 257 | Wiki maintenance agent | Auto-plans and executes wiki updates: create/update/delete pages, rebuild index, lint | Karpathy | ✅ | P1 | `caduceus-storage` |
+| 258 | Wiki auto-trigger | Hooks into agent lifecycle — auto-maintenance on every turn, session start/end | Karpathy | ✅ | P1 | `caduceus-storage` |
 
 ---
 
