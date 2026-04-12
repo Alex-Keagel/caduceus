@@ -6185,3 +6185,1308 @@ mod feature_tests_238_243 {
         assert!(actions.contains(&"scale"));
     }
 }
+
+// ── #262: PlaybookScaffolder ──────────────────────────────────────────────────
+
+fn to_title_case(value: &str) -> String {
+    value
+        .split(['-', '_', ' '])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            if word
+                .chars()
+                .filter(|ch| ch.is_alphabetic())
+                .all(|ch| ch.is_uppercase())
+                && word.chars().any(|ch| ch.is_alphabetic())
+            {
+                word.to_string()
+            } else {
+                let mut chars = word.chars();
+                match chars.next() {
+                    None => String::new(),
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn yaml_quote(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    format!("\"{escaped}\"")
+}
+
+fn indent_block(value: &str, spaces: usize) -> String {
+    let prefix = " ".repeat(spaces);
+    value
+        .lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn pretty_json(value: &Value) -> String {
+    match serde_json::to_string_pretty(value) {
+        Ok(content) => content,
+        Err(_) => value.to_string(),
+    }
+}
+
+fn workflow_job_id(name: &str) -> String {
+    let mut id = String::new();
+
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            id.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, '-' | '_' | ' ') && !id.ends_with('_') {
+            id.push('_');
+        }
+    }
+
+    let trimmed = id.trim_matches('_');
+    if trimmed.is_empty() {
+        "workflow".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn registry_skill_scaffold(name: &str, description: &str) -> String {
+    format!(
+        "---\nname: {name}\ndescription: {}\n---\n\n# {}\n\n## When to Use\n- {}\n\n## Steps\n1. Gather the required context.\n2. Execute the requested task.\n3. Verify the result before returning.\n",
+        yaml_quote(description),
+        to_title_case(name),
+        description,
+    )
+}
+
+fn registry_agent_scaffold(name: &str, description: &str) -> String {
+    format!(
+        "---\nname: {name}\ndescription: {}\ntools: ['shell', 'read', 'edit', 'search']\n---\n\n# {}\n\nYou are a senior specialist for {}.\n\n## When Invoked\n1. Read the relevant context first.\n2. Plan before making changes.\n3. Validate the final result.\n",
+        yaml_quote(description),
+        to_title_case(name),
+        description,
+    )
+}
+
+fn registry_instructions_scaffold(name: &str, description: &str) -> String {
+    format!(
+        "# {} Instructions\n\n## Overview\n- Project: {name}\n- Focus: {description}\n\n## Commands\n- Build: `make build`\n- Test: `make test`\n- Lint: `make lint`\n\n## Rules\n- Keep changes focused on the requested scope.\n- Run validation commands before finishing.\n",
+        to_title_case(name),
+    )
+}
+
+fn registry_instructions_template(template: &str) -> String {
+    match template {
+        "rust" => "# Rust Instructions\n\n## Commands\n- Build: `cargo build`\n- Test: `cargo test`\n- Lint: `cargo clippy --all-targets --all-features -- -D warnings`\n\n## Rules\n- Format code with `cargo fmt`.\n- Prefer idiomatic ownership and error handling.\n".to_string(),
+        "python" => "# Python Instructions\n\n## Commands\n- Build: `python -m build`\n- Test: `pytest`\n- Lint: `ruff check . && mypy .`\n\n## Rules\n- Keep functions small and typed where practical.\n- Add tests for new behavior.\n".to_string(),
+        "typescript" => "# TypeScript Instructions\n\n## Commands\n- Build: `npm run build`\n- Test: `npm test`\n- Lint: `npm run lint`\n\n## Rules\n- Prefer strict typing.\n- Keep components and services focused.\n".to_string(),
+        "react" => "# React Instructions\n\n## Commands\n- Build: `npm run build`\n- Test: `npm test`\n- Lint: `npm run lint`\n\n## Rules\n- Prefer functional components and hooks.\n- Cover user flows with Testing Library.\n".to_string(),
+        "fullstack" => "# Fullstack Instructions\n\n## Commands\n- Backend: `cargo test`\n- Frontend: `npm test`\n- API Checks: `openapi lint api/openapi.yaml`\n\n## Rules\n- Keep contracts in sync across layers.\n- Verify migrations and API compatibility.\n".to_string(),
+        _ => registry_instructions_scaffold(template, "Project-specific instructions."),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybookConfig {
+    pub name: String,
+    pub description: String,
+    pub trigger: String,
+    pub steps: Vec<PlaybookStep>,
+    pub rollback_steps: Vec<String>,
+    pub success_criteria: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybookStep {
+    pub title: String,
+    pub command: Option<String>,
+    pub check: Option<String>,
+    pub on_failure: String,
+}
+
+pub struct PlaybookScaffolder;
+
+impl PlaybookScaffolder {
+    pub fn generate(config: &PlaybookConfig) -> String {
+        let mut output = format!(
+            "---\nname: {}\ntrigger: {}\n---\n# {} Playbook\n\n{}\n\n## Pre-checks\n- [ ] Confirm prerequisites and approvals\n- [ ] Verify access, owners, and communication plan\n\n## Steps\n",
+            config.name,
+            yaml_quote(&config.trigger),
+            to_title_case(&config.name),
+            config.description,
+        );
+
+        if config.steps.is_empty() {
+            output.push_str("_No steps defined._\n\n");
+        } else {
+            for (index, step) in config.steps.iter().enumerate() {
+                output.push_str(&format!("### {}. {}\n", index + 1, step.title));
+                if let Some(command) = &step.command {
+                    output.push_str(&format!("```bash\n{command}\n```\n"));
+                }
+                if let Some(check) = &step.check {
+                    output.push_str(&format!("**Check:** {check}\n"));
+                }
+                output.push_str(&format!("**On failure:** {}\n\n", step.on_failure));
+            }
+        }
+
+        let rollback_steps = if config.rollback_steps.is_empty() {
+            vec![
+                "Stop at the last known good checkpoint".to_string(),
+                "Notify the responsible team and document the rollback".to_string(),
+            ]
+        } else {
+            config.rollback_steps.clone()
+        };
+        output.push_str("## Rollback\n");
+        for (index, step) in rollback_steps.iter().enumerate() {
+            output.push_str(&format!("{}. {}\n", index + 1, step));
+        }
+        output.push('\n');
+
+        let success_criteria = if config.success_criteria.is_empty() {
+            vec!["All steps completed without unresolved errors".to_string()]
+        } else {
+            config.success_criteria.clone()
+        };
+        output.push_str("## Success Criteria\n");
+        for criterion in success_criteria {
+            output.push_str(&format!("- {criterion}\n"));
+        }
+
+        output
+    }
+
+    pub fn quick_generate(name: &str, description: &str, steps: &[&str]) -> String {
+        let config = PlaybookConfig {
+            name: name.to_string(),
+            description: description.to_string(),
+            trigger: "on demand".to_string(),
+            steps: steps
+                .iter()
+                .map(|step| PlaybookStep {
+                    title: (*step).to_string(),
+                    command: None,
+                    check: None,
+                    on_failure: "abort".to_string(),
+                })
+                .collect(),
+            rollback_steps: vec![
+                "Undo the last safe change".to_string(),
+                "Escalate to the owning team".to_string(),
+            ],
+            success_criteria: vec!["All listed steps completed successfully".to_string()],
+        };
+        Self::generate(&config)
+    }
+
+    pub fn incident_response_template() -> String {
+        Self::generate(&PlaybookConfig {
+            name: "incident-response".to_string(),
+            description: "Coordinate containment, diagnosis, and recovery during an incident."
+                .to_string(),
+            trigger: "on incident".to_string(),
+            steps: vec![
+                PlaybookStep {
+                    title: "Acknowledge the incident and open a shared channel".to_string(),
+                    command: Some("echo 'Open incident channel and page responders'".to_string()),
+                    check: Some("Incident commander assigned".to_string()),
+                    on_failure: "retry".to_string(),
+                },
+                PlaybookStep {
+                    title: "Capture recent telemetry and error samples".to_string(),
+                    command: Some("./scripts/collect-incident-context.sh".to_string()),
+                    check: Some("Logs and metrics attached to the incident record".to_string()),
+                    on_failure: "skip".to_string(),
+                },
+                PlaybookStep {
+                    title: "Apply containment or rollback".to_string(),
+                    command: Some("./scripts/rollback-last-release.sh".to_string()),
+                    check: Some("Customer impact stops increasing".to_string()),
+                    on_failure: "rollback".to_string(),
+                },
+            ],
+            rollback_steps: vec![
+                "Revert the last known bad change".to_string(),
+                "Communicate status to stakeholders".to_string(),
+            ],
+            success_criteria: vec![
+                "Service health is stable".to_string(),
+                "Incident timeline captured for follow-up".to_string(),
+            ],
+        })
+    }
+
+    pub fn deployment_template() -> String {
+        Self::generate(&PlaybookConfig {
+            name: "deploy-production".to_string(),
+            description: "Ship a production release with validation and rollback guidance."
+                .to_string(),
+            trigger: "on deploy to production".to_string(),
+            steps: vec![
+                PlaybookStep {
+                    title: "Build release".to_string(),
+                    command: Some("cargo build --release".to_string()),
+                    check: Some("Build artifacts created successfully".to_string()),
+                    on_failure: "abort".to_string(),
+                },
+                PlaybookStep {
+                    title: "Run smoke tests".to_string(),
+                    command: Some("./scripts/smoke-test.sh".to_string()),
+                    check: Some("Smoke tests pass in production".to_string()),
+                    on_failure: "rollback".to_string(),
+                },
+            ],
+            rollback_steps: vec![
+                "Revert to the previous deployment".to_string(),
+                "Notify the team and update the deployment log".to_string(),
+            ],
+            success_criteria: vec![
+                "All health checks are green".to_string(),
+                "No error spike appears in logs".to_string(),
+            ],
+        })
+    }
+
+    pub fn onboarding_template() -> String {
+        Self::generate(&PlaybookConfig {
+            name: "team-onboarding".to_string(),
+            description: "Guide a new teammate through environment setup and project orientation."
+                .to_string(),
+            trigger: "on onboarding".to_string(),
+            steps: vec![
+                PlaybookStep {
+                    title: "Provision accounts and repository access".to_string(),
+                    command: Some("echo 'Grant repo, CI, and cloud access'".to_string()),
+                    check: Some("Access confirmed by the new teammate".to_string()),
+                    on_failure: "retry".to_string(),
+                },
+                PlaybookStep {
+                    title: "Set up the local development environment".to_string(),
+                    command: Some("cargo test -p caduceus-tools".to_string()),
+                    check: Some("Local build and tests succeed".to_string()),
+                    on_failure: "abort".to_string(),
+                },
+                PlaybookStep {
+                    title: "Review architecture, coding standards, and support process".to_string(),
+                    command: None,
+                    check: Some("New teammate can explain the main workflow".to_string()),
+                    on_failure: "skip".to_string(),
+                },
+            ],
+            rollback_steps: vec![
+                "Pause onboarding and capture blockers".to_string(),
+                "Schedule follow-up with the owning mentor".to_string(),
+            ],
+            success_criteria: vec![
+                "Environment is ready for day-one contributions".to_string(),
+                "Owner and escalation paths are understood".to_string(),
+            ],
+        })
+    }
+}
+
+// ── #263: WorkflowScaffolder ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowConfig {
+    pub name: String,
+    pub trigger: WorkflowTrigger,
+    pub steps: Vec<WorkflowStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowTrigger {
+    OnPush,
+    OnPR,
+    OnSchedule(String),
+    OnManual,
+    OnWebhook,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowStep {
+    pub name: String,
+    pub run: String,
+    pub condition: Option<String>,
+}
+
+pub struct WorkflowScaffolder;
+
+impl WorkflowScaffolder {
+    fn trigger_block(trigger: &WorkflowTrigger) -> String {
+        match trigger {
+            WorkflowTrigger::OnPush => "  push:\n".to_string(),
+            WorkflowTrigger::OnPR => "  pull_request:\n".to_string(),
+            WorkflowTrigger::OnSchedule(cron) => {
+                format!("  schedule:\n    - cron: {}\n", yaml_quote(cron))
+            }
+            WorkflowTrigger::OnManual => "  workflow_dispatch:\n".to_string(),
+            WorkflowTrigger::OnWebhook => "  repository_dispatch:\n".to_string(),
+        }
+    }
+
+    pub fn generate(config: &WorkflowConfig) -> String {
+        let mut output = format!(
+            "name: {}\non:\n{}jobs:\n  {}:\n    runs-on: ubuntu-latest\n    steps:\n",
+            config.name,
+            Self::trigger_block(&config.trigger),
+            workflow_job_id(&config.name),
+        );
+
+        let steps = if config.steps.is_empty() {
+            vec![WorkflowStep {
+                name: "Placeholder step".to_string(),
+                run: "echo 'Add workflow steps here'".to_string(),
+                condition: None,
+            }]
+        } else {
+            config.steps.clone()
+        };
+
+        for step in steps {
+            output.push_str(&format!("      - name: {}\n", step.name));
+            if let Some(condition) = step.condition {
+                output.push_str(&format!("        if: {condition}\n"));
+            }
+            if step.run.contains('\n') {
+                output.push_str("        run: |\n");
+                output.push_str(&indent_block(&step.run, 10));
+                output.push('\n');
+            } else {
+                output.push_str(&format!("        run: {}\n", yaml_quote(&step.run)));
+            }
+        }
+
+        output
+    }
+
+    pub fn ci_template(language: &str) -> String {
+        let language = language.to_ascii_lowercase();
+        let config = match language.as_str() {
+            "python" => WorkflowConfig {
+                name: "python-ci".to_string(),
+                trigger: WorkflowTrigger::OnPR,
+                steps: vec![
+                    WorkflowStep {
+                        name: "Install dependencies".to_string(),
+                        run: "pip install -r requirements.txt".to_string(),
+                        condition: None,
+                    },
+                    WorkflowStep {
+                        name: "Run tests".to_string(),
+                        run: "pytest".to_string(),
+                        condition: None,
+                    },
+                ],
+            },
+            "typescript" => WorkflowConfig {
+                name: "typescript-ci".to_string(),
+                trigger: WorkflowTrigger::OnPR,
+                steps: vec![
+                    WorkflowStep {
+                        name: "Install packages".to_string(),
+                        run: "npm ci".to_string(),
+                        condition: None,
+                    },
+                    WorkflowStep {
+                        name: "Lint and test".to_string(),
+                        run: "npm run lint\nnpm test".to_string(),
+                        condition: None,
+                    },
+                ],
+            },
+            _ => WorkflowConfig {
+                name: "rust-ci".to_string(),
+                trigger: WorkflowTrigger::OnPR,
+                steps: vec![
+                    WorkflowStep {
+                        name: "Format check".to_string(),
+                        run: "cargo fmt --all --check".to_string(),
+                        condition: None,
+                    },
+                    WorkflowStep {
+                        name: "Lint".to_string(),
+                        run: "cargo clippy --all-targets --all-features -- -D warnings".to_string(),
+                        condition: None,
+                    },
+                    WorkflowStep {
+                        name: "Test".to_string(),
+                        run: "cargo test --all".to_string(),
+                        condition: None,
+                    },
+                ],
+            },
+        };
+        Self::generate(&config)
+    }
+
+    pub fn deploy_template(target: &str) -> String {
+        let target = target.to_ascii_lowercase();
+        let config = match target.as_str() {
+            "k8s" => WorkflowConfig {
+                name: "deploy-k8s".to_string(),
+                trigger: WorkflowTrigger::OnManual,
+                steps: vec![
+                    WorkflowStep {
+                        name: "Build image".to_string(),
+                        run: "docker build -t app:latest .".to_string(),
+                        condition: None,
+                    },
+                    WorkflowStep {
+                        name: "Apply manifests".to_string(),
+                        run: "kubectl apply -f k8s/".to_string(),
+                        condition: Some("github.ref == 'refs/heads/main'".to_string()),
+                    },
+                ],
+            },
+            "vercel" => WorkflowConfig {
+                name: "deploy-vercel".to_string(),
+                trigger: WorkflowTrigger::OnManual,
+                steps: vec![WorkflowStep {
+                    name: "Deploy to Vercel".to_string(),
+                    run: "vercel deploy --prod".to_string(),
+                    condition: None,
+                }],
+            },
+            _ => WorkflowConfig {
+                name: "deploy-docker".to_string(),
+                trigger: WorkflowTrigger::OnManual,
+                steps: vec![
+                    WorkflowStep {
+                        name: "Build container".to_string(),
+                        run: "docker build -t app:latest .".to_string(),
+                        condition: None,
+                    },
+                    WorkflowStep {
+                        name: "Push image".to_string(),
+                        run: "docker push app:latest".to_string(),
+                        condition: None,
+                    },
+                ],
+            },
+        };
+        Self::generate(&config)
+    }
+
+    pub fn release_template() -> String {
+        Self::generate(&WorkflowConfig {
+            name: "release".to_string(),
+            trigger: WorkflowTrigger::OnManual,
+            steps: vec![
+                WorkflowStep {
+                    name: "Generate changelog".to_string(),
+                    run: "git cliff -o CHANGELOG.md".to_string(),
+                    condition: None,
+                },
+                WorkflowStep {
+                    name: "Create tag".to_string(),
+                    run: "git tag $VERSION && git push origin $VERSION".to_string(),
+                    condition: Some("github.ref == 'refs/heads/main'".to_string()),
+                },
+            ],
+        })
+    }
+}
+
+// ── #264: PromptScaffolder ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptConfig {
+    pub name: String,
+    pub description: String,
+    pub system_context: String,
+    pub user_template: String,
+    pub variables: Vec<(String, String)>,
+    pub examples: Vec<(String, String)>,
+}
+
+pub struct PromptScaffolder;
+
+impl PromptScaffolder {
+    pub fn generate(config: &PromptConfig) -> String {
+        let variables_yaml = if config.variables.is_empty() {
+            "variables: []\n".to_string()
+        } else {
+            let entries = config
+                .variables
+                .iter()
+                .map(|(name, description)| {
+                    format!(
+                        "  - name: {name}\n    description: {}",
+                        yaml_quote(description)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("variables:\n{entries}\n")
+        };
+
+        let mut output = format!(
+            "---\nname: {}\ndescription: {}\n{}---\n\n# {}\n\n{}\n\n## System Context\n{}\n",
+            config.name,
+            yaml_quote(&config.description),
+            variables_yaml,
+            to_title_case(&config.name),
+            config.user_template.trim(),
+            config.system_context.trim(),
+        );
+
+        if !config.examples.is_empty() {
+            output.push_str("\n## Examples\n");
+            for (index, (input, output_text)) in config.examples.iter().enumerate() {
+                output.push_str(&format!(
+                    "### Example {}\n**Input:** {}\n**Output:** {}\n",
+                    index + 1,
+                    input,
+                    output_text,
+                ));
+            }
+        }
+
+        output
+    }
+
+    pub fn code_review_template() -> String {
+        Self::generate(&PromptConfig {
+            name: "code-review".to_string(),
+            description: "Review code for quality, security, and best practices".to_string(),
+            system_context: "You are a senior reviewer focused on correctness, security, and maintainability.".to_string(),
+            user_template: "Review {{file_path}} with focus on {{focus_area}}.\n\n## Checklist\n- [ ] No security vulnerabilities\n- [ ] Error handling is complete\n- [ ] Tests cover edge cases".to_string(),
+            variables: vec![
+                ("file_path".to_string(), "Path to file to review".to_string()),
+                (
+                    "focus_area".to_string(),
+                    "What to focus on (security, performance, readability)".to_string(),
+                ),
+            ],
+            examples: vec![(
+                "src/lib.rs / security".to_string(),
+                "Highlights security issues, missing checks, and risky patterns.".to_string(),
+            )],
+        })
+    }
+
+    pub fn refactor_template() -> String {
+        Self::generate(&PromptConfig {
+            name: "refactor".to_string(),
+            description: "Plan and execute safe refactors with minimal regressions".to_string(),
+            system_context: "You are a senior engineer improving code structure without changing behavior.".to_string(),
+            user_template: "Refactor {{target}} to improve {{goal}}.\n\n## Requirements\n- Preserve existing behavior\n- Keep public APIs stable unless explicitly requested\n- Call out follow-up cleanup opportunities".to_string(),
+            variables: vec![
+                ("target".to_string(), "Code path or component to refactor".to_string()),
+                ("goal".to_string(), "Desired improvement such as readability or performance".to_string()),
+            ],
+            examples: vec![(
+                "src/api.rs / readability".to_string(),
+                "Breaks large functions into smaller helpers while preserving behavior.".to_string(),
+            )],
+        })
+    }
+
+    pub fn test_generation_template() -> String {
+        Self::generate(&PromptConfig {
+            name: "test-generation".to_string(),
+            description: "Generate focused tests for new or existing behavior".to_string(),
+            system_context: "You are a test engineer who prioritizes coverage for edge cases and regressions.".to_string(),
+            user_template: "Write tests for {{function_name}} covering {{scenario}}.\n\n## Expectations\n- Include happy-path coverage\n- Add edge cases and failure modes\n- Prefer deterministic fixtures".to_string(),
+            variables: vec![
+                (
+                    "function_name".to_string(),
+                    "Function, module, or behavior to test".to_string(),
+                ),
+                (
+                    "scenario".to_string(),
+                    "Important scenario or edge case to emphasize".to_string(),
+                ),
+            ],
+            examples: vec![(
+                "parse_config / invalid env values".to_string(),
+                "Adds tests for invalid inputs, defaults, and error messages.".to_string(),
+            )],
+        })
+    }
+
+    pub fn documentation_template() -> String {
+        Self::generate(&PromptConfig {
+            name: "documentation".to_string(),
+            description: "Produce clear documentation for code, workflows, or systems".to_string(),
+            system_context: "You are a technical writer who explains systems concisely and accurately.".to_string(),
+            user_template: "Document {{symbol_name}} for {{audience}}.\n\n## Deliverable\n- Start with a concise summary\n- Include usage notes or examples\n- Mention important constraints or failure modes".to_string(),
+            variables: vec![
+                (
+                    "symbol_name".to_string(),
+                    "Function, module, service, or workflow to document".to_string(),
+                ),
+                (
+                    "audience".to_string(),
+                    "Primary audience such as maintainers, users, or operators".to_string(),
+                ),
+            ],
+            examples: vec![(
+                "ToolRegistry / maintainers".to_string(),
+                "Explains responsibilities, extension points, and common pitfalls.".to_string(),
+            )],
+        })
+    }
+
+    pub fn bug_fix_template() -> String {
+        Self::generate(&PromptConfig {
+            name: "bug-fix".to_string(),
+            description: "Investigate a defect, identify root cause, and propose a safe fix".to_string(),
+            system_context: "You are a debugger who prioritizes root-cause analysis, validation, and rollback safety.".to_string(),
+            user_template: "Investigate {{error_message}} in {{component}}.\n\n## Deliverable\n- Explain the likely root cause\n- Propose the smallest safe fix\n- Identify validation steps and regression risks".to_string(),
+            variables: vec![
+                (
+                    "error_message".to_string(),
+                    "Observed failure, log message, or symptom".to_string(),
+                ),
+                (
+                    "component".to_string(),
+                    "File, service, or subsystem involved".to_string(),
+                ),
+            ],
+            examples: vec![(
+                "timeout waiting for DB / background worker".to_string(),
+                "Explains likely connection leak and adds targeted verification steps.".to_string(),
+            )],
+        })
+    }
+}
+
+// ── #265: HookScaffolder ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookConfig {
+    pub name: String,
+    pub phase: String,
+    pub command: String,
+    pub can_deny: bool,
+}
+
+pub struct HookScaffolder;
+
+impl HookScaffolder {
+    pub fn generate(config: &HookConfig) -> String {
+        pretty_json(&json!({
+            "name": config.name,
+            "phase": config.phase,
+            "command": config.command,
+            "can_deny": config.can_deny,
+        }))
+    }
+
+    pub fn pre_commit_template() -> String {
+        Self::generate(&HookConfig {
+            name: "pre-commit-guard".to_string(),
+            phase: "pre_commit".to_string(),
+            command: "cargo fmt --all && cargo test".to_string(),
+            can_deny: true,
+        })
+    }
+
+    pub fn post_tool_template() -> String {
+        Self::generate(&HookConfig {
+            name: "post-tool-notify".to_string(),
+            phase: "post_tool".to_string(),
+            command: "echo 'Tool execution finished'".to_string(),
+            can_deny: false,
+        })
+    }
+
+    pub fn lint_on_save_template() -> String {
+        Self::generate(&HookConfig {
+            name: "lint-on-save".to_string(),
+            phase: "post_tool".to_string(),
+            command: "npm run lint".to_string(),
+            can_deny: false,
+        })
+    }
+}
+
+// ── #266: McpConfigScaffolder ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub server_type: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+pub struct McpConfigScaffolder;
+
+impl McpConfigScaffolder {
+    fn transport_type(server_type: &str) -> &'static str {
+        let server_type = server_type.to_ascii_lowercase();
+        match server_type.as_str() {
+            "remote" => "http",
+            _ => "stdio",
+        }
+    }
+
+    pub fn generate(config: &McpServerConfig) -> String {
+        let env = config
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+            .collect::<Map<String, Value>>();
+        let args = config
+            .args
+            .iter()
+            .cloned()
+            .map(Value::String)
+            .collect::<Vec<_>>();
+
+        let mut server = Map::new();
+        server.insert("command".to_string(), Value::String(config.command.clone()));
+        server.insert("args".to_string(), Value::Array(args));
+        server.insert("env".to_string(), Value::Object(env));
+        server.insert(
+            "type".to_string(),
+            Value::String(Self::transport_type(&config.server_type).to_string()),
+        );
+        server.insert(
+            "server_type".to_string(),
+            Value::String(config.server_type.clone()),
+        );
+
+        let mut servers = Map::new();
+        servers.insert(config.name.clone(), Value::Object(server));
+
+        let mut root = Map::new();
+        root.insert("mcpServers".to_string(), Value::Object(servers));
+        pretty_json(&Value::Object(root))
+    }
+
+    pub fn filesystem_template() -> String {
+        Self::generate(&McpServerConfig {
+            name: "filesystem".to_string(),
+            server_type: "local".to_string(),
+            command: "npx".to_string(),
+            args: vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-filesystem".to_string(),
+                ".".to_string(),
+            ],
+            env: vec![],
+        })
+    }
+
+    pub fn database_template() -> String {
+        Self::generate(&McpServerConfig {
+            name: "database".to_string(),
+            server_type: "docker".to_string(),
+            command: "docker".to_string(),
+            args: vec![
+                "run".to_string(),
+                "--rm".to_string(),
+                "-i".to_string(),
+                "mcp/database:latest".to_string(),
+            ],
+            env: vec![("DATABASE_URL".to_string(), "${DATABASE_URL}".to_string())],
+        })
+    }
+
+    pub fn api_template() -> String {
+        Self::generate(&McpServerConfig {
+            name: "api".to_string(),
+            server_type: "remote".to_string(),
+            command: "mcp-remote-proxy".to_string(),
+            args: vec!["https://api.example.com/mcp".to_string()],
+            env: vec![("API_TOKEN".to_string(), "${API_TOKEN}".to_string())],
+        })
+    }
+}
+
+// ── #267: ScaffoldRegistry ────────────────────────────────────────────────────
+
+pub struct ScaffoldRegistry;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScaffoldType {
+    Skill,
+    Agent,
+    Instructions,
+    Playbook,
+    Workflow,
+    Prompt,
+    Hook,
+    McpServer,
+}
+
+impl ScaffoldRegistry {
+    pub fn available_types() -> Vec<(ScaffoldType, &'static str, &'static str)> {
+        vec![
+            (
+                ScaffoldType::Skill,
+                "skill",
+                "Reusable SKILL.md capability scaffold",
+            ),
+            (
+                ScaffoldType::Agent,
+                "agent",
+                "Reusable .agent.md specialist scaffold",
+            ),
+            (
+                ScaffoldType::Instructions,
+                "instructions",
+                "Project-wide CADUCEUS.md instruction scaffold",
+            ),
+            (
+                ScaffoldType::Playbook,
+                "playbook",
+                "Operational runbook and playbook scaffold",
+            ),
+            (
+                ScaffoldType::Workflow,
+                "workflow",
+                "Automation workflow scaffold for CI/CD",
+            ),
+            (
+                ScaffoldType::Prompt,
+                "prompt",
+                "Reusable prompt template scaffold",
+            ),
+            (ScaffoldType::Hook, "hook", "Lifecycle hook JSON scaffold"),
+            (
+                ScaffoldType::McpServer,
+                "mcp-server",
+                "MCP server configuration scaffold",
+            ),
+        ]
+    }
+
+    pub fn generate_quick(scaffold_type: ScaffoldType, name: &str, description: &str) -> String {
+        match scaffold_type {
+            ScaffoldType::Skill => registry_skill_scaffold(name, description),
+            ScaffoldType::Agent => registry_agent_scaffold(name, description),
+            ScaffoldType::Instructions => registry_instructions_scaffold(name, description),
+            ScaffoldType::Playbook => PlaybookScaffolder::quick_generate(
+                name,
+                description,
+                &[
+                    "Review prerequisites",
+                    "Execute the procedure",
+                    "Validate the outcome",
+                ],
+            ),
+            ScaffoldType::Workflow => WorkflowScaffolder::generate(&WorkflowConfig {
+                name: name.to_string(),
+                trigger: WorkflowTrigger::OnManual,
+                steps: vec![WorkflowStep {
+                    name: "Run task".to_string(),
+                    run: format!("echo '{}'", description.replace('\'', "\\'")),
+                    condition: None,
+                }],
+            }),
+            ScaffoldType::Prompt => PromptScaffolder::generate(&PromptConfig {
+                name: name.to_string(),
+                description: description.to_string(),
+                system_context: "You are a helpful specialist completing a reusable task."
+                    .to_string(),
+                user_template: format!("{description}\n\nInput: {{{{input}}}}"),
+                variables: vec![(
+                    "input".to_string(),
+                    "Primary input for this prompt".to_string(),
+                )],
+                examples: vec![],
+            }),
+            ScaffoldType::Hook => HookScaffolder::generate(&HookConfig {
+                name: name.to_string(),
+                phase: "pre_tool".to_string(),
+                command: format!("echo '{}'", description.replace('\'', "\\'")),
+                can_deny: false,
+            }),
+            ScaffoldType::McpServer => McpConfigScaffolder::generate(&McpServerConfig {
+                name: name.to_string(),
+                server_type: "local".to_string(),
+                command: "npx".to_string(),
+                args: vec![
+                    "-y".to_string(),
+                    "@modelcontextprotocol/server-filesystem".to_string(),
+                    ".".to_string(),
+                ],
+                env: vec![("DESCRIPTION".to_string(), description.to_string())],
+            }),
+        }
+    }
+
+    pub fn list_templates(scaffold_type: ScaffoldType) -> Vec<&'static str> {
+        match scaffold_type {
+            ScaffoldType::Skill => vec!["default"],
+            ScaffoldType::Agent => vec!["default"],
+            ScaffoldType::Instructions => {
+                vec!["rust", "python", "typescript", "react", "fullstack"]
+            }
+            ScaffoldType::Playbook => vec!["incident-response", "deployment", "onboarding"],
+            ScaffoldType::Workflow => vec![
+                "ci-rust",
+                "ci-python",
+                "ci-typescript",
+                "deploy-docker",
+                "deploy-k8s",
+                "deploy-vercel",
+                "release",
+            ],
+            ScaffoldType::Prompt => {
+                vec![
+                    "code-review",
+                    "refactor",
+                    "test-generation",
+                    "documentation",
+                    "bug-fix",
+                ]
+            }
+            ScaffoldType::Hook => vec!["pre-commit", "post-tool", "lint-on-save"],
+            ScaffoldType::McpServer => vec!["filesystem", "database", "api"],
+        }
+    }
+
+    pub fn generate_from_template(scaffold_type: ScaffoldType, template: &str) -> String {
+        let template = template.to_ascii_lowercase();
+        match scaffold_type {
+            ScaffoldType::Skill => {
+                registry_skill_scaffold("custom-skill", "Reusable skill scaffold.")
+            }
+            ScaffoldType::Agent => {
+                registry_agent_scaffold("custom-agent", "Reusable agent scaffold.")
+            }
+            ScaffoldType::Instructions => registry_instructions_template(&template),
+            ScaffoldType::Playbook => match template.as_str() {
+                "incident-response" => PlaybookScaffolder::incident_response_template(),
+                "deployment" => PlaybookScaffolder::deployment_template(),
+                "onboarding" => PlaybookScaffolder::onboarding_template(),
+                _ => PlaybookScaffolder::quick_generate(
+                    &template,
+                    "Custom operational playbook.",
+                    &["Review context", "Execute steps", "Verify completion"],
+                ),
+            },
+            ScaffoldType::Workflow => match template.as_str() {
+                "ci-python" => WorkflowScaffolder::ci_template("python"),
+                "ci-typescript" => WorkflowScaffolder::ci_template("typescript"),
+                "deploy-docker" => WorkflowScaffolder::deploy_template("docker"),
+                "deploy-k8s" => WorkflowScaffolder::deploy_template("k8s"),
+                "deploy-vercel" => WorkflowScaffolder::deploy_template("vercel"),
+                "release" => WorkflowScaffolder::release_template(),
+                _ => WorkflowScaffolder::ci_template("rust"),
+            },
+            ScaffoldType::Prompt => match template.as_str() {
+                "refactor" => PromptScaffolder::refactor_template(),
+                "test-generation" => PromptScaffolder::test_generation_template(),
+                "documentation" => PromptScaffolder::documentation_template(),
+                "bug-fix" => PromptScaffolder::bug_fix_template(),
+                _ => PromptScaffolder::code_review_template(),
+            },
+            ScaffoldType::Hook => match template.as_str() {
+                "post-tool" => HookScaffolder::post_tool_template(),
+                "lint-on-save" => HookScaffolder::lint_on_save_template(),
+                _ => HookScaffolder::pre_commit_template(),
+            },
+            ScaffoldType::McpServer => match template.as_str() {
+                "database" => McpConfigScaffolder::database_template(),
+                "api" => McpConfigScaffolder::api_template(),
+                _ => McpConfigScaffolder::filesystem_template(),
+            },
+        }
+    }
+
+    pub fn suggested_path(scaffold_type: ScaffoldType, name: &str) -> String {
+        match scaffold_type {
+            ScaffoldType::Skill => format!(".caduceus/skills/{name}/SKILL.md"),
+            ScaffoldType::Agent => format!(".caduceus/agents/{name}.agent.md"),
+            ScaffoldType::Instructions => "CADUCEUS.md".to_string(),
+            ScaffoldType::Playbook => format!(".caduceus/playbooks/{name}.md"),
+            ScaffoldType::Workflow => format!(".github/workflows/{name}.yml"),
+            ScaffoldType::Prompt => format!(".caduceus/prompts/{name}.prompt.md"),
+            ScaffoldType::Hook => format!(".caduceus/hooks/{name}.json"),
+            ScaffoldType::McpServer => format!(".caduceus/mcp/{name}.json"),
+        }
+    }
+}
+
+// ── Tests for #262–#267 ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod feature_tests_262_267 {
+    use super::*;
+
+    #[test]
+    fn playbook_generate_contains_sections_and_steps() {
+        let config = PlaybookConfig {
+            name: "deploy-production".to_string(),
+            description: "Deploy a production release safely.".to_string(),
+            trigger: "on deploy to production".to_string(),
+            steps: vec![
+                PlaybookStep {
+                    title: "Build release".to_string(),
+                    command: Some("cargo build --release".to_string()),
+                    check: Some("Artifacts built successfully".to_string()),
+                    on_failure: "abort".to_string(),
+                },
+                PlaybookStep {
+                    title: "Run smoke tests".to_string(),
+                    command: Some("./scripts/smoke-test.sh".to_string()),
+                    check: Some("Smoke tests pass".to_string()),
+                    on_failure: "rollback".to_string(),
+                },
+            ],
+            rollback_steps: vec![
+                "Revert to previous version".to_string(),
+                "Notify team".to_string(),
+            ],
+            success_criteria: vec![
+                "All health checks green".to_string(),
+                "No error spike in logs".to_string(),
+            ],
+        };
+
+        let output = PlaybookScaffolder::generate(&config);
+        assert!(output.contains("name: deploy-production"));
+        assert!(output.contains("trigger: \"on deploy to production\""));
+        assert!(output.contains("# Deploy Production Playbook"));
+        assert!(output.contains("## Pre-checks"));
+        assert!(output.contains("```bash\ncargo build --release\n```"));
+        assert!(output.contains("**Check:** Smoke tests pass"));
+        assert!(output.contains("**On failure:** rollback"));
+        assert!(output.contains("## Rollback"));
+        assert!(output.contains("## Success Criteria"));
+    }
+
+    #[test]
+    fn playbook_quick_generate_and_templates_work() {
+        let quick = PlaybookScaffolder::quick_generate(
+            "incident-triage",
+            "Handle a new production alert.",
+            &["Assess impact", "Stabilize service"],
+        );
+        assert!(quick.contains("# Incident Triage Playbook"));
+        assert!(quick.contains("### 1. Assess impact"));
+
+        let incident = PlaybookScaffolder::incident_response_template();
+        let deployment = PlaybookScaffolder::deployment_template();
+        let onboarding = PlaybookScaffolder::onboarding_template();
+        assert!(incident.contains("on incident"));
+        assert!(deployment.contains("cargo build --release"));
+        assert!(onboarding.contains("on onboarding"));
+    }
+
+    #[test]
+    fn workflow_generate_renders_trigger_conditions_and_multiline_run() {
+        let config = WorkflowConfig {
+            name: "nightly-checks".to_string(),
+            trigger: WorkflowTrigger::OnSchedule("0 0 * * *".to_string()),
+            steps: vec![WorkflowStep {
+                name: "Run nightly checks".to_string(),
+                run: "cargo fmt --all --check\ncargo test --all".to_string(),
+                condition: Some("github.ref == 'refs/heads/main'".to_string()),
+            }],
+        };
+
+        let output = WorkflowScaffolder::generate(&config);
+        assert!(output.contains("name: nightly-checks"));
+        assert!(output.contains("schedule:"));
+        assert!(output.contains("cron: \"0 0 * * *\""));
+        assert!(output.contains("if: github.ref == 'refs/heads/main'"));
+        assert!(output.contains("run: |"));
+        assert!(output.contains("cargo test --all"));
+    }
+
+    #[test]
+    fn workflow_templates_cover_ci_deploy_and_release() {
+        let rust_ci = WorkflowScaffolder::ci_template("rust");
+        let python_ci = WorkflowScaffolder::ci_template("python");
+        let ts_ci = WorkflowScaffolder::ci_template("typescript");
+        let docker = WorkflowScaffolder::deploy_template("docker");
+        let k8s = WorkflowScaffolder::deploy_template("k8s");
+        let vercel = WorkflowScaffolder::deploy_template("vercel");
+        let release = WorkflowScaffolder::release_template();
+
+        assert!(rust_ci.contains("cargo clippy"));
+        assert!(python_ci.contains("pytest"));
+        assert!(ts_ci.contains("npm ci"));
+        assert!(docker.contains("docker push app:latest"));
+        assert!(k8s.contains("kubectl apply -f k8s/"));
+        assert!(vercel.contains("vercel deploy --prod"));
+        assert!(release.contains("git cliff -o CHANGELOG.md"));
+    }
+
+    #[test]
+    fn prompt_generate_contains_frontmatter_variables_examples_and_context() {
+        let config = PromptConfig {
+            name: "code-review".to_string(),
+            description: "Review code for issues".to_string(),
+            system_context: "You are a reviewer.".to_string(),
+            user_template: "Review {{file_path}} carefully.".to_string(),
+            variables: vec![(
+                "file_path".to_string(),
+                "Path to the file under review".to_string(),
+            )],
+            examples: vec![(
+                "src/lib.rs".to_string(),
+                "Highlights bugs and risks.".to_string(),
+            )],
+        };
+
+        let output = PromptScaffolder::generate(&config);
+        assert!(output.contains("name: code-review"));
+        assert!(output.contains("description: \"Review code for issues\""));
+        assert!(output.contains("- name: file_path"));
+        assert!(output.contains("Review {{file_path}} carefully."));
+        assert!(output.contains("## System Context"));
+        assert!(output.contains("## Examples"));
+    }
+
+    #[test]
+    fn prompt_templates_cover_common_tasks() {
+        let review = PromptScaffolder::code_review_template();
+        let refactor = PromptScaffolder::refactor_template();
+        let tests = PromptScaffolder::test_generation_template();
+        let docs = PromptScaffolder::documentation_template();
+        let bug_fix = PromptScaffolder::bug_fix_template();
+
+        assert!(review.contains("{{file_path}}"));
+        assert!(review.contains("No security vulnerabilities"));
+        assert!(refactor.contains("{{target}}"));
+        assert!(tests.contains("{{function_name}}"));
+        assert!(docs.contains("{{symbol_name}}"));
+        assert!(bug_fix.contains("{{error_message}}"));
+    }
+
+    #[test]
+    fn hook_generate_json_is_valid() {
+        let config = HookConfig {
+            name: "pre-commit-guard".to_string(),
+            phase: "pre_commit".to_string(),
+            command: "cargo test".to_string(),
+            can_deny: true,
+        };
+
+        let output = HookScaffolder::generate(&config);
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["name"], "pre-commit-guard");
+        assert_eq!(parsed["phase"], "pre_commit");
+        assert_eq!(parsed["command"], "cargo test");
+        assert_eq!(parsed["can_deny"], true);
+    }
+
+    #[test]
+    fn hook_templates_cover_expected_phases() {
+        let pre_commit: Value =
+            serde_json::from_str(&HookScaffolder::pre_commit_template()).unwrap();
+        let post_tool: Value = serde_json::from_str(&HookScaffolder::post_tool_template()).unwrap();
+        let lint_on_save: Value =
+            serde_json::from_str(&HookScaffolder::lint_on_save_template()).unwrap();
+
+        assert_eq!(pre_commit["phase"], "pre_commit");
+        assert_eq!(pre_commit["can_deny"], true);
+        assert_eq!(post_tool["phase"], "post_tool");
+        assert_eq!(lint_on_save["phase"], "post_tool");
+    }
+
+    #[test]
+    fn mcp_generate_json_uses_standard_shape() {
+        let config = McpServerConfig {
+            name: "filesystem".to_string(),
+            server_type: "local".to_string(),
+            command: "npx".to_string(),
+            args: vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-filesystem".to_string(),
+            ],
+            env: vec![("ROOT".to_string(), ".".to_string())],
+        };
+
+        let output = McpConfigScaffolder::generate(&config);
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["mcpServers"]["filesystem"]["command"], "npx");
+        assert_eq!(parsed["mcpServers"]["filesystem"]["type"], "stdio");
+        assert_eq!(parsed["mcpServers"]["filesystem"]["server_type"], "local");
+        assert_eq!(parsed["mcpServers"]["filesystem"]["env"]["ROOT"], ".");
+    }
+
+    #[test]
+    fn mcp_templates_cover_filesystem_database_and_api() {
+        let filesystem: Value =
+            serde_json::from_str(&McpConfigScaffolder::filesystem_template()).unwrap();
+        let database: Value =
+            serde_json::from_str(&McpConfigScaffolder::database_template()).unwrap();
+        let api: Value = serde_json::from_str(&McpConfigScaffolder::api_template()).unwrap();
+
+        assert_eq!(filesystem["mcpServers"]["filesystem"]["type"], "stdio");
+        assert_eq!(database["mcpServers"]["database"]["server_type"], "docker");
+        assert_eq!(api["mcpServers"]["api"]["type"], "http");
+    }
+
+    #[test]
+    fn scaffold_registry_available_types_and_paths_match_requested_layout() {
+        let available = ScaffoldRegistry::available_types();
+        assert_eq!(available.len(), 8);
+        assert!(available.iter().any(|(_, name, _)| *name == "playbook"));
+        assert!(available.iter().any(|(_, name, _)| *name == "mcp-server"));
+
+        assert_eq!(
+            ScaffoldRegistry::suggested_path(ScaffoldType::Skill, "demo"),
+            ".caduceus/skills/demo/SKILL.md"
+        );
+        assert_eq!(
+            ScaffoldRegistry::suggested_path(ScaffoldType::Agent, "demo"),
+            ".caduceus/agents/demo.agent.md"
+        );
+        assert_eq!(
+            ScaffoldRegistry::suggested_path(ScaffoldType::Instructions, "ignored"),
+            "CADUCEUS.md"
+        );
+        assert_eq!(
+            ScaffoldRegistry::suggested_path(ScaffoldType::Playbook, "demo"),
+            ".caduceus/playbooks/demo.md"
+        );
+        assert_eq!(
+            ScaffoldRegistry::suggested_path(ScaffoldType::Workflow, "demo"),
+            ".github/workflows/demo.yml"
+        );
+        assert_eq!(
+            ScaffoldRegistry::suggested_path(ScaffoldType::Prompt, "demo"),
+            ".caduceus/prompts/demo.prompt.md"
+        );
+        assert_eq!(
+            ScaffoldRegistry::suggested_path(ScaffoldType::Hook, "demo"),
+            ".caduceus/hooks/demo.json"
+        );
+        assert_eq!(
+            ScaffoldRegistry::suggested_path(ScaffoldType::McpServer, "demo"),
+            ".caduceus/mcp/demo.json"
+        );
+    }
+
+    #[test]
+    fn scaffold_registry_quick_generate_and_templates_cover_all_types() {
+        for (scaffold_type, _, _) in ScaffoldRegistry::available_types() {
+            let quick = ScaffoldRegistry::generate_quick(
+                scaffold_type,
+                "demo-scaffold",
+                "Create a reusable scaffold",
+            );
+            assert!(!quick.is_empty());
+            assert!(quick.contains("demo-scaffold") || quick.contains("reusable scaffold"));
+
+            let templates = ScaffoldRegistry::list_templates(scaffold_type);
+            assert!(!templates.is_empty());
+            for template in templates {
+                let generated = ScaffoldRegistry::generate_from_template(scaffold_type, template);
+                assert!(
+                    !generated.is_empty(),
+                    "template {template} should generate content"
+                );
+            }
+        }
+    }
+}

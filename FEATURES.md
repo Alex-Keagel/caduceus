@@ -712,6 +712,15 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 | 256 | Wiki watcher | File change detection with FNV-1a hashing, extension filtering, ignore patterns | Karpathy | ✅ | P1 | `caduceus-storage` |
 | 257 | Wiki maintenance agent | Auto-plans and executes wiki updates: create/update/delete pages, rebuild index, lint | Karpathy | ✅ | P1 | `caduceus-storage` |
 | 258 | Wiki auto-trigger | Hooks into agent lifecycle — auto-maintenance on every turn, session start/end | Karpathy | ✅ | P1 | `caduceus-storage` |
+| 259 | Agent scaffolder | Generate .agent.md with persona, triggers, tools, checklist via /create agent | New | ✅ | P1 | `caduceus-orchestrator` |
+| 260 | Skill scaffolder | Generate SKILL.md with steps, triggers, examples via /create skill | New | ✅ | P1 | `caduceus-orchestrator` |
+| 261 | Instructions scaffolder | Generate CADUCEUS.md with auto-detect (language, framework) via /create instructions | New | ✅ | P1 | `caduceus-orchestrator` |
+| 262 | Playbook scaffolder | Generate step-by-step runbooks with rollback, templates for deploy/incident/onboard | New | ✅ | P1 | `caduceus-tools` |
+| 263 | Workflow scaffolder | Generate CI/CD YAML workflows with templates for Rust/Python/TS/Docker/K8s | New | ✅ | P1 | `caduceus-tools` |
+| 264 | Prompt scaffolder | Generate .prompt.md templates for code review, refactor, test gen, docs, bug fix | New | ✅ | P1 | `caduceus-tools` |
+| 265 | Hook scaffolder | Generate lifecycle hook JSON (pre-commit, post-tool, lint-on-save) | New | ✅ | P2 | `caduceus-tools` |
+| 266 | MCP config scaffolder | Generate MCP server JSON (filesystem, database, API templates) | New | ✅ | P2 | `caduceus-tools` |
+| 267 | Scaffold registry | Unified /create command for all 8 artifact types with path suggestions | New | ✅ | P1 | `caduceus-tools` |
 
 ---
 
