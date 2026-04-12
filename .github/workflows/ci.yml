@@ -35,7 +35,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
       - name: cargo fmt --check
         run: cargo fmt --all --check
@@ -45,24 +45,3 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
-
-  frontend:
-    name: Frontend checks
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: "npm"
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: TypeScript check
-        run: npx tsc --noEmit
-
-      - name: Build
-        run: npm run build
