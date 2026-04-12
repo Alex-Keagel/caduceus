@@ -2693,3 +2693,288 @@ mod tests {
         assert_eq!(top[0].0, "alpha");
     }
 }
+
+// ── #241: Agent Persistent Memory ────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct AgentMemory {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub category: String,
+    pub metadata: HashMap<String, String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Default)]
+pub struct AgentMemoryStore {
+    memories: HashMap<String, AgentMemory>,
+}
+
+impl AgentMemoryStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn store(&mut self, memory: AgentMemory) {
+        self.memories.insert(memory.id.clone(), memory);
+    }
+
+    /// Search memories by keyword.
+    /// Scoring: title match +0.6, content match +0.3, category match +0.2.
+    pub fn search(&self, query: &str) -> Vec<(&AgentMemory, f64)> {
+        let q = query.to_lowercase();
+        let mut results: Vec<(&AgentMemory, f64)> = self
+            .memories
+            .values()
+            .filter_map(|m| {
+                let mut score = 0.0f64;
+                if m.title.to_lowercase().contains(&q) {
+                    score += 0.6;
+                }
+                if m.content.to_lowercase().contains(&q) {
+                    score += 0.3;
+                }
+                if m.category.to_lowercase().contains(&q) {
+                    score += 0.2;
+                }
+                if score > 0.0 {
+                    Some((m, score))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results
+    }
+
+    pub fn get(&self, id: &str) -> Option<&AgentMemory> {
+        self.memories.get(id)
+    }
+
+    pub fn list_by_category(&self, category: &str) -> Vec<&AgentMemory> {
+        let cat = category.to_lowercase();
+        let mut result: Vec<&AgentMemory> = self
+            .memories
+            .values()
+            .filter(|m| m.category.to_lowercase() == cat)
+            .collect();
+        result.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        result
+    }
+
+    pub fn delete(&mut self, id: &str) -> bool {
+        self.memories.remove(id).is_some()
+    }
+}
+
+// ── #247: Git-Trackable Task Data ─────────────────────────────────────────────
+
+pub struct GitTrackableStore {
+    base_dir: PathBuf,
+}
+
+impl GitTrackableStore {
+    /// Stores tasks under `<project_root>/.caduceus/tasks/`.
+    pub fn new(project_root: &Path) -> Self {
+        Self {
+            base_dir: project_root.to_path_buf(),
+        }
+    }
+
+    pub fn tasks_dir(&self) -> PathBuf {
+        self.base_dir.join(".caduceus").join("tasks")
+    }
+
+    pub fn save_task(&self, task: &serde_json::Value) -> std::result::Result<(), String> {
+        let id = task
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Task must have a string 'id' field".to_string())?;
+        let dir = self.tasks_dir();
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(format!("{id}.json"));
+        let json = serde_json::to_string_pretty(task).map_err(|e| e.to_string())?;
+        fs::write(path, json).map_err(|e| e.to_string())
+    }
+
+    pub fn load_task(&self, id: &str) -> std::result::Result<serde_json::Value, String> {
+        let path = self.tasks_dir().join(format!("{id}.json"));
+        let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&content).map_err(|e| e.to_string())
+    }
+
+    pub fn list_tasks(&self) -> std::result::Result<Vec<serde_json::Value>, String> {
+        let dir = self.tasks_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut tasks = Vec::new();
+        for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                let task: serde_json::Value =
+                    serde_json::from_str(&content).map_err(|e| e.to_string())?;
+                tasks.push(task);
+            }
+        }
+        Ok(tasks)
+    }
+
+    pub fn delete_task(&self, id: &str) -> std::result::Result<(), String> {
+        let path = self.tasks_dir().join(format!("{id}.json"));
+        fs::remove_file(path).map_err(|e| e.to_string())
+    }
+}
+
+// ── Tests for #241, #247 ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod feature_tests_241_247 {
+    use super::*;
+
+    // ── #241 AgentMemoryStore ─────────────────────────────────────────────────
+
+    fn make_memory(id: &str, title: &str, content: &str, category: &str) -> AgentMemory {
+        AgentMemory {
+            id: id.to_string(),
+            title: title.to_string(),
+            content: content.to_string(),
+            category: category.to_string(),
+            metadata: HashMap::new(),
+            created_at: 100,
+            updated_at: 100,
+        }
+    }
+
+    #[test]
+    fn memory_store_and_get() {
+        let mut store = AgentMemoryStore::new();
+        store.store(make_memory(
+            "m1",
+            "Auth notes",
+            "Use JWT tokens",
+            "security",
+        ));
+        assert!(store.get("m1").is_some());
+        assert_eq!(store.get("m1").unwrap().title, "Auth notes");
+    }
+
+    #[test]
+    fn memory_search_title_match() {
+        let mut store = AgentMemoryStore::new();
+        store.store(make_memory("m1", "Auth notes", "content here", "security"));
+        store.store(make_memory("m2", "Unrelated", "content here", "other"));
+        let results = store.search("auth");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.id, "m1");
+        assert!((results[0].1 - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn memory_search_content_match() {
+        let mut store = AgentMemoryStore::new();
+        store.store(make_memory(
+            "m1",
+            "Notes",
+            "JWT tokens are secure",
+            "security",
+        ));
+        let results = store.search("jwt");
+        assert_eq!(results.len(), 1);
+        assert!((results[0].1 - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn memory_search_category_bonus() {
+        let mut store = AgentMemoryStore::new();
+        store.store(make_memory("m1", "Some note", "content", "auth"));
+        let results = store.search("auth");
+        assert_eq!(results.len(), 1);
+        assert!((results[0].1 - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn memory_search_combined_score() {
+        let mut store = AgentMemoryStore::new();
+        // auth appears in title + category -> 0.6 + 0.2 = 0.8
+        store.store(make_memory("m1", "Auth guide", "details", "auth"));
+        let results = store.search("auth");
+        assert!((results[0].1 - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn memory_list_by_category() {
+        let mut store = AgentMemoryStore::new();
+        store.store(make_memory("m1", "A", "c", "security"));
+        store.store(make_memory("m2", "B", "c", "other"));
+        store.store(make_memory("m3", "C", "c", "security"));
+        let sec = store.list_by_category("security");
+        assert_eq!(sec.len(), 2);
+        assert!(sec.iter().all(|m| m.category == "security"));
+    }
+
+    #[test]
+    fn memory_delete() {
+        let mut store = AgentMemoryStore::new();
+        store.store(make_memory("m1", "A", "c", "x"));
+        assert!(store.delete("m1"));
+        assert!(!store.delete("m1")); // already gone
+        assert!(store.get("m1").is_none());
+    }
+
+    // ── #247 GitTrackableStore ────────────────────────────────────────────────
+
+    #[test]
+    fn git_store_save_load_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GitTrackableStore::new(dir.path());
+        let task = serde_json::json!({ "id": "task-1", "title": "Do something" });
+        store.save_task(&task).unwrap();
+        let loaded = store.load_task("task-1").unwrap();
+        assert_eq!(loaded["title"], "Do something");
+        store.delete_task("task-1").unwrap();
+        assert!(store.load_task("task-1").is_err());
+    }
+
+    #[test]
+    fn git_store_list_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GitTrackableStore::new(dir.path());
+        store
+            .save_task(&serde_json::json!({ "id": "t1", "v": 1 }))
+            .unwrap();
+        store
+            .save_task(&serde_json::json!({ "id": "t2", "v": 2 }))
+            .unwrap();
+        let list = store.list_tasks().unwrap();
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn git_store_list_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GitTrackableStore::new(dir.path());
+        let list = store.list_tasks().unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn git_store_missing_id_field_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GitTrackableStore::new(dir.path());
+        let bad = serde_json::json!({ "title": "no id" });
+        assert!(store.save_task(&bad).is_err());
+    }
+
+    #[test]
+    fn git_store_tasks_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GitTrackableStore::new(dir.path());
+        assert!(store.tasks_dir().ends_with(".caduceus/tasks"));
+    }
+}

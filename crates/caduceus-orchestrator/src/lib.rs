@@ -1047,10 +1047,7 @@ impl ExecutionTreeViz {
         let mut out = String::from("graph TD\n");
         for node in &self.nodes {
             let safe_label = node.label.replace('"', "'");
-            out.push_str(&format!(
-                "    {}[\"{}\"]\n",
-                node.id, safe_label
-            ));
+            out.push_str(&format!("    {}[\"{}\"]\n", node.id, safe_label));
             let color = match node.status.as_str() {
                 "succeeded" => "fill:#10b981,color:#fff",
                 "failed" => "fill:#ef4444,color:#fff",
@@ -1905,5 +1902,896 @@ mod tests {
         tree.add_node(make_viz_node("r2", "active", None, 0));
         let json = tree.to_react_flow_json();
         assert_eq!(json["edges"].as_array().unwrap().len(), 0);
+    }
+}
+
+// ── #236: PRD Parser ─────────────────────────────────────────────────────────
+
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub struct PrdTask {
+    pub id: usize,
+    pub title: String,
+    pub description: String,
+    pub parent_id: Option<usize>,
+    pub priority: u8,
+    pub complexity: u8,
+    pub estimated_hours: f64,
+    pub dependencies: Vec<usize>,
+    pub tags: Vec<String>,
+}
+
+pub struct PrdParser;
+
+impl PrdParser {
+    /// Return (heading, content) pairs for every markdown section.
+    pub fn extract_sections(text: &str) -> Vec<(String, String)> {
+        let mut sections: Vec<(String, String)> = Vec::new();
+        let mut current_title: Option<String> = None;
+        let mut buf = String::new();
+
+        for line in text.lines() {
+            if line.starts_with('#') {
+                if let Some(title) = current_title.take() {
+                    sections.push((title, buf.trim().to_string()));
+                    buf.clear();
+                }
+                let title = line.trim_start_matches('#').trim().to_string();
+                if !title.is_empty() {
+                    current_title = Some(title);
+                }
+            } else if current_title.is_some() {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+        }
+        if let Some(title) = current_title {
+            sections.push((title, buf.trim().to_string()));
+        }
+        sections
+    }
+
+    /// Parse a markdown PRD document into a flat list of `PrdTask`s.
+    pub fn parse(prd_text: &str) -> Vec<PrdTask> {
+        // Collect (level, title, content) triples.
+        let mut triples: Vec<(usize, String, String)> = Vec::new();
+        let mut current: Option<(usize, String)> = None;
+        let mut buf = String::new();
+
+        for line in prd_text.lines() {
+            if line.starts_with('#') {
+                if let Some((lvl, title)) = current.take() {
+                    triples.push((lvl, title, buf.trim().to_string()));
+                    buf.clear();
+                }
+                let level = line.chars().take_while(|&c| c == '#').count();
+                let title = line[level..].trim().to_string();
+                if !title.is_empty() {
+                    current = Some((level, title));
+                }
+            } else if current.is_some() {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+        }
+        if let Some((lvl, title)) = current {
+            triples.push((lvl, title, buf.trim().to_string()));
+        }
+
+        // Build tasks with parent tracking via a stack of (task_id, heading_level).
+        let mut tasks: Vec<PrdTask> = Vec::new();
+        let mut parent_stack: Vec<(usize, usize)> = Vec::new();
+
+        for (id, (level, title, content)) in triples.into_iter().enumerate() {
+            while parent_stack.last().is_some_and(|&(_, l)| l >= level) {
+                parent_stack.pop();
+            }
+            let parent_id = parent_stack.last().map(|&(pid, _)| pid);
+            let priority = Self::extract_priority(&content);
+            let complexity = Self::extract_complexity(&content);
+            let estimated_hours = Self::extract_hours(&content);
+            let tags = Self::extract_tags(&content);
+
+            tasks.push(PrdTask {
+                id,
+                title,
+                description: content,
+                parent_id,
+                priority,
+                complexity,
+                estimated_hours,
+                dependencies: Vec::new(),
+                tags,
+            });
+            parent_stack.push((id, level));
+        }
+        tasks
+    }
+
+    /// Infer dependency edges from keyword references between task descriptions.
+    /// Returns pairs `(dependent_id, dependency_id)`.
+    pub fn infer_dependencies(tasks: &[PrdTask]) -> Vec<(usize, usize)> {
+        let mut deps = Vec::new();
+        for task in tasks {
+            for other in tasks {
+                if other.id == task.id {
+                    continue;
+                }
+                if task
+                    .description
+                    .to_lowercase()
+                    .contains(&other.title.to_lowercase())
+                {
+                    deps.push((task.id, other.id));
+                }
+            }
+        }
+        deps
+    }
+
+    fn extract_priority(text: &str) -> u8 {
+        let lower = text.to_lowercase();
+        if lower.contains("priority: high") || lower.contains("priority:high") {
+            8
+        } else if lower.contains("priority: low") || lower.contains("priority:low") {
+            2
+        } else {
+            5
+        }
+    }
+
+    fn extract_complexity(text: &str) -> u8 {
+        let lower = text.to_lowercase();
+        if lower.contains("complexity: high") || lower.contains("complexity:high") {
+            8
+        } else if lower.contains("complexity: low") || lower.contains("complexity:low") {
+            2
+        } else {
+            5
+        }
+    }
+
+    fn extract_hours(text: &str) -> f64 {
+        for word in text.split_whitespace() {
+            let stripped = word.trim_end_matches('h');
+            if let Ok(h) = stripped.parse::<f64>() {
+                if h > 0.0 && h < 1000.0 {
+                    return h;
+                }
+            }
+        }
+        1.0
+    }
+
+    fn extract_tags(text: &str) -> Vec<String> {
+        text.split_whitespace()
+            .filter(|w| w.starts_with('#'))
+            .map(|w| w.trim_start_matches('#').to_string())
+            .collect()
+    }
+}
+
+// ── #237: Smart Task Recommender ─────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct TaskRecommendation {
+    pub task_id: usize,
+    pub score: f64,
+    pub reason: String,
+}
+
+pub struct TaskRecommender;
+
+impl TaskRecommender {
+    /// Rank incomplete tasks by readiness, priority, and inverse complexity.
+    pub fn recommend_next(tasks: &[PrdTask], completed: &[usize]) -> Vec<TaskRecommendation> {
+        let mut recs: Vec<TaskRecommendation> = tasks
+            .iter()
+            .filter(|t| !completed.contains(&t.id))
+            .map(|t| {
+                let dep_s = Self::dependency_score(t, completed);
+                let pri_s = Self::priority_score(t);
+                let cmp_s = Self::complexity_score(t);
+                let score = 0.4 * dep_s + 0.35 * pri_s + 0.25 * cmp_s;
+                let reason =
+                    format!("dep_ready={dep_s:.2} priority={pri_s:.2} complexity_inv={cmp_s:.2}");
+                TaskRecommendation {
+                    task_id: t.id,
+                    score,
+                    reason,
+                }
+            })
+            .collect();
+
+        recs.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        recs
+    }
+
+    fn dependency_score(task: &PrdTask, completed: &[usize]) -> f64 {
+        if task.dependencies.is_empty() || task.dependencies.iter().all(|d| completed.contains(d)) {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    fn priority_score(task: &PrdTask) -> f64 {
+        f64::from(task.priority) / 10.0
+    }
+
+    fn complexity_score(task: &PrdTask) -> f64 {
+        if task.complexity == 0 {
+            1.0
+        } else {
+            1.0 / f64::from(task.complexity)
+        }
+    }
+}
+
+// ── #239: Unlimited Task Hierarchy ───────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct HierarchicalTask {
+    pub id: usize,
+    pub title: String,
+    pub parent_id: Option<usize>,
+    pub status: String,
+    pub priority: u8,
+    pub complexity: u8,
+    pub estimated_hours: f64,
+    pub actual_hours: f64,
+    pub tags: Vec<String>,
+    pub level: usize,
+}
+
+pub struct TaskTree {
+    tasks: HashMap<usize, HierarchicalTask>,
+    next_id: usize,
+}
+
+impl TaskTree {
+    pub fn new() -> Self {
+        Self {
+            tasks: HashMap::new(),
+            next_id: 0,
+        }
+    }
+
+    pub fn add_task(&mut self, title: &str, parent_id: Option<usize>) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        let level = parent_id.map_or(0, |p| self.depth(p) + 1);
+        self.tasks.insert(
+            id,
+            HierarchicalTask {
+                id,
+                title: title.to_string(),
+                parent_id,
+                status: "pending".to_string(),
+                priority: 5,
+                complexity: 5,
+                estimated_hours: 1.0,
+                actual_hours: 0.0,
+                tags: Vec::new(),
+                level,
+            },
+        );
+        id
+    }
+
+    pub fn get_task(&self, id: usize) -> Option<&HierarchicalTask> {
+        self.tasks.get(&id)
+    }
+
+    pub fn children(&self, id: usize) -> Vec<&HierarchicalTask> {
+        let mut ch: Vec<&HierarchicalTask> = self
+            .tasks
+            .values()
+            .filter(|t| t.parent_id == Some(id))
+            .collect();
+        ch.sort_by_key(|t| t.id);
+        ch
+    }
+
+    /// All descendants of `id`, depth-first.
+    pub fn subtree(&self, id: usize) -> Vec<&HierarchicalTask> {
+        let mut result = Vec::new();
+        for child in self.children(id) {
+            result.push(child);
+            result.extend(self.subtree(child.id));
+        }
+        result
+    }
+
+    /// Number of ancestors (root = 0).
+    pub fn depth(&self, id: usize) -> usize {
+        let mut depth = 0;
+        let mut current = id;
+        while let Some(parent) = self.tasks.get(&current).and_then(|t| t.parent_id) {
+            depth += 1;
+            current = parent;
+        }
+        depth
+    }
+
+    /// Percentage of immediate children with status `"done"`.
+    /// Leaf tasks with `status == "done"` return 100.0, otherwise 0.0.
+    pub fn progress(&self, id: usize) -> f64 {
+        let ch = self.children(id);
+        if ch.is_empty() {
+            return if self.tasks.get(&id).is_some_and(|t| t.status == "done") {
+                100.0
+            } else {
+                0.0
+            };
+        }
+        let done = ch.iter().filter(|c| c.status == "done").count();
+        done as f64 / ch.len() as f64 * 100.0
+    }
+
+    /// Visual tree with indentation.
+    pub fn to_tree_string(&self) -> String {
+        let mut output = String::new();
+        let mut roots: Vec<&HierarchicalTask> = self
+            .tasks
+            .values()
+            .filter(|t| t.parent_id.is_none())
+            .collect();
+        roots.sort_by_key(|t| t.id);
+        for root in roots {
+            self.write_node(&mut output, root, 0);
+        }
+        output
+    }
+
+    fn write_node(&self, output: &mut String, task: &HierarchicalTask, depth: usize) {
+        let indent = "  ".repeat(depth);
+        output.push_str(&format!("{indent}- [{}] {}\n", task.status, task.title));
+        for child in self.children(task.id) {
+            self.write_node(output, child, depth + 1);
+        }
+    }
+}
+
+impl Default for TaskTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── #240: Time Tracking ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct TimeEntry {
+    pub task_id: usize,
+    pub estimated_hours: f64,
+    pub actual_hours: f64,
+    pub started_at: u64,
+    pub completed_at: Option<u64>,
+}
+
+#[derive(Default)]
+pub struct TimeTracker {
+    entries: Vec<TimeEntry>,
+}
+
+impl TimeTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn start_task(&mut self, task_id: usize, estimated: f64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.entries.push(TimeEntry {
+            task_id,
+            estimated_hours: estimated,
+            actual_hours: 0.0,
+            started_at: now,
+            completed_at: None,
+        });
+    }
+
+    pub fn complete_task(&mut self, task_id: usize, actual: f64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Some(e) = self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|e| e.task_id == task_id && e.completed_at.is_none())
+        {
+            e.actual_hours = actual;
+            e.completed_at = Some(now);
+        }
+    }
+
+    /// Ratio of total estimated to total actual for completed tasks.
+    pub fn velocity(&self) -> f64 {
+        let completed: Vec<&TimeEntry> = self
+            .entries
+            .iter()
+            .filter(|e| e.completed_at.is_some() && e.actual_hours > 0.0)
+            .collect();
+        if completed.is_empty() {
+            return 1.0;
+        }
+        let est: f64 = completed.iter().map(|e| e.estimated_hours).sum();
+        let act: f64 = completed.iter().map(|e| e.actual_hours).sum();
+        if act == 0.0 {
+            1.0
+        } else {
+            est / act
+        }
+    }
+
+    pub fn total_estimated(&self) -> f64 {
+        self.entries.iter().map(|e| e.estimated_hours).sum()
+    }
+
+    pub fn total_actual(&self) -> f64 {
+        self.entries.iter().map(|e| e.actual_hours).sum()
+    }
+
+    /// Tasks that are still running and have exceeded their estimate.
+    pub fn overdue_tasks(&self) -> Vec<usize> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.entries
+            .iter()
+            .filter(|e| {
+                e.completed_at.is_none()
+                    && (now.saturating_sub(e.started_at)) as f64 / 3600.0 > e.estimated_hours
+            })
+            .map(|e| e.task_id)
+            .collect()
+    }
+}
+
+// ── #245: SRE Agent Mode ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct SreAlert {
+    pub id: String,
+    pub severity: String,
+    pub source: String,
+    pub message: String,
+    pub timestamp: u64,
+    pub acknowledged: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Runbook {
+    pub name: String,
+    pub trigger_pattern: String,
+    pub steps: Vec<String>,
+}
+
+#[derive(Default)]
+pub struct SreAgent {
+    alerts: Vec<SreAlert>,
+    runbooks: Vec<Runbook>,
+}
+
+impl SreAgent {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn ingest_alert(&mut self, alert: SreAlert) {
+        self.alerts.push(alert);
+    }
+
+    /// Find the first runbook whose trigger pattern appears in the alert.
+    pub fn match_runbook(&self, alert: &SreAlert) -> Option<&Runbook> {
+        let msg = alert.message.to_lowercase();
+        let src = alert.source.to_lowercase();
+        self.runbooks.iter().find(|rb| {
+            let p = rb.trigger_pattern.to_lowercase();
+            msg.contains(&p) || src.contains(&p)
+        })
+    }
+
+    pub fn pending_alerts(&self) -> Vec<&SreAlert> {
+        self.alerts.iter().filter(|a| !a.acknowledged).collect()
+    }
+
+    pub fn acknowledge(&mut self, alert_id: &str) {
+        if let Some(a) = self.alerts.iter_mut().find(|a| a.id == alert_id) {
+            a.acknowledged = true;
+        }
+    }
+
+    pub fn add_runbook(&mut self, runbook: Runbook) {
+        self.runbooks.push(runbook);
+    }
+}
+
+// ── #246: Progress Inference ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct InferredProgress {
+    pub task_id: usize,
+    pub percentage: f64,
+    pub confidence: f64,
+    pub evidence: Vec<String>,
+}
+
+pub struct ProgressInferrer;
+
+impl ProgressInferrer {
+    /// Estimate progress from git commit messages referencing a task title.
+    pub fn infer_from_commits(task_title: &str, commit_messages: &[String]) -> InferredProgress {
+        if commit_messages.is_empty() {
+            return InferredProgress {
+                task_id: 0,
+                percentage: 0.0,
+                confidence: 0.0,
+                evidence: Vec::new(),
+            };
+        }
+        let title_lower = task_title.to_lowercase();
+        let title_words: Vec<&str> = title_lower.split_whitespace().collect();
+        let done_kws = [
+            "done",
+            "complete",
+            "finish",
+            "implement",
+            "close",
+            "resolve",
+        ];
+
+        let mut evidence = Vec::new();
+        let mut matching = 0usize;
+        let mut completion_hints = 0usize;
+
+        for msg in commit_messages {
+            let lower = msg.to_lowercase();
+            let relevant = title_words.iter().any(|w| lower.contains(*w));
+            if relevant {
+                matching += 1;
+                evidence.push(msg.clone());
+                if done_kws.iter().any(|kw| lower.contains(kw)) {
+                    completion_hints += 1;
+                }
+            }
+        }
+
+        let confidence = matching as f64 / commit_messages.len() as f64;
+        let percentage = if matching == 0 {
+            0.0
+        } else {
+            completion_hints as f64 / matching as f64 * 100.0
+        };
+
+        InferredProgress {
+            task_id: 0,
+            percentage,
+            confidence,
+            evidence,
+        }
+    }
+
+    /// Progress from test suite pass rate (0–100).
+    pub fn infer_from_tests(total: usize, passing: usize) -> f64 {
+        if total == 0 {
+            return 0.0;
+        }
+        (passing as f64 / total as f64 * 100.0).min(100.0)
+    }
+
+    /// Progress from file creation ratio (0–100).
+    pub fn infer_from_files(files_planned: usize, files_created: usize) -> f64 {
+        if files_planned == 0 {
+            return 0.0;
+        }
+        (files_created as f64 / files_planned as f64 * 100.0).min(100.0)
+    }
+
+    /// Weighted average: 40% commits, 40% tests, 20% files.
+    pub fn combined(commits: f64, tests: f64, files: f64) -> f64 {
+        (0.4 * commits + 0.4 * tests + 0.2 * files).min(100.0)
+    }
+}
+
+// ── Tests for #236–#237, #239–#240, #245–#246 ────────────────────────────────
+
+#[cfg(test)]
+mod feature_tests_236_246 {
+    use super::*;
+
+    // ── #236 PrdParser ────────────────────────────────────────────────────────
+
+    #[test]
+    fn prd_extract_sections_basic() {
+        let md = "# Auth\nBuild login.\n## OAuth\nUse OAuth2.";
+        let sections = PrdParser::extract_sections(md);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].0, "Auth");
+        assert!(sections[0].1.contains("Build login"));
+        assert_eq!(sections[1].0, "OAuth");
+    }
+
+    #[test]
+    fn prd_parse_sets_parent_id() {
+        let md = "# Feature\nTop level.\n## Sub-feature\nChild task.";
+        let tasks = PrdParser::parse(md);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].parent_id, None);
+        assert_eq!(tasks[1].parent_id, Some(0));
+    }
+
+    #[test]
+    fn prd_parse_extracts_priority() {
+        let md = "# Task\npriority: high\nDo something.";
+        let tasks = PrdParser::parse(md);
+        assert_eq!(tasks[0].priority, 8);
+    }
+
+    #[test]
+    fn prd_infer_dependencies_finds_reference() {
+        let tasks = vec![
+            PrdTask {
+                id: 0,
+                title: "Database setup".to_string(),
+                description: "Set up the database.".to_string(),
+                parent_id: None,
+                priority: 5,
+                complexity: 5,
+                estimated_hours: 1.0,
+                dependencies: vec![],
+                tags: vec![],
+            },
+            PrdTask {
+                id: 1,
+                title: "API layer".to_string(),
+                description: "Implement API after Database setup is complete.".to_string(),
+                parent_id: None,
+                priority: 5,
+                complexity: 5,
+                estimated_hours: 1.0,
+                dependencies: vec![],
+                tags: vec![],
+            },
+        ];
+        let deps = PrdParser::infer_dependencies(&tasks);
+        assert!(deps.contains(&(1, 0)));
+    }
+
+    // ── #237 TaskRecommender ──────────────────────────────────────────────────
+
+    fn make_task(id: usize, priority: u8, complexity: u8, deps: Vec<usize>) -> PrdTask {
+        PrdTask {
+            id,
+            title: format!("Task {id}"),
+            description: String::new(),
+            parent_id: None,
+            priority,
+            complexity,
+            estimated_hours: 1.0,
+            dependencies: deps,
+            tags: vec![],
+        }
+    }
+
+    #[test]
+    fn recommender_excludes_completed() {
+        let tasks = vec![make_task(0, 9, 1, vec![]), make_task(1, 5, 5, vec![])];
+        let recs = TaskRecommender::recommend_next(&tasks, &[0]);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].task_id, 1);
+    }
+
+    #[test]
+    fn recommender_dep_not_ready_scores_zero_component() {
+        let tasks = vec![
+            make_task(0, 8, 1, vec![99]), // dep 99 not completed
+            make_task(1, 5, 5, vec![]),
+        ];
+        let recs = TaskRecommender::recommend_next(&tasks, &[]);
+        // Task 1 should score higher because task 0's dep is not satisfied
+        let id1 = recs.iter().find(|r| r.task_id == 1).unwrap();
+        let id0 = recs.iter().find(|r| r.task_id == 0).unwrap();
+        assert!(id1.score > id0.score);
+    }
+
+    #[test]
+    fn recommender_score_formula() {
+        // Single task: dep_ready=1 (no deps), priority=10 -> 1.0, complexity=1 -> 1.0
+        let tasks = vec![make_task(0, 10, 1, vec![])];
+        let recs = TaskRecommender::recommend_next(&tasks, &[]);
+        let expected = 0.4 * 1.0 + 0.35 * 1.0 + 0.25 * 1.0;
+        assert!((recs[0].score - expected).abs() < 1e-9);
+    }
+
+    // ── #239 TaskTree ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn task_tree_add_and_get() {
+        let mut tree = TaskTree::new();
+        let root = tree.add_task("Root", None);
+        let child = tree.add_task("Child", Some(root));
+        assert_eq!(tree.get_task(root).unwrap().title, "Root");
+        assert_eq!(tree.get_task(child).unwrap().parent_id, Some(root));
+    }
+
+    #[test]
+    fn task_tree_depth() {
+        let mut tree = TaskTree::new();
+        let a = tree.add_task("A", None);
+        let b = tree.add_task("B", Some(a));
+        let c = tree.add_task("C", Some(b));
+        assert_eq!(tree.depth(a), 0);
+        assert_eq!(tree.depth(b), 1);
+        assert_eq!(tree.depth(c), 2);
+    }
+
+    #[test]
+    fn task_tree_children_and_subtree() {
+        let mut tree = TaskTree::new();
+        let root = tree.add_task("Root", None);
+        let c1 = tree.add_task("C1", Some(root));
+        let c2 = tree.add_task("C2", Some(root));
+        let gc = tree.add_task("GC", Some(c1));
+        assert_eq!(tree.children(root).len(), 2);
+        let sub = tree.subtree(root);
+        assert_eq!(sub.len(), 3);
+        assert!(sub.iter().any(|t| t.id == gc));
+    }
+
+    #[test]
+    fn task_tree_progress() {
+        let mut tree = TaskTree::new();
+        let root = tree.add_task("Root", None);
+        let c1 = tree.add_task("C1", Some(root));
+        let c2 = tree.add_task("C2", Some(root));
+        tree.tasks.get_mut(&c1).unwrap().status = "done".to_string();
+        let _ = c2;
+        assert!((tree.progress(root) - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn task_tree_to_tree_string() {
+        let mut tree = TaskTree::new();
+        let root = tree.add_task("Root", None);
+        tree.add_task("Child", Some(root));
+        let s = tree.to_tree_string();
+        assert!(s.contains("Root"));
+        assert!(s.contains("Child"));
+        assert!(s.contains("  -")); // indented child
+    }
+
+    // ── #240 TimeTracker ──────────────────────────────────────────────────────
+
+    #[test]
+    fn time_tracker_start_complete_velocity() {
+        let mut tracker = TimeTracker::new();
+        tracker.start_task(1, 4.0);
+        tracker.complete_task(1, 2.0);
+        // velocity = 4.0 / 2.0 = 2.0
+        assert!((tracker.velocity() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn time_tracker_totals() {
+        let mut tracker = TimeTracker::new();
+        tracker.start_task(1, 3.0);
+        tracker.complete_task(1, 2.0);
+        tracker.start_task(2, 5.0);
+        tracker.complete_task(2, 6.0);
+        assert!((tracker.total_estimated() - 8.0).abs() < 1e-9);
+        assert!((tracker.total_actual() - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn time_tracker_no_completed_velocity_one() {
+        let tracker = TimeTracker::new();
+        assert!((tracker.velocity() - 1.0).abs() < 1e-9);
+    }
+
+    // ── #245 SreAgent ─────────────────────────────────────────────────────────
+
+    fn make_alert(id: &str, msg: &str) -> SreAlert {
+        SreAlert {
+            id: id.to_string(),
+            severity: "critical".to_string(),
+            source: "prometheus".to_string(),
+            message: msg.to_string(),
+            timestamp: 0,
+            acknowledged: false,
+        }
+    }
+
+    #[test]
+    fn sre_agent_ingest_and_pending() {
+        let mut agent = SreAgent::new();
+        agent.ingest_alert(make_alert("a1", "disk full"));
+        agent.ingest_alert(make_alert("a2", "cpu spike"));
+        assert_eq!(agent.pending_alerts().len(), 2);
+    }
+
+    #[test]
+    fn sre_agent_acknowledge() {
+        let mut agent = SreAgent::new();
+        agent.ingest_alert(make_alert("a1", "disk full"));
+        agent.acknowledge("a1");
+        assert_eq!(agent.pending_alerts().len(), 0);
+    }
+
+    #[test]
+    fn sre_agent_match_runbook() {
+        let mut agent = SreAgent::new();
+        agent.add_runbook(Runbook {
+            name: "disk-runbook".to_string(),
+            trigger_pattern: "disk full".to_string(),
+            steps: vec!["Check disk".to_string(), "Clean up".to_string()],
+        });
+        let alert = make_alert("a1", "disk full on /var");
+        let rb = agent.match_runbook(&alert);
+        assert!(rb.is_some());
+        assert_eq!(rb.unwrap().name, "disk-runbook");
+    }
+
+    #[test]
+    fn sre_agent_no_runbook_match() {
+        let mut agent = SreAgent::new();
+        agent.add_runbook(Runbook {
+            name: "disk-runbook".to_string(),
+            trigger_pattern: "disk full".to_string(),
+            steps: vec![],
+        });
+        let alert = make_alert("a1", "network timeout");
+        assert!(agent.match_runbook(&alert).is_none());
+    }
+
+    // ── #246 ProgressInferrer ─────────────────────────────────────────────────
+
+    #[test]
+    fn progress_infer_from_commits_matching() {
+        let msgs = vec![
+            "implement auth login".to_string(),
+            "fix auth token bug".to_string(),
+            "unrelated commit".to_string(),
+        ];
+        let p = ProgressInferrer::infer_from_commits("auth", &msgs);
+        assert!(p.confidence > 0.0);
+        assert_eq!(p.evidence.len(), 2);
+    }
+
+    #[test]
+    fn progress_infer_from_commits_empty() {
+        let p = ProgressInferrer::infer_from_commits("auth", &[]);
+        assert_eq!(p.percentage, 0.0);
+        assert_eq!(p.confidence, 0.0);
+    }
+
+    #[test]
+    fn progress_infer_from_tests() {
+        assert!((ProgressInferrer::infer_from_tests(10, 8) - 80.0).abs() < 1e-9);
+        assert_eq!(ProgressInferrer::infer_from_tests(0, 0), 0.0);
+    }
+
+    #[test]
+    fn progress_infer_from_files() {
+        assert!((ProgressInferrer::infer_from_files(4, 2) - 50.0).abs() < 1e-9);
+        assert!((ProgressInferrer::infer_from_files(4, 5) - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn progress_combined() {
+        let c = ProgressInferrer::combined(100.0, 80.0, 60.0);
+        let expected = 0.4 * 100.0 + 0.4 * 80.0 + 0.2 * 60.0;
+        assert!((c - expected).abs() < 1e-9);
     }
 }

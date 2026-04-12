@@ -667,69 +667,130 @@ impl BuiltinCatalog {
             },
             CatalogAgent {
                 name: "prd-analyst",
-                description: "Analyzes PRDs and requirements docs, breaks them into implementable tasks",
+                description:
+                    "Analyzes PRDs and requirements docs, breaks them into implementable tasks",
                 categories: &[Category::Productivity, Category::Documentation],
-                triggers: &["analyze prd", "prd analyst", "break down requirements", "requirements analysis"],
+                triggers: &[
+                    "analyze prd",
+                    "prd analyst",
+                    "break down requirements",
+                    "requirements analysis",
+                ],
             },
             CatalogAgent {
                 name: "api-architect",
-                description: "Designs REST/GraphQL APIs with proper resource modeling and versioning",
+                description:
+                    "Designs REST/GraphQL APIs with proper resource modeling and versioning",
                 categories: &[Category::Backend, Category::Documentation],
-                triggers: &["api architect", "design rest api", "resource modeling", "api versioning"],
+                triggers: &[
+                    "api architect",
+                    "design rest api",
+                    "resource modeling",
+                    "api versioning",
+                ],
             },
             CatalogAgent {
                 name: "database-architect",
                 description: "Designs schemas, indexes, and query optimization strategies",
                 categories: &[Category::Database],
-                triggers: &["database architect", "design schema", "index strategy", "query optimization"],
+                triggers: &[
+                    "database architect",
+                    "design schema",
+                    "index strategy",
+                    "query optimization",
+                ],
             },
             CatalogAgent {
                 name: "devops-pipelines",
                 description: "Creates and troubleshoots CI/CD pipelines across platforms",
                 categories: &[Category::DevOps, Category::Deployment],
-                triggers: &["devops pipelines", "ci cd pipeline", "pipeline setup", "pipeline debug"],
+                triggers: &[
+                    "devops pipelines",
+                    "ci cd pipeline",
+                    "pipeline setup",
+                    "pipeline debug",
+                ],
             },
             CatalogAgent {
                 name: "sre-responder",
-                description: "Handles incidents: alert triage, runbook execution, postmortem writing",
+                description:
+                    "Handles incidents: alert triage, runbook execution, postmortem writing",
                 categories: &[Category::DevOps, Category::Backend],
-                triggers: &["sre responder", "alert triage", "run runbook", "write postmortem"],
+                triggers: &[
+                    "sre responder",
+                    "alert triage",
+                    "run runbook",
+                    "write postmortem",
+                ],
             },
             CatalogAgent {
                 name: "compliance-auditor",
                 description: "Checks code against regulatory requirements (GDPR, SOC2, HIPAA)",
                 categories: &[Category::Security],
-                triggers: &["compliance audit", "gdpr check", "soc2 review", "hipaa compliance"],
+                triggers: &[
+                    "compliance audit",
+                    "gdpr check",
+                    "soc2 review",
+                    "hipaa compliance",
+                ],
             },
             CatalogAgent {
                 name: "mobile-dev",
-                description: "Specializes in React Native, Flutter, Swift, Kotlin mobile development",
+                description:
+                    "Specializes in React Native, Flutter, Swift, Kotlin mobile development",
                 categories: &[Category::Frontend],
-                triggers: &["mobile dev", "react native", "flutter app", "ios development", "android development"],
+                triggers: &[
+                    "mobile dev",
+                    "react native",
+                    "flutter app",
+                    "ios development",
+                    "android development",
+                ],
             },
             CatalogAgent {
                 name: "ml-engineer",
-                description: "Machine learning pipeline design, model training, experiment tracking",
+                description:
+                    "Machine learning pipeline design, model training, experiment tracking",
                 categories: &[Category::AI],
-                triggers: &["ml engineer", "machine learning pipeline", "model training", "experiment tracking"],
+                triggers: &[
+                    "ml engineer",
+                    "machine learning pipeline",
+                    "model training",
+                    "experiment tracking",
+                ],
             },
             CatalogAgent {
                 name: "tech-writer",
                 description: "Generates comprehensive technical documentation, API docs, guides",
                 categories: &[Category::Documentation],
-                triggers: &["tech writer", "technical writer", "write api docs", "documentation guide"],
+                triggers: &[
+                    "tech writer",
+                    "technical writer",
+                    "write api docs",
+                    "documentation guide",
+                ],
             },
             CatalogAgent {
                 name: "cost-optimizer",
                 description: "Analyzes cloud costs, recommends right-sizing and reserved instances",
                 categories: &[Category::DevOps, Category::Deployment],
-                triggers: &["cost optimizer", "cloud costs", "right sizing", "reserved instances"],
+                triggers: &[
+                    "cost optimizer",
+                    "cloud costs",
+                    "right sizing",
+                    "reserved instances",
+                ],
             },
             CatalogAgent {
                 name: "chaos-engineer",
                 description: "Designs chaos experiments, game days, and resilience testing",
                 categories: &[Category::Testing, Category::DevOps],
-                triggers: &["chaos engineer", "chaos experiment", "game day", "resilience testing"],
+                triggers: &[
+                    "chaos engineer",
+                    "chaos experiment",
+                    "game day",
+                    "resilience testing",
+                ],
             },
         ]
     }
