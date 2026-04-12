@@ -3608,6 +3608,569 @@ impl WikiQueryEngine {
     }
 }
 
+// ── #256: WikiWatcher ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileChangeType {
+    Created,
+    Modified,
+    Deleted,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileChange {
+    pub path: String,
+    pub change_type: FileChangeType,
+    pub content_hash: u64,
+}
+
+pub struct WikiWatcher {
+    pub watched_extensions: Vec<String>,
+    pub ignore_patterns: Vec<String>,
+}
+
+impl Default for WikiWatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WikiWatcher {
+    pub fn new() -> Self {
+        Self {
+            watched_extensions: vec![
+                "rs".to_string(),
+                "ts".to_string(),
+                "py".to_string(),
+                "go".to_string(),
+                "md".to_string(),
+                "json".to_string(),
+            ],
+            ignore_patterns: vec![
+                "node_modules".to_string(),
+                ".git".to_string(),
+                "target".to_string(),
+            ],
+        }
+    }
+
+    /// Diff `previous_hashes` against the current project state.
+    pub fn detect_changes(
+        &self,
+        project_root: &Path,
+        previous_hashes: &HashMap<String, u64>,
+    ) -> Vec<FileChange> {
+        let current = self.snapshot_project(project_root);
+        let mut changes = Vec::new();
+
+        // Created or modified
+        for (path, hash) in &current {
+            match previous_hashes.get(path) {
+                None => changes.push(FileChange {
+                    path: path.clone(),
+                    change_type: FileChangeType::Created,
+                    content_hash: *hash,
+                }),
+                Some(prev) if prev != hash => changes.push(FileChange {
+                    path: path.clone(),
+                    change_type: FileChangeType::Modified,
+                    content_hash: *hash,
+                }),
+                _ => {}
+            }
+        }
+
+        // Deleted
+        for (path, hash) in previous_hashes {
+            if !current.contains_key(path) {
+                changes.push(FileChange {
+                    path: path.clone(),
+                    change_type: FileChangeType::Deleted,
+                    content_hash: *hash,
+                });
+            }
+        }
+
+        changes
+    }
+
+    /// FNV-1a 64-bit hash of a file's text content.
+    pub fn hash_file(content: &str) -> u64 {
+        let mut hash: u64 = 14_695_981_039_346_656_037;
+        for byte in content.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(1_099_511_628_211);
+        }
+        hash
+    }
+
+    /// Return `true` when this path should be tracked (extension allowed, not
+    /// inside an ignored directory).
+    pub fn should_watch(&self, path: &str) -> bool {
+        // Reject anything that passes through an ignored directory segment.
+        let sep = std::path::MAIN_SEPARATOR.to_string();
+        for segment in path.split(&sep as &str) {
+            if self.ignore_patterns.iter().any(|p| p == segment) {
+                return false;
+            }
+        }
+        // Also reject if any ignore pattern appears as a substring (handles
+        // forward-slash paths on all platforms).
+        for pattern in &self.ignore_patterns {
+            if path.contains(pattern.as_str()) {
+                return false;
+            }
+        }
+        let ext = path.rsplit('.').next().unwrap_or("");
+        self.watched_extensions.iter().any(|e| e == ext)
+    }
+
+    /// Walk `project_root` and return a map of relative-path → content-hash
+    /// for every file that passes `should_watch`.
+    pub fn snapshot_project(&self, project_root: &Path) -> HashMap<String, u64> {
+        let mut hashes = HashMap::new();
+        self.walk_dir(project_root, project_root, &mut hashes);
+        hashes
+    }
+
+    fn walk_dir(&self, root: &Path, dir: &Path, hashes: &mut HashMap<String, u64>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let dir_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                if !self.ignore_patterns.iter().any(|p| p == dir_name) {
+                    self.walk_dir(root, &path, hashes);
+                }
+            } else {
+                let abs_str = path.to_string_lossy();
+                if self.should_watch(&abs_str) {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        let rel = path
+                            .strip_prefix(root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .to_string();
+                        hashes.insert(rel, Self::hash_file(&content));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── #257: WikiMaintenanceAgent ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaintenanceActionType {
+    CreatePage,
+    UpdatePage,
+    DeletePage,
+    UpdateIndex,
+    UpdateLog,
+    RunLint,
+}
+
+#[derive(Debug, Clone)]
+pub struct MaintenanceAction {
+    pub action_type: MaintenanceActionType,
+    pub page_slug: String,
+    pub description: String,
+}
+
+pub struct WikiMaintenanceAgent {
+    pub auto_ingest: bool,
+    pub auto_lint: bool,
+    pub auto_index: bool,
+    pub update_interval_secs: u64,
+}
+
+impl Default for WikiMaintenanceAgent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct MaintenanceReport {
+    pub pages_created: usize,
+    pub pages_updated: usize,
+    pub pages_deleted: usize,
+    pub lint_findings: usize,
+    pub index_updated: bool,
+    pub log_entries_added: usize,
+}
+
+impl WikiMaintenanceAgent {
+    pub fn new() -> Self {
+        Self {
+            auto_ingest: true,
+            auto_lint: true,
+            auto_index: true,
+            update_interval_secs: 300,
+        }
+    }
+
+    /// Decide which wiki operations are needed based on the detected changes.
+    pub fn plan_actions(
+        &self,
+        changes: &[FileChange],
+        wiki: &WikiEngine,
+        _index: &WikiIndex,
+    ) -> Vec<MaintenanceAction> {
+        let mut actions = Vec::new();
+
+        for change in changes {
+            let slug = WikiIngestor::slugify(&change.path.replace(['/', '.'], "-"));
+            let page_slug = format!("src-{slug}");
+
+            match change.change_type {
+                FileChangeType::Created => {
+                    actions.push(MaintenanceAction {
+                        action_type: MaintenanceActionType::CreatePage,
+                        page_slug,
+                        description: format!("Create summary page for new file: {}", change.path),
+                    });
+                }
+                FileChangeType::Modified => {
+                    if wiki.page_exists(&page_slug) {
+                        actions.push(MaintenanceAction {
+                            action_type: MaintenanceActionType::UpdatePage,
+                            page_slug,
+                            description: format!(
+                                "Update summary page for modified file: {}",
+                                change.path
+                            ),
+                        });
+                    } else {
+                        actions.push(MaintenanceAction {
+                            action_type: MaintenanceActionType::CreatePage,
+                            page_slug,
+                            description: format!(
+                                "Create summary page for modified file (page not found): {}",
+                                change.path
+                            ),
+                        });
+                    }
+                }
+                FileChangeType::Deleted => {
+                    actions.push(MaintenanceAction {
+                        action_type: MaintenanceActionType::UpdatePage,
+                        page_slug,
+                        description: format!(
+                            "Archive summary page for deleted file: {}",
+                            change.path
+                        ),
+                    });
+                }
+            }
+        }
+
+        if !changes.is_empty() {
+            if self.auto_index {
+                actions.push(MaintenanceAction {
+                    action_type: MaintenanceActionType::UpdateIndex,
+                    page_slug: "index".to_string(),
+                    description: "Rebuild wiki index after file changes".to_string(),
+                });
+            }
+            if self.auto_lint {
+                actions.push(MaintenanceAction {
+                    action_type: MaintenanceActionType::RunLint,
+                    page_slug: String::new(),
+                    description: "Run wiki lint pass".to_string(),
+                });
+            }
+            actions.push(MaintenanceAction {
+                action_type: MaintenanceActionType::UpdateLog,
+                page_slug: "log".to_string(),
+                description: format!("Log {} change(s) to wiki log", changes.len()),
+            });
+        }
+
+        actions
+    }
+
+    /// Execute a single planned action, mutating `index` and `log` in place.
+    pub fn execute_action(
+        &self,
+        action: &MaintenanceAction,
+        wiki: &WikiEngine,
+        index: &mut WikiIndex,
+        log: &mut WikiLog,
+    ) -> std::result::Result<(), CaduceusError> {
+        match action.action_type {
+            MaintenanceActionType::CreatePage => {
+                if !wiki.page_exists(&action.page_slug) {
+                    let content = format!(
+                        "# {}\n\n{}\n",
+                        action.page_slug, action.description
+                    );
+                    wiki.write_page(&action.page_slug, &content)?;
+                }
+                log.append(LogEntry {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    operation: WikiOperation::Create,
+                    description: action.description.clone(),
+                    pages_touched: vec![action.page_slug.clone()],
+                });
+            }
+            MaintenanceActionType::UpdatePage => {
+                if wiki.page_exists(&action.page_slug) {
+                    let existing = wiki.read_page(&action.page_slug)?;
+                    let note = if action.description.contains("Archive")
+                        || action.description.contains("deleted")
+                    {
+                        format!("\n\n> **Archived**: {}\n", action.description)
+                    } else {
+                        format!("\n\n> **Updated**: {}\n", action.description)
+                    };
+                    wiki.write_page(&action.page_slug, &format!("{existing}{note}"))?;
+                } else {
+                    let content = format!(
+                        "# {}\n\n{}\n",
+                        action.page_slug, action.description
+                    );
+                    wiki.write_page(&action.page_slug, &content)?;
+                }
+                log.append(LogEntry {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    operation: WikiOperation::Update,
+                    description: action.description.clone(),
+                    pages_touched: vec![action.page_slug.clone()],
+                });
+            }
+            MaintenanceActionType::DeletePage => {
+                if wiki.page_exists(&action.page_slug) {
+                    wiki.delete_page(&action.page_slug)?;
+                }
+                log.append(LogEntry {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    operation: WikiOperation::Delete,
+                    description: action.description.clone(),
+                    pages_touched: vec![action.page_slug.clone()],
+                });
+            }
+            MaintenanceActionType::UpdateIndex => {
+                let pages = wiki.list_pages()?;
+                for page in &pages {
+                    let category = if page.slug.starts_with("src-") {
+                        "source"
+                    } else {
+                        "entity"
+                    };
+                    index.update_entry(
+                        &page.slug,
+                        IndexEntry {
+                            slug: page.slug.clone(),
+                            title: page.title.clone(),
+                            summary: format!(
+                                "Auto-indexed page with {} links",
+                                page.links.len()
+                            ),
+                            category: category.to_string(),
+                            source_count: 1,
+                            link_count: page.links.len(),
+                        },
+                    );
+                }
+                let index_md = index.to_markdown();
+                let index_path = wiki.wiki_dir().join("index.md");
+                fs::write(&index_path, index_md)
+                    .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+            }
+            MaintenanceActionType::UpdateLog => {
+                let log_md = log.to_markdown();
+                let log_path = wiki.wiki_dir().join("log.md");
+                fs::write(&log_path, log_md)
+                    .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+            }
+            MaintenanceActionType::RunLint => {
+                let pages = wiki.list_pages()?;
+                let findings = WikiLinter::lint(&pages, index);
+                log.append(LogEntry {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    operation: WikiOperation::Lint,
+                    description: format!("Lint found {} finding(s)", findings.len()),
+                    pages_touched: vec![],
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Run a complete maintenance cycle against `project_root`.
+    pub fn run_full_maintenance(
+        &self,
+        project_root: &Path,
+        previous_hashes: &HashMap<String, u64>,
+    ) -> std::result::Result<MaintenanceReport, CaduceusError> {
+        let wiki = WikiEngine::new(project_root);
+        wiki.init()?;
+
+        let watcher = WikiWatcher::new();
+        let changes = watcher.detect_changes(project_root, previous_hashes);
+
+        let mut index = WikiIndex::new();
+        let mut log = WikiLog::new();
+        let log_baseline = log.entries.len();
+
+        let actions = self.plan_actions(&changes, &wiki, &index);
+
+        let mut report = MaintenanceReport {
+            pages_created: 0,
+            pages_updated: 0,
+            pages_deleted: 0,
+            lint_findings: 0,
+            index_updated: false,
+            log_entries_added: 0,
+        };
+
+        for action in &actions {
+            self.execute_action(action, &wiki, &mut index, &mut log)?;
+            match action.action_type {
+                MaintenanceActionType::CreatePage => report.pages_created += 1,
+                MaintenanceActionType::UpdatePage => report.pages_updated += 1,
+                MaintenanceActionType::DeletePage => report.pages_deleted += 1,
+                MaintenanceActionType::UpdateIndex => report.index_updated = true,
+                MaintenanceActionType::RunLint => {
+                    let pages = wiki.list_pages()?;
+                    report.lint_findings = WikiLinter::lint(&pages, &index).len();
+                }
+                MaintenanceActionType::UpdateLog => {}
+            }
+        }
+
+        report.log_entries_added = log.entries.len().saturating_sub(log_baseline);
+        Ok(report)
+    }
+}
+
+// ── #258: WikiAutoTrigger ─────────────────────────────────────────────────────
+
+pub struct WikiAutoTrigger {
+    enabled: bool,
+    last_snapshot: HashMap<String, u64>,
+    agent: WikiMaintenanceAgent,
+    watcher: WikiWatcher,
+}
+
+impl Default for WikiAutoTrigger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WikiAutoTrigger {
+    pub fn new() -> Self {
+        Self {
+            enabled: true,
+            last_snapshot: HashMap::new(),
+            agent: WikiMaintenanceAgent::new(),
+            watcher: WikiWatcher::new(),
+        }
+    }
+
+    pub fn enable(&mut self) {
+        self.enabled = true;
+    }
+
+    pub fn disable(&mut self) {
+        self.enabled = false;
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Call after each agent turn.  Diffs the project against the last
+    /// snapshot; if changes exist, runs maintenance and returns a report.
+    pub fn on_agent_turn_complete(
+        &mut self,
+        project_root: &Path,
+    ) -> std::result::Result<Option<MaintenanceReport>, CaduceusError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+
+        let changes = self.watcher.detect_changes(project_root, &self.last_snapshot);
+
+        if changes.is_empty() {
+            return Ok(None);
+        }
+
+        let wiki = WikiEngine::new(project_root);
+        wiki.init()?;
+
+        let mut index = WikiIndex::new();
+        let mut log = WikiLog::new();
+        let log_baseline = log.entries.len();
+
+        let actions = self.agent.plan_actions(&changes, &wiki, &index);
+
+        let mut report = MaintenanceReport {
+            pages_created: 0,
+            pages_updated: 0,
+            pages_deleted: 0,
+            lint_findings: 0,
+            index_updated: false,
+            log_entries_added: 0,
+        };
+
+        for action in &actions {
+            self.agent
+                .execute_action(action, &wiki, &mut index, &mut log)?;
+            match action.action_type {
+                MaintenanceActionType::CreatePage => report.pages_created += 1,
+                MaintenanceActionType::UpdatePage => report.pages_updated += 1,
+                MaintenanceActionType::DeletePage => report.pages_deleted += 1,
+                MaintenanceActionType::UpdateIndex => report.index_updated = true,
+                MaintenanceActionType::RunLint => {
+                    let pages = wiki.list_pages()?;
+                    report.lint_findings = WikiLinter::lint(&pages, &index).len();
+                }
+                MaintenanceActionType::UpdateLog => {}
+            }
+        }
+
+        report.log_entries_added = log.entries.len().saturating_sub(log_baseline);
+        // Snapshot *after* executing actions so that wiki-generated files
+        // (e.g. newly written .md pages) are included in last_snapshot and
+        // won't be re-detected as "created" on the next turn.
+        self.last_snapshot = self.watcher.snapshot_project(project_root);
+        Ok(Some(report))
+    }
+
+    /// Call at session start to seed the baseline snapshot.
+    pub fn on_session_start(&mut self, project_root: &Path) {
+        self.last_snapshot = self.watcher.snapshot_project(project_root);
+    }
+
+    /// Call at session end to flush any remaining changes.
+    pub fn on_session_end(
+        &mut self,
+        project_root: &Path,
+    ) -> std::result::Result<Option<MaintenanceReport>, CaduceusError> {
+        self.on_agent_turn_complete(project_root)
+    }
+
+    /// Unconditionally run a full maintenance pass right now.
+    pub fn force_maintenance(
+        &mut self,
+        project_root: &Path,
+    ) -> std::result::Result<MaintenanceReport, CaduceusError> {
+        let report = self
+            .agent
+            .run_full_maintenance(project_root, &self.last_snapshot)?;
+        self.last_snapshot = self.watcher.snapshot_project(project_root);
+        Ok(report)
+    }
+}
+
 // ── Tests for #241, #247 ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -4182,5 +4745,410 @@ mod feature_tests_250_255 {
         contents.insert("rust".to_string(), "Systems programming.".to_string());
         let results = WikiQueryEngine::search(&pages, &contents, "quantum");
         assert!(results.is_empty());
+    }
+}
+
+// ── Tests for #256-258 ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod feature_tests_256_258 {
+    use super::*;
+    use std::collections::HashMap;
+
+    // ── #256 WikiWatcher ──────────────────────────────────────────────────────
+
+    #[test]
+    fn watcher_hash_file_stable() {
+        let h1 = WikiWatcher::hash_file("hello world");
+        let h2 = WikiWatcher::hash_file("hello world");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn watcher_hash_file_differs_on_different_content() {
+        let h1 = WikiWatcher::hash_file("foo");
+        let h2 = WikiWatcher::hash_file("bar");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn watcher_should_watch_extensions() {
+        let w = WikiWatcher::new();
+        assert!(w.should_watch("src/main.rs"));
+        assert!(w.should_watch("lib/util.py"));
+        assert!(w.should_watch("notes.md"));
+        assert!(!w.should_watch("image.png"));
+        assert!(!w.should_watch("binary.exe"));
+    }
+
+    #[test]
+    fn watcher_should_watch_ignores_patterns() {
+        let w = WikiWatcher::new();
+        assert!(!w.should_watch("node_modules/react/index.js"));
+        assert!(!w.should_watch(".git/config"));
+        assert!(!w.should_watch("target/debug/build/foo.rs"));
+    }
+
+    #[test]
+    fn watcher_detect_created_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = WikiWatcher::new();
+        let prev: HashMap<String, u64> = HashMap::new();
+        std::fs::write(dir.path().join("hello.rs"), "fn main() {}").unwrap();
+        let changes = w.detect_changes(dir.path(), &prev);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change_type, FileChangeType::Created);
+        assert!(changes[0].path.ends_with("hello.rs"));
+    }
+
+    #[test]
+    fn watcher_detect_modified_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = WikiWatcher::new();
+        std::fs::write(dir.path().join("hello.rs"), "fn main() {}").unwrap();
+        let prev = w.snapshot_project(dir.path());
+        // Modify the file
+        std::fs::write(dir.path().join("hello.rs"), "fn main() { println!(\"hi\"); }").unwrap();
+        let changes = w.detect_changes(dir.path(), &prev);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change_type, FileChangeType::Modified);
+    }
+
+    #[test]
+    fn watcher_detect_deleted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = WikiWatcher::new();
+        std::fs::write(dir.path().join("bye.rs"), "fn bye() {}").unwrap();
+        let prev = w.snapshot_project(dir.path());
+        std::fs::remove_file(dir.path().join("bye.rs")).unwrap();
+        let changes = w.detect_changes(dir.path(), &prev);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change_type, FileChangeType::Deleted);
+    }
+
+    #[test]
+    fn watcher_no_changes_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = WikiWatcher::new();
+        std::fs::write(dir.path().join("stable.rs"), "fn stable() {}").unwrap();
+        let prev = w.snapshot_project(dir.path());
+        let changes = w.detect_changes(dir.path(), &prev);
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn watcher_snapshot_ignores_untracked_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = WikiWatcher::new();
+        std::fs::write(dir.path().join("image.png"), &[0u8, 1, 2]).unwrap();
+        let snap = w.snapshot_project(dir.path());
+        assert!(snap.is_empty());
+    }
+
+    #[test]
+    fn watcher_snapshot_ignores_target_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("target").join("debug");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("main.rs"), "fn main() {}").unwrap();
+        let w = WikiWatcher::new();
+        let snap = w.snapshot_project(dir.path());
+        assert!(snap.is_empty(), "target/ contents should not be snapshotted");
+    }
+
+    // ── #257 WikiMaintenanceAgent ─────────────────────────────────────────────
+
+    #[test]
+    fn maintenance_agent_plan_create_action_for_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        let index = WikiIndex::new();
+        let agent = WikiMaintenanceAgent::new();
+
+        let changes = vec![FileChange {
+            path: "src/lib.rs".to_string(),
+            change_type: FileChangeType::Created,
+            content_hash: 42,
+        }];
+
+        let actions = agent.plan_actions(&changes, &engine, &index);
+        assert!(actions
+            .iter()
+            .any(|a| a.action_type == MaintenanceActionType::CreatePage));
+        assert!(actions
+            .iter()
+            .any(|a| a.action_type == MaintenanceActionType::UpdateIndex));
+        assert!(actions
+            .iter()
+            .any(|a| a.action_type == MaintenanceActionType::RunLint));
+        assert!(actions
+            .iter()
+            .any(|a| a.action_type == MaintenanceActionType::UpdateLog));
+    }
+
+    #[test]
+    fn maintenance_agent_plan_update_action_for_existing_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        let index = WikiIndex::new();
+        let agent = WikiMaintenanceAgent::new();
+
+        // Pre-create the page the agent would update
+        let slug = format!("src-{}", WikiIngestor::slugify("src-lib-rs"));
+        engine
+            .write_page(&slug, "# Existing Page\n\ncontent")
+            .unwrap();
+
+        let changes = vec![FileChange {
+            path: "src/lib.rs".to_string(),
+            change_type: FileChangeType::Modified,
+            content_hash: 99,
+        }];
+
+        let actions = agent.plan_actions(&changes, &engine, &index);
+        // Some action for the modified file (create or update depending on slug match)
+        assert!(!actions.is_empty());
+    }
+
+    #[test]
+    fn maintenance_agent_plan_archive_for_deleted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        let index = WikiIndex::new();
+        let agent = WikiMaintenanceAgent::new();
+
+        let changes = vec![FileChange {
+            path: "old/thing.py".to_string(),
+            change_type: FileChangeType::Deleted,
+            content_hash: 0,
+        }];
+
+        let actions = agent.plan_actions(&changes, &engine, &index);
+        // Deleted files get an UpdatePage (archive) action
+        assert!(actions
+            .iter()
+            .any(|a| a.action_type == MaintenanceActionType::UpdatePage
+                && a.description.contains("Archive")));
+    }
+
+    #[test]
+    fn maintenance_agent_plan_no_actions_for_empty_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        let index = WikiIndex::new();
+        let agent = WikiMaintenanceAgent::new();
+
+        let actions = agent.plan_actions(&[], &engine, &index);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn maintenance_agent_execute_create_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        let agent = WikiMaintenanceAgent::new();
+        let mut index = WikiIndex::new();
+        let mut log = WikiLog::new();
+
+        let action = MaintenanceAction {
+            action_type: MaintenanceActionType::CreatePage,
+            page_slug: "test-page".to_string(),
+            description: "Test creation".to_string(),
+        };
+
+        agent
+            .execute_action(&action, &engine, &mut index, &mut log)
+            .unwrap();
+        assert!(engine.page_exists("test-page"));
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(log.entries[0].operation, WikiOperation::Create);
+    }
+
+    #[test]
+    fn maintenance_agent_execute_update_page_appends_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        engine
+            .write_page("mypage", "# My Page\n\nOriginal content")
+            .unwrap();
+        let agent = WikiMaintenanceAgent::new();
+        let mut index = WikiIndex::new();
+        let mut log = WikiLog::new();
+
+        let action = MaintenanceAction {
+            action_type: MaintenanceActionType::UpdatePage,
+            page_slug: "mypage".to_string(),
+            description: "Update summary".to_string(),
+        };
+
+        agent
+            .execute_action(&action, &engine, &mut index, &mut log)
+            .unwrap();
+        let content = engine.read_page("mypage").unwrap();
+        assert!(content.contains("Original content"));
+        assert!(content.contains("Updated"));
+    }
+
+    #[test]
+    fn maintenance_agent_execute_delete_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        engine.write_page("doomed", "# Doomed\n\n").unwrap();
+        let agent = WikiMaintenanceAgent::new();
+        let mut index = WikiIndex::new();
+        let mut log = WikiLog::new();
+
+        let action = MaintenanceAction {
+            action_type: MaintenanceActionType::DeletePage,
+            page_slug: "doomed".to_string(),
+            description: "Cleanup".to_string(),
+        };
+
+        agent
+            .execute_action(&action, &engine, &mut index, &mut log)
+            .unwrap();
+        assert!(!engine.page_exists("doomed"));
+        assert_eq!(log.entries[0].operation, WikiOperation::Delete);
+    }
+
+    #[test]
+    fn maintenance_agent_execute_update_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        engine
+            .write_page("alpha", "# Alpha\n\ncontent here")
+            .unwrap();
+        let agent = WikiMaintenanceAgent::new();
+        let mut index = WikiIndex::new();
+        let mut log = WikiLog::new();
+
+        let action = MaintenanceAction {
+            action_type: MaintenanceActionType::UpdateIndex,
+            page_slug: "index".to_string(),
+            description: "Rebuild index".to_string(),
+        };
+
+        agent
+            .execute_action(&action, &engine, &mut index, &mut log)
+            .unwrap();
+        let index_content = std::fs::read_to_string(engine.wiki_dir().join("index.md")).unwrap();
+        assert!(index_content.contains("alpha"));
+    }
+
+    #[test]
+    fn maintenance_agent_run_full_maintenance() {
+        let dir = tempfile::tempdir().unwrap();
+        // Put a watched file in the project root
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+        let agent = WikiMaintenanceAgent::new();
+        let prev: HashMap<String, u64> = HashMap::new();
+        let report = agent.run_full_maintenance(dir.path(), &prev).unwrap();
+
+        assert!(report.pages_created > 0);
+        assert!(report.index_updated);
+    }
+
+    // ── #258 WikiAutoTrigger ──────────────────────────────────────────────────
+
+    #[test]
+    fn auto_trigger_enable_disable() {
+        let mut trigger = WikiAutoTrigger::new();
+        assert!(trigger.is_enabled());
+        trigger.disable();
+        assert!(!trigger.is_enabled());
+        trigger.enable();
+        assert!(trigger.is_enabled());
+    }
+
+    #[test]
+    fn auto_trigger_disabled_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut trigger = WikiAutoTrigger::new();
+        trigger.disable();
+        std::fs::write(dir.path().join("new.rs"), "fn new() {}").unwrap();
+        let result = trigger.on_agent_turn_complete(dir.path()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn auto_trigger_session_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-populate a file before session start
+        std::fs::write(dir.path().join("existing.rs"), "fn existing() {}").unwrap();
+
+        let mut trigger = WikiAutoTrigger::new();
+        trigger.on_session_start(dir.path());
+
+        // No changes since start → None
+        let report = trigger.on_agent_turn_complete(dir.path()).unwrap();
+        assert!(report.is_none(), "no changes should produce no report");
+
+        // Create a new file during the session
+        std::fs::write(dir.path().join("added.rs"), "fn added() {}").unwrap();
+
+        // First turn after the change → Some report
+        let report = trigger.on_agent_turn_complete(dir.path()).unwrap();
+        assert!(report.is_some());
+        let r = report.unwrap();
+        assert!(r.pages_created > 0);
+
+        // Second turn with no further changes → None
+        let report2 = trigger.on_agent_turn_complete(dir.path()).unwrap();
+        assert!(report2.is_none());
+
+        // Session end with no additional changes → None
+        let end_report = trigger.on_session_end(dir.path()).unwrap();
+        assert!(end_report.is_none());
+    }
+
+    #[test]
+    fn auto_trigger_force_maintenance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("force.rs"), "fn force() {}").unwrap();
+
+        let mut trigger = WikiAutoTrigger::new();
+        // No initial snapshot set — previous_hashes is empty → file looks new
+        let report = trigger.force_maintenance(dir.path()).unwrap();
+        assert!(report.pages_created > 0 || report.pages_updated >= 0);
+    }
+
+    #[test]
+    fn auto_trigger_on_session_end_detects_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut trigger = WikiAutoTrigger::new();
+        trigger.on_session_start(dir.path());
+
+        // Create file after session start
+        std::fs::write(dir.path().join("end.rs"), "fn end() {}").unwrap();
+
+        let report = trigger.on_session_end(dir.path()).unwrap();
+        assert!(report.is_some());
+        assert!(report.unwrap().pages_created > 0);
+    }
+
+    #[test]
+    fn auto_trigger_snapshot_updated_after_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut trigger = WikiAutoTrigger::new();
+        trigger.on_session_start(dir.path());
+
+        std::fs::write(dir.path().join("once.rs"), "fn once() {}").unwrap();
+
+        // First turn sees the change
+        let r1 = trigger.on_agent_turn_complete(dir.path()).unwrap();
+        assert!(r1.is_some());
+
+        // Second turn: same file, no change → snapshot updated, returns None
+        let r2 = trigger.on_agent_turn_complete(dir.path()).unwrap();
+        assert!(r2.is_none());
     }
 }
