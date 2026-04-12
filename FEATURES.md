@@ -701,6 +701,8 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 | 245 | SRE agent mode | Automated incident detection, diagnosis, and remediation for cloud infrastructure | Azure-MCP | 📋 | P3 | `caduceus-orchestrator` |
 | 246 | Progress inference | AI infers task completion percentage from code changes, test results, and commit history | Agentic-Tools | 📋 | P2 | `caduceus-orchestrator` |
 | 247 | Git-trackable task data | Task/project data stored as JSON files alongside code for version control | Agentic-Tools | 📋 | P2 | `caduceus-storage` |
+| 248 | WebAuthn/FIDO2 passkey authentication | Passwordless authentication for cloud deployment using hardware security keys | OpenCode-Cloud | 💡 | P3 | `caduceus-permissions` |
+| 249 | Two-factor authentication (2FA) | TOTP/SMS second factor for enterprise deployments | OpenCode-Cloud | 💡 | P3 | `caduceus-permissions` |
 
 ---
 
