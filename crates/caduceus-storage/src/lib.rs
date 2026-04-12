@@ -2863,10 +2863,8 @@ impl WikiEngine {
 
     /// Create directory structure, `index.md`, and `log.md` if they do not exist.
     pub fn init(&self) -> std::result::Result<(), CaduceusError> {
-        fs::create_dir_all(&self.wiki_dir)
-            .map_err(|e| CaduceusError::Storage(e.to_string()))?;
-        fs::create_dir_all(&self.sources_dir)
-            .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+        fs::create_dir_all(&self.wiki_dir).map_err(|e| CaduceusError::Storage(e.to_string()))?;
+        fs::create_dir_all(&self.sources_dir).map_err(|e| CaduceusError::Storage(e.to_string()))?;
 
         let index_path = self.wiki_dir.join("index.md");
         if !index_path.exists() {
@@ -2900,8 +2898,8 @@ impl WikiEngine {
             return Ok(Vec::new());
         }
         let mut pages = Vec::new();
-        for entry in fs::read_dir(&self.wiki_dir)
-            .map_err(|e| CaduceusError::Storage(e.to_string()))?
+        for entry in
+            fs::read_dir(&self.wiki_dir).map_err(|e| CaduceusError::Storage(e.to_string()))?
         {
             let entry = entry.map_err(|e| CaduceusError::Storage(e.to_string()))?;
             let path = entry.path();
@@ -2914,10 +2912,10 @@ impl WikiEngine {
                 if name == "index" || name == "log" {
                     continue;
                 }
-                let content = fs::read_to_string(&path)
-                    .map_err(|e| CaduceusError::Storage(e.to_string()))?;
-                let meta = fs::metadata(&path)
-                    .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+                let content =
+                    fs::read_to_string(&path).map_err(|e| CaduceusError::Storage(e.to_string()))?;
+                let meta =
+                    fs::metadata(&path).map_err(|e| CaduceusError::Storage(e.to_string()))?;
                 let last_modified = meta
                     .modified()
                     .ok()
@@ -3098,8 +3096,7 @@ impl WikiIndex {
                             .trim_start_matches('—')
                             .trim()
                             .to_string();
-                        let (source_count, link_count) =
-                            parse_index_counts(rest).unwrap_or((0, 0));
+                        let (source_count, link_count) = parse_index_counts(rest).unwrap_or((0, 0));
                         let title = slug
                             .split('-')
                             .map(capitalise)
@@ -3153,20 +3150,8 @@ fn parse_index_counts(s: &str) -> Option<(usize, usize)> {
     let paren = s.find('(')?;
     let inner = &s[paren + 1..s.find(')')?];
     let mut parts = inner.split(',');
-    let src = parts
-        .next()?
-        .split(':')
-        .nth(1)?
-        .trim()
-        .parse()
-        .ok()?;
-    let lnk = parts
-        .next()?
-        .split(':')
-        .nth(1)?
-        .trim()
-        .parse()
-        .ok()?;
+    let src = parts.next()?.split(':').nth(1)?.trim().parse().ok()?;
+    let lnk = parts.next()?.split(':').nth(1)?.trim().parse().ok()?;
     Some((src, lnk))
 }
 
@@ -3242,10 +3227,7 @@ impl WikiLog {
     }
 
     pub fn by_operation(&self, op: &WikiOperation) -> Vec<&LogEntry> {
-        self.entries
-            .iter()
-            .filter(|e| &e.operation == op)
-            .collect()
+        self.entries.iter().filter(|e| &e.operation == op).collect()
     }
 
     /// Render as `log.md`.  Each entry: `## [timestamp] Op | description`
@@ -3282,8 +3264,8 @@ impl WikiLog {
                     } else {
                         (after, "")
                     };
-                    let operation = WikiOperation::from_str(op_str)
-                        .unwrap_or(WikiOperation::Update);
+                    let operation =
+                        WikiOperation::from_str(op_str).unwrap_or(WikiOperation::Update);
                     let mut pages_touched = Vec::new();
                     if let Some(next) = lines.peek() {
                         if let Some(p) = next.trim().strip_prefix("Pages: ") {
@@ -3469,10 +3451,7 @@ impl WikiLinter {
                 category: LintCategory::OrphanPage,
                 page: p.slug.clone(),
                 description: format!("'{}' has no inbound links", p.slug),
-                suggestion: format!(
-                    "Add [[{}]] to a related page or the index",
-                    p.slug
-                ),
+                suggestion: format!("Add [[{}]] to a related page or the index", p.slug),
             })
             .collect()
     }
@@ -3589,8 +3568,7 @@ impl WikiQueryEngine {
         contents: &HashMap<String, String>,
         slugs: &[String],
     ) -> String {
-        let slug_set: std::collections::HashSet<&str> =
-            slugs.iter().map(String::as_str).collect();
+        let slug_set: std::collections::HashSet<&str> = slugs.iter().map(String::as_str).collect();
         pages
             .iter()
             .filter(|p| slug_set.contains(p.slug.as_str()))
@@ -3740,10 +3718,7 @@ impl WikiWatcher {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                let dir_name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
+                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if !self.ignore_patterns.iter().any(|p| p == dir_name) {
                     self.walk_dir(root, &path, hashes);
                 }
@@ -3906,10 +3881,7 @@ impl WikiMaintenanceAgent {
         match action.action_type {
             MaintenanceActionType::CreatePage => {
                 if !wiki.page_exists(&action.page_slug) {
-                    let content = format!(
-                        "# {}\n\n{}\n",
-                        action.page_slug, action.description
-                    );
+                    let content = format!("# {}\n\n{}\n", action.page_slug, action.description);
                     wiki.write_page(&action.page_slug, &content)?;
                 }
                 log.append(LogEntry {
@@ -3931,10 +3903,7 @@ impl WikiMaintenanceAgent {
                     };
                     wiki.write_page(&action.page_slug, &format!("{existing}{note}"))?;
                 } else {
-                    let content = format!(
-                        "# {}\n\n{}\n",
-                        action.page_slug, action.description
-                    );
+                    let content = format!("# {}\n\n{}\n", action.page_slug, action.description);
                     wiki.write_page(&action.page_slug, &content)?;
                 }
                 log.append(LogEntry {
@@ -3968,10 +3937,7 @@ impl WikiMaintenanceAgent {
                         IndexEntry {
                             slug: page.slug.clone(),
                             title: page.title.clone(),
-                            summary: format!(
-                                "Auto-indexed page with {} links",
-                                page.links.len()
-                            ),
+                            summary: format!("Auto-indexed page with {} links", page.links.len()),
                             category: category.to_string(),
                             source_count: 1,
                             link_count: page.links.len(),
@@ -3986,8 +3952,7 @@ impl WikiMaintenanceAgent {
             MaintenanceActionType::UpdateLog => {
                 let log_md = log.to_markdown();
                 let log_path = wiki.wiki_dir().join("log.md");
-                fs::write(&log_path, log_md)
-                    .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+                fs::write(&log_path, log_md).map_err(|e| CaduceusError::Storage(e.to_string()))?;
             }
             MaintenanceActionType::RunLint => {
                 let pages = wiki.list_pages()?;
@@ -4097,7 +4062,9 @@ impl WikiAutoTrigger {
             return Ok(None);
         }
 
-        let changes = self.watcher.detect_changes(project_root, &self.last_snapshot);
+        let changes = self
+            .watcher
+            .detect_changes(project_root, &self.last_snapshot);
 
         if changes.is_empty() {
             return Ok(None);
@@ -4351,7 +4318,9 @@ mod feature_tests_250_255 {
         let dir = tempfile::tempdir().unwrap();
         let engine = WikiEngine::new(dir.path());
         engine.init().unwrap();
-        engine.write_page("rust-tips", "# Rust Tips\n\nUse clippy.").unwrap();
+        engine
+            .write_page("rust-tips", "# Rust Tips\n\nUse clippy.")
+            .unwrap();
         assert!(engine.page_exists("rust-tips"));
         let content = engine.read_page("rust-tips").unwrap();
         assert!(content.contains("Use clippy"));
@@ -4402,7 +4371,9 @@ mod feature_tests_250_255 {
         let dir = tempfile::tempdir().unwrap();
         let engine = WikiEngine::new(dir.path());
         engine.init().unwrap();
-        engine.write_page("rust-tips", "# Rust Tips\nUse clippy.").unwrap();
+        engine
+            .write_page("rust-tips", "# Rust Tips\nUse clippy.")
+            .unwrap();
         engine
             .write_page("python-tips", "# Python Tips\nUse black.")
             .unwrap();
@@ -4592,13 +4563,14 @@ mod feature_tests_250_255 {
     fn ingestor_extract_entities() {
         let src = "Alice and Bob went to London to meet Charlie.";
         let entities = WikiIngestor::extract_entities(src);
-        assert!(entities.iter().any(|e| e == "Alice" || e == "London" || e == "Charlie"));
+        assert!(entities
+            .iter()
+            .any(|e| e == "Alice" || e == "London" || e == "Charlie"));
     }
 
     #[test]
     fn ingestor_extract_key_claims() {
-        let src =
-            "The model achieves 95% accuracy. It trains in under an hour. Short.";
+        let src = "The model achieves 95% accuracy. It trains in under an hour. Short.";
         let claims = WikiIngestor::extract_key_claims(src);
         assert!(!claims.is_empty());
         assert!(claims.iter().any(|c| c.contains("accuracy")));
@@ -4606,7 +4578,8 @@ mod feature_tests_250_255 {
 
     #[test]
     fn ingestor_generate_summary_page() {
-        let src = "Alice founded the company in 2010. She built a great team. The company grew fast.";
+        let src =
+            "Alice founded the company in 2010. She built a great team. The company grew fast.";
         let page = WikiIngestor::generate_summary_page("Alice Co", src);
         assert!(page.starts_with("# Alice Co"));
         assert!(page.contains("## Summary"));
@@ -4649,7 +4622,10 @@ mod feature_tests_250_255 {
 
     #[test]
     fn linter_find_empty_pages() {
-        let pages = vec![make_page("empty", 0, vec![]), make_page("full", 100, vec![])];
+        let pages = vec![
+            make_page("empty", 0, vec![]),
+            make_page("full", 100, vec![]),
+        ];
         let idx = WikiIndex::new();
         let findings = WikiLinter::find_empty_pages(&pages);
         assert_eq!(findings.len(), 1);
@@ -4723,8 +4699,7 @@ mod feature_tests_250_255 {
         let mut contents = HashMap::new();
         contents.insert("a".to_string(), "Content of A.".to_string());
         contents.insert("b".to_string(), "Content of B.".to_string());
-        let ctx =
-            WikiQueryEngine::gather_context(&pages, &contents, &["a".to_string()]);
+        let ctx = WikiQueryEngine::gather_context(&pages, &contents, &["a".to_string()]);
         assert!(ctx.contains("Content of A"));
         assert!(!ctx.contains("Content of B"));
     }
@@ -4808,7 +4783,11 @@ mod feature_tests_256_258 {
         std::fs::write(dir.path().join("hello.rs"), "fn main() {}").unwrap();
         let prev = w.snapshot_project(dir.path());
         // Modify the file
-        std::fs::write(dir.path().join("hello.rs"), "fn main() { println!(\"hi\"); }").unwrap();
+        std::fs::write(
+            dir.path().join("hello.rs"),
+            "fn main() { println!(\"hi\"); }",
+        )
+        .unwrap();
         let changes = w.detect_changes(dir.path(), &prev);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].change_type, FileChangeType::Modified);
@@ -4853,7 +4832,10 @@ mod feature_tests_256_258 {
         std::fs::write(target_dir.join("main.rs"), "fn main() {}").unwrap();
         let w = WikiWatcher::new();
         let snap = w.snapshot_project(dir.path());
-        assert!(snap.is_empty(), "target/ contents should not be snapshotted");
+        assert!(
+            snap.is_empty(),
+            "target/ contents should not be snapshotted"
+        );
     }
 
     // ── #257 WikiMaintenanceAgent ─────────────────────────────────────────────
