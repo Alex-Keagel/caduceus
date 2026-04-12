@@ -960,6 +960,112 @@ pub async fn execute_tool_calls(
     results
 }
 
+// ── #234: Agent Execution Tree Visualizer ─────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VizTreeNode {
+    pub id: String,
+    pub label: String,
+    /// One of: "active", "succeeded", "failed", "pruned"
+    pub status: String,
+    pub parent: Option<String>,
+    pub error: Option<String>,
+    pub depth: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExecutionTreeViz {
+    pub nodes: Vec<VizTreeNode>,
+}
+
+impl ExecutionTreeViz {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_node(&mut self, node: VizTreeNode) {
+        self.nodes.push(node);
+    }
+
+    pub fn node_color(status: &str) -> &'static str {
+        match status {
+            "active" => "#f59e0b",    // amber / yellow
+            "succeeded" => "#10b981", // green
+            "failed" => "#ef4444",    // red
+            "pruned" => "#6b7280",    // gray
+            _ => "#6b7280",
+        }
+    }
+
+    /// Emit React Flow nodes + edges JSON.
+    pub fn to_react_flow_json(&self) -> serde_json::Value {
+        let rf_nodes: Vec<serde_json::Value> = self
+            .nodes
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "type": "default",
+                    "data": {
+                        "label": n.label,
+                        "status": n.status,
+                        "error": n.error,
+                    },
+                    "style": {
+                        "background": Self::node_color(&n.status),
+                        "color": "#fff",
+                        "borderRadius": "8px",
+                    },
+                    "position": {
+                        "x": (n.depth as f64) * 200.0,
+                        "y": 0.0,  // caller is responsible for layout
+                    }
+                })
+            })
+            .collect();
+
+        let rf_edges: Vec<serde_json::Value> = self
+            .nodes
+            .iter()
+            .filter_map(|n| {
+                n.parent.as_ref().map(|p| {
+                    serde_json::json!({
+                        "id": format!("{}->{}", p, n.id),
+                        "source": p,
+                        "target": n.id,
+                        "type": "smoothstep",
+                    })
+                })
+            })
+            .collect();
+
+        serde_json::json!({ "nodes": rf_nodes, "edges": rf_edges })
+    }
+
+    /// Emit Mermaid `graph TD` flowchart syntax.
+    pub fn to_mermaid(&self) -> String {
+        let mut out = String::from("graph TD\n");
+        for node in &self.nodes {
+            let safe_label = node.label.replace('"', "'");
+            out.push_str(&format!(
+                "    {}[\"{}\"]\n",
+                node.id, safe_label
+            ));
+            let color = match node.status.as_str() {
+                "succeeded" => "fill:#10b981,color:#fff",
+                "failed" => "fill:#ef4444,color:#fff",
+                "active" => "fill:#f59e0b,color:#fff",
+                _ => "fill:#6b7280,color:#fff",
+            };
+            out.push_str(&format!("    style {} {}\n", node.id, color));
+            if let Some(parent) = &node.parent {
+                out.push_str(&format!("    {} --> {}\n", parent, node.id));
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1733,5 +1839,71 @@ mod tests {
             token.is_cancelled(),
             "cancel() should set the token to cancelled"
         );
+    }
+
+    // ── #234: ExecutionTreeViz tests ──────────────────────────────────────────
+
+    fn make_viz_node(id: &str, status: &str, parent: Option<&str>, depth: usize) -> VizTreeNode {
+        VizTreeNode {
+            id: id.to_string(),
+            label: format!("Node {id}"),
+            status: status.to_string(),
+            parent: parent.map(str::to_string),
+            error: None,
+            depth,
+        }
+    }
+
+    #[test]
+    fn exec_tree_add_and_color() {
+        let mut tree = ExecutionTreeViz::new();
+        tree.add_node(make_viz_node("root", "succeeded", None, 0));
+        tree.add_node(make_viz_node("child", "failed", Some("root"), 1));
+        assert_eq!(tree.nodes.len(), 2);
+        assert_eq!(ExecutionTreeViz::node_color("succeeded"), "#10b981");
+        assert_eq!(ExecutionTreeViz::node_color("failed"), "#ef4444");
+        assert_eq!(ExecutionTreeViz::node_color("active"), "#f59e0b");
+        assert_eq!(ExecutionTreeViz::node_color("pruned"), "#6b7280");
+        assert_eq!(ExecutionTreeViz::node_color("unknown"), "#6b7280");
+    }
+
+    #[test]
+    fn exec_tree_react_flow_json() {
+        let mut tree = ExecutionTreeViz::new();
+        tree.add_node(make_viz_node("root", "succeeded", None, 0));
+        tree.add_node(make_viz_node("child", "active", Some("root"), 1));
+        let json = tree.to_react_flow_json();
+        let nodes = json["nodes"].as_array().unwrap();
+        let edges = json["edges"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0]["source"], "root");
+        assert_eq!(edges[0]["target"], "child");
+        assert_eq!(nodes[0]["data"]["status"], "succeeded");
+        assert_eq!(nodes[1]["data"]["label"], "Node child");
+    }
+
+    #[test]
+    fn exec_tree_mermaid_output() {
+        let mut tree = ExecutionTreeViz::new();
+        tree.add_node(make_viz_node("root", "succeeded", None, 0));
+        tree.add_node(make_viz_node("a", "failed", Some("root"), 1));
+        tree.add_node(make_viz_node("b", "pruned", Some("root"), 1));
+        let mermaid = tree.to_mermaid();
+        assert!(mermaid.starts_with("graph TD\n"));
+        assert!(mermaid.contains("root --> a"));
+        assert!(mermaid.contains("root --> b"));
+        assert!(mermaid.contains("fill:#10b981")); // succeeded
+        assert!(mermaid.contains("fill:#ef4444")); // failed
+        assert!(mermaid.contains("fill:#6b7280")); // pruned
+    }
+
+    #[test]
+    fn exec_tree_no_edges_for_roots() {
+        let mut tree = ExecutionTreeViz::new();
+        tree.add_node(make_viz_node("r1", "active", None, 0));
+        tree.add_node(make_viz_node("r2", "active", None, 0));
+        let json = tree.to_react_flow_json();
+        assert_eq!(json["edges"].as_array().unwrap().len(), 0);
     }
 }

@@ -685,6 +685,10 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 | 229 | Feature discovery tooltips | Per-panel first-use hints stored in localStorage, shown once per feature | New | ✅ | P1 | `caduceus-app` |
 | 230 | Interactive command reference | Searchable /help panel with 27 commands, keybindings, mentions, and examples | New | ✅ | P1 | `caduceus-app` |
 | 231 | Contextual help overlay | ? hotkey toggles help badges on every UI element showing what it does | New | ✅ | P1 | `caduceus-app` |
+| 232 | Code property graph | Network visualization of functions/classes/modules with call/import/modify edges; Cytoscape JSON export | AI-Viz | ✅ | P1 | `caduceus-omniscience` |
+| 233 | Vector space visualizer | 2D/3D scatter plot of code embeddings with cluster labels and query-relevance highlighting | AI-Viz | ✅ | P1 | `caduceus-omniscience` |
+| 234 | Agent execution tree viz | React Flow / Mermaid flowchart of agent reasoning branches with status colors | AI-Viz | ✅ | P1 | `caduceus-orchestrator` |
+| 235 | AST overlay data model | Editor decoration data for highlighting focused/modified/referenced code regions | AI-Viz | ✅ | P1 | `caduceus-omniscience` |
 
 ---
 

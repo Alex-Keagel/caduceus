@@ -1736,6 +1736,366 @@ impl ErrorRecoveryEngine {
     }
 }
 
+// ── #232: Code Property Graph ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GraphNodeType {
+    Function,
+    Class,
+    Module,
+    Variable,
+    Import,
+    Interface,
+    Trait,
+    Struct,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GraphEdgeType {
+    Calls,
+    InheritsFrom,
+    Implements,
+    Imports,
+    Modifies,
+    References,
+    Returns,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphNode {
+    pub id: String,
+    pub label: String,
+    pub node_type: GraphNodeType,
+    pub file: String,
+    pub line: usize,
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphEdge {
+    pub source: String,
+    pub target: String,
+    pub edge_type: GraphEdgeType,
+    pub weight: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphStats {
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub components: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CodePropertyGraph {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
+impl CodePropertyGraph {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_node(&mut self, node: GraphNode) {
+        self.nodes.push(node);
+    }
+
+    pub fn add_edge(&mut self, edge: GraphEdge) {
+        self.edges.push(edge);
+    }
+
+    pub fn neighbors(&self, node_id: &str) -> Vec<&GraphNode> {
+        let target_ids: Vec<&str> = self
+            .edges
+            .iter()
+            .filter(|e| e.source == node_id)
+            .map(|e| e.target.as_str())
+            .collect();
+        self.nodes
+            .iter()
+            .filter(|n| target_ids.contains(&n.id.as_str()))
+            .collect()
+    }
+
+    /// Transitive downstream nodes reachable from `node_id`.
+    pub fn affected_by(&self, node_id: &str) -> Vec<&GraphNode> {
+        let mut visited: Vec<String> = Vec::new();
+        let mut queue: Vec<String> = vec![node_id.to_string()];
+        while let Some(current) = queue.pop() {
+            if visited.contains(&current) {
+                continue;
+            }
+            visited.push(current.clone());
+            for edge in &self.edges {
+                if edge.source == current && !visited.contains(&edge.target) {
+                    queue.push(edge.target.clone());
+                }
+            }
+        }
+        // Exclude the starting node itself
+        self.nodes
+            .iter()
+            .filter(|n| n.id != node_id && visited.contains(&n.id))
+            .collect()
+    }
+
+    pub fn subgraph(&self, node_ids: &[&str]) -> CodePropertyGraph {
+        let id_set: std::collections::HashSet<&str> = node_ids.iter().copied().collect();
+        let nodes = self
+            .nodes
+            .iter()
+            .filter(|n| id_set.contains(n.id.as_str()))
+            .cloned()
+            .collect();
+        let edges = self
+            .edges
+            .iter()
+            .filter(|e| id_set.contains(e.source.as_str()) && id_set.contains(e.target.as_str()))
+            .cloned()
+            .collect();
+        CodePropertyGraph { nodes, edges }
+    }
+
+    pub fn to_cytoscape_json(&self) -> serde_json::Value {
+        let elements: Vec<serde_json::Value> = self
+            .nodes
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "group": "nodes",
+                    "data": {
+                        "id": n.id,
+                        "label": n.label,
+                        "type": format!("{:?}", n.node_type),
+                        "file": n.file,
+                        "line": n.line,
+                    }
+                })
+            })
+            .chain(self.edges.iter().map(|e| {
+                serde_json::json!({
+                    "group": "edges",
+                    "data": {
+                        "source": e.source,
+                        "target": e.target,
+                        "type": format!("{:?}", e.edge_type),
+                        "weight": e.weight,
+                    }
+                })
+            }))
+            .collect();
+        serde_json::json!({ "elements": elements })
+    }
+
+    pub fn stats(&self) -> GraphStats {
+        // Connected components via union-find on node indices
+        let n = self.nodes.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+
+        fn find(parent: &mut Vec<usize>, x: usize) -> usize {
+            if parent[x] != x {
+                parent[x] = find(parent, parent[x]);
+            }
+            parent[x]
+        }
+
+        for edge in &self.edges {
+            let si = self.nodes.iter().position(|nd| nd.id == edge.source);
+            let ti = self.nodes.iter().position(|nd| nd.id == edge.target);
+            if let (Some(s), Some(t)) = (si, ti) {
+                let pr = find(&mut parent, s);
+                let qr = find(&mut parent, t);
+                if pr != qr {
+                    parent[pr] = qr;
+                }
+            }
+        }
+
+        let components = if n == 0 {
+            0
+        } else {
+            (0..n).filter(|&i| find(&mut parent, i) == i).count()
+        };
+
+        GraphStats {
+            node_count: self.nodes.len(),
+            edge_count: self.edges.len(),
+            components,
+        }
+    }
+}
+
+// ── #233: Vector Space Visualizer ────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpacePoint {
+    pub id: String,
+    pub label: String,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub cluster_id: Option<String>,
+    pub file: String,
+    pub relevance: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpaceCluster {
+    pub id: String,
+    pub label: String,
+    pub color: String,
+    pub center_x: f64,
+    pub center_y: f64,
+    pub center_z: f64,
+    pub point_count: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VectorSpaceMap {
+    pub points: Vec<SpacePoint>,
+    pub clusters: Vec<SpaceCluster>,
+}
+
+impl VectorSpaceMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_point(&mut self, point: SpacePoint) {
+        self.points.push(point);
+    }
+
+    pub fn add_cluster(&mut self, cluster: SpaceCluster) {
+        self.clusters.push(cluster);
+    }
+
+    /// Set relevance scores based on distance from a query embedding placeholder.
+    /// Points with `file` containing `query` get relevance 1.0; others decay by distance.
+    pub fn highlight_relevant(&mut self, query: &str, threshold: f64) {
+        for point in &mut self.points {
+            if point.file.contains(query) || point.label.contains(query) {
+                point.relevance = 1.0;
+            } else if point.relevance <= threshold {
+                point.relevance = 0.0;
+            }
+        }
+    }
+
+    /// Return the `k` points closest to (x, y, z) in 3-D space.
+    pub fn nearest_to_query(&self, x: f64, y: f64, z: f64, k: usize) -> Vec<&SpacePoint> {
+        let mut scored: Vec<(f64, &SpacePoint)> = self
+            .points
+            .iter()
+            .map(|p| {
+                let d = ((p.x - x).powi(2) + (p.y - y).powi(2) + (p.z - z).powi(2)).sqrt();
+                (d, p)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().take(k).map(|(_, p)| p).collect()
+    }
+
+    pub fn to_render_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "points": self.points.iter().map(|p| serde_json::json!({
+                "id": p.id,
+                "label": p.label,
+                "position": [p.x, p.y, p.z],
+                "clusterId": p.cluster_id,
+                "file": p.file,
+                "relevance": p.relevance,
+            })).collect::<Vec<_>>(),
+            "clusters": self.clusters.iter().map(|c| serde_json::json!({
+                "id": c.id,
+                "label": c.label,
+                "color": c.color,
+                "center": [c.center_x, c.center_y, c.center_z],
+                "pointCount": c.point_count,
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
+// ── #235: AST Overlay Data ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HighlightType {
+    Focus,
+    Scope,
+    Modified,
+    Referenced,
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AstHighlight {
+    pub file: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub start_col: usize,
+    pub end_col: usize,
+    pub highlight_type: HighlightType,
+    pub label: String,
+    pub tooltip: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AstOverlay {
+    pub highlights: Vec<AstHighlight>,
+}
+
+impl AstOverlay {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_highlight(&mut self, highlight: AstHighlight) {
+        self.highlights.push(highlight);
+    }
+
+    pub fn highlights_for_file(&self, file: &str) -> Vec<&AstHighlight> {
+        self.highlights.iter().filter(|h| h.file == file).collect()
+    }
+
+    pub fn clear_file(&mut self, file: &str) {
+        self.highlights.retain(|h| h.file != file);
+    }
+
+    /// Emit Monaco editor decoration JSON for a given file.
+    pub fn to_editor_decorations(&self, file: &str) -> serde_json::Value {
+        let decorations: Vec<serde_json::Value> = self
+            .highlights_for_file(file)
+            .iter()
+            .map(|h| {
+                let class_name = match h.highlight_type {
+                    HighlightType::Focus => "caduceus-focus",
+                    HighlightType::Scope => "caduceus-scope",
+                    HighlightType::Modified => "caduceus-modified",
+                    HighlightType::Referenced => "caduceus-referenced",
+                    HighlightType::Error => "caduceus-error",
+                    HighlightType::Warning => "caduceus-warning",
+                };
+                serde_json::json!({
+                    "range": {
+                        "startLineNumber": h.start_line,
+                        "startColumn": h.start_col,
+                        "endLineNumber": h.end_line,
+                        "endColumn": h.end_col,
+                    },
+                    "options": {
+                        "className": class_name,
+                        "hoverMessage": { "value": h.tooltip },
+                        "glyphMarginHoverMessage": { "value": h.label },
+                    }
+                })
+            })
+            .collect();
+        serde_json::json!({ "decorations": decorations })
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2479,5 +2839,232 @@ def decorated():
         engine.record_attempt("s", true);
         assert_eq!(engine.history[0].attempt_number, 1);
         assert_eq!(engine.history[1].attempt_number, 2);
+    }
+
+    // ── #232: CodePropertyGraph tests ────────────────────────────────────────
+
+    fn make_node(id: &str, label: &str) -> GraphNode {
+        GraphNode {
+            id: id.to_string(),
+            label: label.to_string(),
+            node_type: GraphNodeType::Function,
+            file: "src/lib.rs".to_string(),
+            line: 1,
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn make_edge(src: &str, tgt: &str, t: GraphEdgeType) -> GraphEdge {
+        GraphEdge {
+            source: src.to_string(),
+            target: tgt.to_string(),
+            edge_type: t,
+            weight: 1.0,
+        }
+    }
+
+    #[test]
+    fn cpg_add_nodes_and_edges() {
+        let mut g = CodePropertyGraph::new();
+        g.add_node(make_node("a", "A"));
+        g.add_node(make_node("b", "B"));
+        g.add_edge(make_edge("a", "b", GraphEdgeType::Calls));
+        assert_eq!(g.nodes.len(), 2);
+        assert_eq!(g.edges.len(), 1);
+    }
+
+    #[test]
+    fn cpg_neighbors() {
+        let mut g = CodePropertyGraph::new();
+        g.add_node(make_node("a", "A"));
+        g.add_node(make_node("b", "B"));
+        g.add_node(make_node("c", "C"));
+        g.add_edge(make_edge("a", "b", GraphEdgeType::Calls));
+        g.add_edge(make_edge("a", "c", GraphEdgeType::Imports));
+        let nb = g.neighbors("a");
+        assert_eq!(nb.len(), 2);
+        assert!(nb.iter().any(|n| n.id == "b"));
+        assert!(nb.iter().any(|n| n.id == "c"));
+    }
+
+    #[test]
+    fn cpg_affected_by_traversal() {
+        let mut g = CodePropertyGraph::new();
+        // a -> b -> c  (chain)
+        g.add_node(make_node("a", "A"));
+        g.add_node(make_node("b", "B"));
+        g.add_node(make_node("c", "C"));
+        g.add_edge(make_edge("a", "b", GraphEdgeType::Calls));
+        g.add_edge(make_edge("b", "c", GraphEdgeType::Calls));
+        let affected = g.affected_by("a");
+        assert_eq!(affected.len(), 2);
+        assert!(affected.iter().any(|n| n.id == "b"));
+        assert!(affected.iter().any(|n| n.id == "c"));
+        // Starting node itself is excluded
+        assert!(!affected.iter().any(|n| n.id == "a"));
+    }
+
+    #[test]
+    fn cpg_subgraph() {
+        let mut g = CodePropertyGraph::new();
+        g.add_node(make_node("a", "A"));
+        g.add_node(make_node("b", "B"));
+        g.add_node(make_node("c", "C"));
+        g.add_edge(make_edge("a", "b", GraphEdgeType::Calls));
+        g.add_edge(make_edge("b", "c", GraphEdgeType::Calls));
+        let sub = g.subgraph(&["a", "b"]);
+        assert_eq!(sub.nodes.len(), 2);
+        assert_eq!(sub.edges.len(), 1); // a->b, not b->c
+    }
+
+    #[test]
+    fn cpg_cytoscape_json_structure() {
+        let mut g = CodePropertyGraph::new();
+        g.add_node(make_node("a", "A"));
+        g.add_edge(make_edge("a", "b", GraphEdgeType::Returns));
+        let json = g.to_cytoscape_json();
+        let elems = json["elements"].as_array().unwrap();
+        assert_eq!(elems.len(), 2);
+        assert_eq!(elems[0]["group"], "nodes");
+        assert_eq!(elems[1]["group"], "edges");
+    }
+
+    #[test]
+    fn cpg_stats_components() {
+        let mut g = CodePropertyGraph::new();
+        g.add_node(make_node("a", "A"));
+        g.add_node(make_node("b", "B"));
+        // Two isolated nodes = 2 components
+        let s = g.stats();
+        assert_eq!(s.node_count, 2);
+        assert_eq!(s.edge_count, 0);
+        assert_eq!(s.components, 2);
+
+        g.add_edge(make_edge("a", "b", GraphEdgeType::Calls));
+        let s2 = g.stats();
+        assert_eq!(s2.components, 1);
+    }
+
+    // ── #233: VectorSpaceMap tests ────────────────────────────────────────────
+
+    fn make_point(id: &str, x: f64, y: f64, z: f64) -> SpacePoint {
+        SpacePoint {
+            id: id.to_string(),
+            label: id.to_string(),
+            x,
+            y,
+            z,
+            cluster_id: None,
+            file: format!("src/{id}.rs"),
+            relevance: 0.5,
+        }
+    }
+
+    #[test]
+    fn vsm_add_points_and_clusters() {
+        let mut m = VectorSpaceMap::new();
+        m.add_point(make_point("p1", 0.0, 0.0, 0.0));
+        m.add_point(make_point("p2", 1.0, 1.0, 1.0));
+        m.add_cluster(SpaceCluster {
+            id: "c1".to_string(),
+            label: "cluster".to_string(),
+            color: "#ff0000".to_string(),
+            center_x: 0.5,
+            center_y: 0.5,
+            center_z: 0.5,
+            point_count: 2,
+        });
+        assert_eq!(m.points.len(), 2);
+        assert_eq!(m.clusters.len(), 1);
+    }
+
+    #[test]
+    fn vsm_nearest_to_query() {
+        let mut m = VectorSpaceMap::new();
+        m.add_point(make_point("near", 0.1, 0.0, 0.0));
+        m.add_point(make_point("far", 100.0, 100.0, 100.0));
+        let nearest = m.nearest_to_query(0.0, 0.0, 0.0, 1);
+        assert_eq!(nearest.len(), 1);
+        assert_eq!(nearest[0].id, "near");
+    }
+
+    #[test]
+    fn vsm_highlight_relevant() {
+        let mut m = VectorSpaceMap::new();
+        let mut p = make_point("auth", 0.0, 0.0, 0.0);
+        p.file = "src/auth.rs".to_string();
+        p.relevance = 0.1;
+        m.add_point(p);
+        m.add_point(make_point("other", 1.0, 1.0, 1.0));
+        m.highlight_relevant("auth", 0.5);
+        assert_eq!(m.points[0].relevance, 1.0); // matched
+        assert_eq!(m.points[1].relevance, 0.0); // below threshold, set to 0
+    }
+
+    #[test]
+    fn vsm_render_json_structure() {
+        let mut m = VectorSpaceMap::new();
+        m.add_point(make_point("p1", 1.0, 2.0, 3.0));
+        let json = m.to_render_json();
+        let pts = json["points"].as_array().unwrap();
+        assert_eq!(pts.len(), 1);
+        assert_eq!(pts[0]["id"], "p1");
+        let pos = pts[0]["position"].as_array().unwrap();
+        assert_eq!(pos[0].as_f64().unwrap(), 1.0);
+    }
+
+    // ── #235: AstOverlay tests ────────────────────────────────────────────────
+
+    fn make_highlight(file: &str, t: HighlightType) -> AstHighlight {
+        AstHighlight {
+            file: file.to_string(),
+            start_line: 10,
+            end_line: 15,
+            start_col: 1,
+            end_col: 20,
+            highlight_type: t,
+            label: "test label".to_string(),
+            tooltip: "test tooltip".to_string(),
+        }
+    }
+
+    #[test]
+    fn ast_overlay_add_and_filter() {
+        let mut overlay = AstOverlay::new();
+        overlay.add_highlight(make_highlight("src/foo.rs", HighlightType::Focus));
+        overlay.add_highlight(make_highlight("src/bar.rs", HighlightType::Error));
+        overlay.add_highlight(make_highlight("src/foo.rs", HighlightType::Modified));
+        assert_eq!(overlay.highlights_for_file("src/foo.rs").len(), 2);
+        assert_eq!(overlay.highlights_for_file("src/bar.rs").len(), 1);
+        assert_eq!(overlay.highlights_for_file("src/other.rs").len(), 0);
+    }
+
+    #[test]
+    fn ast_overlay_clear_file() {
+        let mut overlay = AstOverlay::new();
+        overlay.add_highlight(make_highlight("src/foo.rs", HighlightType::Scope));
+        overlay.add_highlight(make_highlight("src/bar.rs", HighlightType::Warning));
+        overlay.clear_file("src/foo.rs");
+        assert_eq!(overlay.highlights.len(), 1);
+        assert_eq!(overlay.highlights[0].file, "src/bar.rs");
+    }
+
+    #[test]
+    fn ast_overlay_editor_decorations_json() {
+        let mut overlay = AstOverlay::new();
+        overlay.add_highlight(make_highlight("src/foo.rs", HighlightType::Error));
+        let json = overlay.to_editor_decorations("src/foo.rs");
+        let decs = json["decorations"].as_array().unwrap();
+        assert_eq!(decs.len(), 1);
+        assert_eq!(decs[0]["options"]["className"], "caduceus-error");
+        assert_eq!(decs[0]["range"]["startLineNumber"], 10);
+        assert_eq!(decs[0]["range"]["endLineNumber"], 15);
+    }
+
+    #[test]
+    fn ast_overlay_decorations_empty_for_unknown_file() {
+        let overlay = AstOverlay::new();
+        let json = overlay.to_editor_decorations("nonexistent.rs");
+        assert_eq!(json["decorations"].as_array().unwrap().len(), 0);
     }
 }
