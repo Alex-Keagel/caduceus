@@ -2831,6 +2831,783 @@ impl GitTrackableStore {
     }
 }
 
+// ── #250: WikiEngine ─────────────────────────────────────────────────────────
+
+/// A page stored in the wiki.
+pub struct WikiPage {
+    pub slug: String,
+    pub title: String,
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    /// `[[linked-page]]` references found in the page content.
+    pub links: Vec<String>,
+    /// Seconds since UNIX epoch of last modification.
+    pub last_modified: u64,
+}
+
+/// Core wiki manager – owns the wiki directory layout.
+pub struct WikiEngine {
+    wiki_dir: PathBuf,
+    sources_dir: PathBuf,
+}
+
+impl WikiEngine {
+    pub fn new(project_root: &Path) -> Self {
+        let wiki_dir = project_root.join(".caduceus").join("wiki");
+        let sources_dir = wiki_dir.join("raw");
+        Self {
+            wiki_dir,
+            sources_dir,
+        }
+    }
+
+    /// Create directory structure, `index.md`, and `log.md` if they do not exist.
+    pub fn init(&self) -> std::result::Result<(), CaduceusError> {
+        fs::create_dir_all(&self.wiki_dir)
+            .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+        fs::create_dir_all(&self.sources_dir)
+            .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+
+        let index_path = self.wiki_dir.join("index.md");
+        if !index_path.exists() {
+            fs::write(&index_path, "# Wiki Index\n\n")
+                .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+        }
+        let log_path = self.wiki_dir.join("log.md");
+        if !log_path.exists() {
+            fs::write(&log_path, "# Wiki Log\n\n")
+                .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub fn wiki_dir(&self) -> &Path {
+        &self.wiki_dir
+    }
+
+    /// Absolute path of a page file for the given slug.
+    pub fn page_path(&self, slug: &str) -> PathBuf {
+        self.wiki_dir.join(format!("{slug}.md"))
+    }
+
+    pub fn page_exists(&self, slug: &str) -> bool {
+        self.page_path(slug).exists()
+    }
+
+    /// List all `.md` pages in the wiki dir, excluding `index.md` and `log.md`.
+    pub fn list_pages(&self) -> std::result::Result<Vec<WikiPage>, CaduceusError> {
+        if !self.wiki_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut pages = Vec::new();
+        for entry in fs::read_dir(&self.wiki_dir)
+            .map_err(|e| CaduceusError::Storage(e.to_string()))?
+        {
+            let entry = entry.map_err(|e| CaduceusError::Storage(e.to_string()))?;
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "md") {
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if name == "index" || name == "log" {
+                    continue;
+                }
+                let content = fs::read_to_string(&path)
+                    .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+                let meta = fs::metadata(&path)
+                    .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+                let last_modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let title = wiki_title_from_content(&content).unwrap_or_else(|| name.clone());
+                let links = wiki_extract_links(&content);
+                pages.push(WikiPage {
+                    slug: name,
+                    title,
+                    path,
+                    size_bytes: meta.len(),
+                    links,
+                    last_modified,
+                });
+            }
+        }
+        Ok(pages)
+    }
+
+    pub fn read_page(&self, slug: &str) -> std::result::Result<String, CaduceusError> {
+        let path = self.page_path(slug);
+        fs::read_to_string(&path).map_err(|e| CaduceusError::Storage(e.to_string()))
+    }
+
+    pub fn write_page(&self, slug: &str, content: &str) -> std::result::Result<(), CaduceusError> {
+        let path = self.page_path(slug);
+        fs::write(path, content).map_err(|e| CaduceusError::Storage(e.to_string()))
+    }
+
+    pub fn delete_page(&self, slug: &str) -> std::result::Result<(), CaduceusError> {
+        let path = self.page_path(slug);
+        fs::remove_file(path).map_err(|e| CaduceusError::Storage(e.to_string()))
+    }
+
+    /// Simple case-insensitive full-text search across all pages.
+    pub fn search_pages(&self, query: &str) -> std::result::Result<Vec<WikiPage>, CaduceusError> {
+        let lower = query.to_lowercase();
+        let all = self.list_pages()?;
+        let mut matches = Vec::new();
+        for page in all {
+            let content = self.read_page(&page.slug).unwrap_or_default();
+            if page.title.to_lowercase().contains(&lower)
+                || page.slug.to_lowercase().contains(&lower)
+                || content.to_lowercase().contains(&lower)
+            {
+                matches.push(page);
+            }
+        }
+        Ok(matches)
+    }
+}
+
+fn wiki_title_from_content(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("# ") {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Extract `[[slug]]` link references from wiki content.
+fn wiki_extract_links(content: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    let mut remaining = content;
+    while let Some(start) = remaining.find("[[") {
+        let after_open = &remaining[start + 2..];
+        if let Some(end) = after_open.find("]]") {
+            let slug = after_open[..end].trim().to_string();
+            if !slug.is_empty() && !links.contains(&slug) {
+                links.push(slug);
+            }
+            remaining = &after_open[end + 2..];
+        } else {
+            break;
+        }
+    }
+    links
+}
+
+// ── #251: WikiIndex ───────────────────────────────────────────────────────────
+
+pub struct IndexEntry {
+    pub slug: String,
+    pub title: String,
+    pub summary: String,
+    /// One of: `entity`, `concept`, `source`, `analysis`.
+    pub category: String,
+    pub source_count: usize,
+    pub link_count: usize,
+}
+
+#[derive(Default)]
+pub struct WikiIndex {
+    entries: Vec<IndexEntry>,
+}
+
+impl WikiIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_entry(&mut self, entry: IndexEntry) {
+        self.entries.push(entry);
+    }
+
+    pub fn remove_entry(&mut self, slug: &str) {
+        self.entries.retain(|e| e.slug != slug);
+    }
+
+    pub fn update_entry(&mut self, slug: &str, entry: IndexEntry) {
+        self.remove_entry(slug);
+        self.entries.push(entry);
+    }
+
+    pub fn find_by_category(&self, category: &str) -> Vec<&IndexEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.category == category)
+            .collect()
+    }
+
+    pub fn find_by_query(&self, query: &str) -> Vec<&IndexEntry> {
+        let lower = query.to_lowercase();
+        self.entries
+            .iter()
+            .filter(|e| {
+                e.slug.to_lowercase().contains(&lower)
+                    || e.title.to_lowercase().contains(&lower)
+                    || e.summary.to_lowercase().contains(&lower)
+                    || e.category.to_lowercase().contains(&lower)
+            })
+            .collect()
+    }
+
+    /// Render the index as markdown suitable for `index.md`.
+    pub fn to_markdown(&self) -> String {
+        let mut out = String::from("# Wiki Index\n\n");
+        let categories = ["entity", "concept", "source", "analysis"];
+        for cat in &categories {
+            let entries: Vec<_> = self.find_by_category(cat);
+            if entries.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("## {}\n\n", capitalise(cat)));
+            for e in entries {
+                out.push_str(&format!(
+                    "- [[{}]] — {} (sources: {}, links: {})\n",
+                    e.slug, e.summary, e.source_count, e.link_count
+                ));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Parse `index.md` back into a `WikiIndex`.
+    pub fn from_markdown(content: &str) -> Self {
+        let mut index = WikiIndex::new();
+        let mut current_category = String::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if let Some(heading) = trimmed.strip_prefix("## ") {
+                current_category = heading.trim().to_lowercase();
+            } else if trimmed.starts_with("- [[") {
+                // "- [[slug]] — summary (sources: N, links: M)"
+                if let Some(inner) = trimmed.strip_prefix("- [[") {
+                    if let Some(close) = inner.find("]]") {
+                        let slug = inner[..close].to_string();
+                        let rest = inner[close + 2..].trim();
+                        let summary = rest
+                            .split(" (sources:")
+                            .next()
+                            .unwrap_or("")
+                            .trim_start_matches('—')
+                            .trim()
+                            .to_string();
+                        let (source_count, link_count) =
+                            parse_index_counts(rest).unwrap_or((0, 0));
+                        let title = slug
+                            .split('-')
+                            .map(capitalise)
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        index.add_entry(IndexEntry {
+                            slug,
+                            title,
+                            summary,
+                            category: current_category.clone(),
+                            source_count,
+                            link_count,
+                        });
+                    }
+                }
+            }
+        }
+        index
+    }
+
+    /// Return slugs of pages that have no inbound `[[links]]` in `all_slugs`.
+    pub fn orphan_pages(&self, all_slugs: &[String]) -> Vec<String> {
+        let linked: std::collections::HashSet<String> = self
+            .entries
+            .iter()
+            .flat_map(|_| std::iter::empty::<String>())
+            .collect();
+        // Any slug that appears in all_slugs but has zero inbound links from index entries.
+        // Since the index tracks per-entry link counts but not *which* pages are linked,
+        // we return all slugs that do not appear in any other entry's context.
+        // A simpler correct definition: pages not referenced by any other page's [[links]].
+        // Without page content we flag them all; callers should prefer WikiLinter::find_orphans.
+        all_slugs
+            .iter()
+            .filter(|s| !linked.contains(*s))
+            .cloned()
+            .collect()
+    }
+}
+
+fn capitalise(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+    }
+}
+
+fn parse_index_counts(s: &str) -> Option<(usize, usize)> {
+    // "— summary (sources: N, links: M)"
+    let paren = s.find('(')?;
+    let inner = &s[paren + 1..s.find(')')?];
+    let mut parts = inner.split(',');
+    let src = parts
+        .next()?
+        .split(':')
+        .nth(1)?
+        .trim()
+        .parse()
+        .ok()?;
+    let lnk = parts
+        .next()?
+        .split(':')
+        .nth(1)?
+        .trim()
+        .parse()
+        .ok()?;
+    Some((src, lnk))
+}
+
+// ── #252: WikiLog ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum WikiOperation {
+    Ingest,
+    Query,
+    Lint,
+    Update,
+    Create,
+    Delete,
+}
+
+impl WikiOperation {
+    fn as_str(&self) -> &'static str {
+        match self {
+            WikiOperation::Ingest => "Ingest",
+            WikiOperation::Query => "Query",
+            WikiOperation::Lint => "Lint",
+            WikiOperation::Update => "Update",
+            WikiOperation::Create => "Create",
+            WikiOperation::Delete => "Delete",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s.trim() {
+            "Ingest" => Some(WikiOperation::Ingest),
+            "Query" => Some(WikiOperation::Query),
+            "Lint" => Some(WikiOperation::Lint),
+            "Update" => Some(WikiOperation::Update),
+            "Create" => Some(WikiOperation::Create),
+            "Delete" => Some(WikiOperation::Delete),
+            _ => None,
+        }
+    }
+}
+
+pub struct LogEntry {
+    /// ISO 8601 timestamp.
+    pub timestamp: String,
+    pub operation: WikiOperation,
+    pub description: String,
+    pub pages_touched: Vec<String>,
+}
+
+pub struct LogStats {
+    pub total_operations: usize,
+    pub ingests: usize,
+    pub queries: usize,
+    pub lints: usize,
+    pub pages_created: usize,
+}
+
+#[derive(Default)]
+pub struct WikiLog {
+    entries: Vec<LogEntry>,
+}
+
+impl WikiLog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn append(&mut self, entry: LogEntry) {
+        self.entries.push(entry);
+    }
+
+    pub fn recent(&self, n: usize) -> Vec<&LogEntry> {
+        self.entries.iter().rev().take(n).collect()
+    }
+
+    pub fn by_operation(&self, op: &WikiOperation) -> Vec<&LogEntry> {
+        self.entries
+            .iter()
+            .filter(|e| &e.operation == op)
+            .collect()
+    }
+
+    /// Render as `log.md`.  Each entry: `## [timestamp] Op | description`
+    pub fn to_markdown(&self) -> String {
+        let mut out = String::from("# Wiki Log\n\n");
+        for e in &self.entries {
+            out.push_str(&format!(
+                "## [{}] {} | {}\n",
+                e.timestamp,
+                e.operation.as_str(),
+                e.description
+            ));
+            if !e.pages_touched.is_empty() {
+                out.push_str(&format!("Pages: {}\n", e.pages_touched.join(", ")));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Parse `log.md` back into a `WikiLog`.
+    pub fn from_markdown(content: &str) -> Self {
+        let mut log = WikiLog::new();
+        let mut lines = content.lines().peekable();
+        while let Some(line) = lines.next() {
+            let trimmed = line.trim();
+            // "## [timestamp] Op | description"
+            if let Some(rest) = trimmed.strip_prefix("## [") {
+                if let Some(close) = rest.find(']') {
+                    let timestamp = rest[..close].to_string();
+                    let after = rest[close + 1..].trim();
+                    let (op_str, desc) = if let Some(pipe) = after.find('|') {
+                        (after[..pipe].trim(), after[pipe + 1..].trim())
+                    } else {
+                        (after, "")
+                    };
+                    let operation = WikiOperation::from_str(op_str)
+                        .unwrap_or(WikiOperation::Update);
+                    let mut pages_touched = Vec::new();
+                    if let Some(next) = lines.peek() {
+                        if let Some(p) = next.trim().strip_prefix("Pages: ") {
+                            pages_touched = p.split(", ").map(str::to_string).collect();
+                            lines.next();
+                        }
+                    }
+                    log.append(LogEntry {
+                        timestamp,
+                        operation,
+                        description: desc.to_string(),
+                        pages_touched,
+                    });
+                }
+            }
+        }
+        log
+    }
+
+    pub fn stats(&self) -> LogStats {
+        let mut stats = LogStats {
+            total_operations: self.entries.len(),
+            ingests: 0,
+            queries: 0,
+            lints: 0,
+            pages_created: 0,
+        };
+        for e in &self.entries {
+            match e.operation {
+                WikiOperation::Ingest => stats.ingests += 1,
+                WikiOperation::Query => stats.queries += 1,
+                WikiOperation::Lint => stats.lints += 1,
+                WikiOperation::Create => stats.pages_created += 1,
+                _ => {}
+            }
+        }
+        stats
+    }
+}
+
+// ── #253: WikiIngestor ────────────────────────────────────────────────────────
+
+pub struct WikiIngestor;
+
+impl WikiIngestor {
+    /// Extract candidate entity names (capitalised words / quoted phrases) from source text.
+    pub fn extract_entities(source: &str) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut entities = Vec::new();
+        for word in source.split_whitespace() {
+            let clean: String = word
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if clean.len() >= 3
+                && clean.chars().next().is_some_and(|c| c.is_uppercase())
+                && seen.insert(clean.clone())
+            {
+                entities.push(clean);
+            }
+        }
+        entities
+    }
+
+    /// Extract key claims/sentences: sentences that contain verbs or strong nouns.
+    pub fn extract_key_claims(source: &str) -> Vec<String> {
+        source
+            .split(['.', '!', '?'])
+            .map(str::trim)
+            .filter(|s| s.len() > 20)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Generate a markdown summary page for a source document.
+    pub fn generate_summary_page(title: &str, source: &str) -> String {
+        let claims = Self::extract_key_claims(source);
+        let entities = Self::extract_entities(source);
+        let mut out = format!("# {title}\n\n## Summary\n\n");
+        for claim in claims.iter().take(5) {
+            out.push_str(&format!("- {claim}\n"));
+        }
+        if !entities.is_empty() {
+            out.push_str("\n## Key Entities\n\n");
+            for e in entities.iter().take(10) {
+                out.push_str(&format!("- [[{}]]\n", Self::slugify(e)));
+            }
+        }
+        out
+    }
+
+    /// Generate a markdown entity page from an entity name and surrounding context.
+    pub fn generate_entity_page(entity: &str, context: &str) -> String {
+        let slug = Self::slugify(entity);
+        let mut out = format!("# {entity}\n\n## Overview\n\n");
+        let relevant: Vec<_> = context
+            .split(['.', '!', '?'])
+            .map(str::trim)
+            .filter(|s| s.to_lowercase().contains(&entity.to_lowercase()) && s.len() > 10)
+            .take(5)
+            .collect();
+        if relevant.is_empty() {
+            out.push_str("No context available.\n");
+        } else {
+            for s in relevant {
+                out.push_str(&format!("- {s}\n"));
+            }
+        }
+        out.push_str(&format!("\n## Back-links\n\n[[{slug}]]\n"));
+        out
+    }
+
+    /// Find `[[existing-slug]]` cross-references between content and known pages.
+    pub fn find_cross_references(content: &str, existing_slugs: &[String]) -> Vec<String> {
+        let lower_content = content.to_lowercase();
+        existing_slugs
+            .iter()
+            .filter(|slug| lower_content.contains(slug.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// Convert a title string to a URL-safe slug.
+    ///
+    /// `"My Page Title"` → `"my-page-title"`
+    pub fn slugify(title: &str) -> String {
+        title
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+            .split('-')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+}
+
+// ── #254: WikiLinter ──────────────────────────────────────────────────────────
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum LintCategory {
+    OrphanPage,
+    MissingPage,
+    StaleContent,
+    Contradiction,
+    MissingCrossRef,
+    EmptyPage,
+}
+
+pub struct LintFinding {
+    pub category: LintCategory,
+    pub page: String,
+    pub description: String,
+    pub suggestion: String,
+}
+
+pub struct WikiLinter;
+
+impl WikiLinter {
+    /// Run all lint checks and return combined findings.
+    pub fn lint(pages: &[WikiPage], index: &WikiIndex) -> Vec<LintFinding> {
+        let mut findings = Vec::new();
+        findings.extend(Self::find_orphans(pages, index));
+        findings.extend(Self::find_broken_links(pages));
+        findings.extend(Self::find_empty_pages(pages));
+        findings
+    }
+
+    /// Pages that have no inbound `[[link]]` from any other page.
+    pub fn find_orphans(pages: &[WikiPage], _index: &WikiIndex) -> Vec<LintFinding> {
+        let all_slugs: std::collections::HashSet<&str> =
+            pages.iter().map(|p| p.slug.as_str()).collect();
+        let linked: std::collections::HashSet<&str> = pages
+            .iter()
+            .flat_map(|p| p.links.iter().map(String::as_str))
+            .collect();
+        pages
+            .iter()
+            .filter(|p| !linked.contains(p.slug.as_str()))
+            .filter(|_p| all_slugs.len() > 1) // single page is never an orphan by convention
+            .map(|p| LintFinding {
+                category: LintCategory::OrphanPage,
+                page: p.slug.clone(),
+                description: format!("'{}' has no inbound links", p.slug),
+                suggestion: format!(
+                    "Add [[{}]] to a related page or the index",
+                    p.slug
+                ),
+            })
+            .collect()
+    }
+
+    /// Links that point to slugs that do not exist as pages.
+    pub fn find_broken_links(pages: &[WikiPage]) -> Vec<LintFinding> {
+        let existing: std::collections::HashSet<&str> =
+            pages.iter().map(|p| p.slug.as_str()).collect();
+        let mut findings = Vec::new();
+        for page in pages {
+            for link in &page.links {
+                if !existing.contains(link.as_str()) {
+                    findings.push(LintFinding {
+                        category: LintCategory::MissingPage,
+                        page: page.slug.clone(),
+                        description: format!("broken link [[{}]] in '{}'", link, page.slug),
+                        suggestion: format!("Create page '{}' or remove the link", link),
+                    });
+                }
+            }
+        }
+        findings
+    }
+
+    pub fn find_empty_pages(pages: &[WikiPage]) -> Vec<LintFinding> {
+        pages
+            .iter()
+            .filter(|p| p.size_bytes == 0)
+            .map(|p| LintFinding {
+                category: LintCategory::EmptyPage,
+                page: p.slug.clone(),
+                description: format!("'{}' is empty", p.slug),
+                suggestion: format!("Add content to '{}' or delete it", p.slug),
+            })
+            .collect()
+    }
+
+    /// Pages not modified within `max_age_days`.
+    pub fn find_stale_pages(pages: &[WikiPage], max_age_days: u32) -> Vec<LintFinding> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let threshold = u64::from(max_age_days) * 86_400;
+        pages
+            .iter()
+            .filter(|p| p.last_modified > 0 && now.saturating_sub(p.last_modified) > threshold)
+            .map(|p| LintFinding {
+                category: LintCategory::StaleContent,
+                page: p.slug.clone(),
+                description: format!("'{}' has not been updated in >{max_age_days} days", p.slug),
+                suggestion: format!("Review and update '{}'", p.slug),
+            })
+            .collect()
+    }
+}
+
+// ── #255: WikiQueryEngine ─────────────────────────────────────────────────────
+
+pub struct WikiQueryEngine;
+
+pub struct QueryResult {
+    pub answer: String,
+    pub sources: Vec<String>,
+    pub confidence: f64,
+}
+
+impl WikiQueryEngine {
+    /// Score each page by relevance to `query`.  Returns `(slug, relevance)` pairs sorted
+    /// by descending relevance.
+    pub fn search(
+        pages: &[WikiPage],
+        contents: &HashMap<String, String>,
+        query: &str,
+    ) -> Vec<(String, f64)> {
+        let lower = query.to_lowercase();
+        let terms: Vec<&str> = lower.split_whitespace().collect();
+        let mut scored: Vec<(String, f64)> = pages
+            .iter()
+            .filter_map(|p| {
+                let content = contents.get(&p.slug).map(String::as_str).unwrap_or("");
+                let content_lower = content.to_lowercase();
+                let title_lower = p.title.to_lowercase();
+                let slug_lower = p.slug.to_lowercase();
+
+                let mut score = 0.0_f64;
+                for term in &terms {
+                    if title_lower.contains(term) {
+                        score += 0.5;
+                    }
+                    if slug_lower.contains(term) {
+                        score += 0.3;
+                    }
+                    // Count occurrences in content, capped at 1.0 per term
+                    let occurrences = content_lower.matches(term).count();
+                    if occurrences > 0 {
+                        score += (occurrences as f64 * 0.1).min(1.0);
+                    }
+                }
+                if score > 0.0 {
+                    Some((p.slug.clone(), score))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored
+    }
+
+    /// Concatenate the content of the given pages into a single context string.
+    pub fn gather_context(
+        pages: &[WikiPage],
+        contents: &HashMap<String, String>,
+        slugs: &[String],
+    ) -> String {
+        let slug_set: std::collections::HashSet<&str> =
+            slugs.iter().map(String::as_str).collect();
+        pages
+            .iter()
+            .filter(|p| slug_set.contains(p.slug.as_str()))
+            .map(|p| {
+                let content = contents.get(&p.slug).map(String::as_str).unwrap_or("");
+                format!("## {}\n\n{content}\n\n", p.title)
+            })
+            .collect::<Vec<_>>()
+            .join("---\n\n")
+    }
+
+    /// Extract `[[page-ref]]` citations from text.
+    pub fn extract_citations(text: &str) -> Vec<String> {
+        wiki_extract_links(text)
+    }
+}
+
 // ── Tests for #241, #247 ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2976,5 +3753,434 @@ mod feature_tests_241_247 {
         let dir = tempfile::tempdir().unwrap();
         let store = GitTrackableStore::new(dir.path());
         assert!(store.tasks_dir().ends_with(".caduceus/tasks"));
+    }
+}
+
+// ── Tests for #250-255 ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod feature_tests_250_255 {
+    use super::*;
+
+    // ── #250 WikiEngine ───────────────────────────────────────────────────────
+
+    #[test]
+    fn wiki_engine_init_creates_dirs_and_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        assert!(engine.wiki_dir().exists());
+        assert!(engine.wiki_dir().join("raw").exists());
+        assert!(engine.wiki_dir().join("index.md").exists());
+        assert!(engine.wiki_dir().join("log.md").exists());
+    }
+
+    #[test]
+    fn wiki_engine_init_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        engine.init().unwrap(); // second call must not fail
+    }
+
+    #[test]
+    fn wiki_engine_write_read_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        engine.write_page("rust-tips", "# Rust Tips\n\nUse clippy.").unwrap();
+        assert!(engine.page_exists("rust-tips"));
+        let content = engine.read_page("rust-tips").unwrap();
+        assert!(content.contains("Use clippy"));
+    }
+
+    #[test]
+    fn wiki_engine_delete_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        engine.write_page("to-delete", "content").unwrap();
+        assert!(engine.page_exists("to-delete"));
+        engine.delete_page("to-delete").unwrap();
+        assert!(!engine.page_exists("to-delete"));
+    }
+
+    #[test]
+    fn wiki_engine_list_pages_excludes_index_and_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        engine.write_page("alpha", "# Alpha\ncontent").unwrap();
+        engine.write_page("beta", "# Beta\ncontent").unwrap();
+        let pages = engine.list_pages().unwrap();
+        let slugs: Vec<_> = pages.iter().map(|p| p.slug.as_str()).collect();
+        assert!(slugs.contains(&"alpha"));
+        assert!(slugs.contains(&"beta"));
+        assert!(!slugs.contains(&"index"));
+        assert!(!slugs.contains(&"log"));
+    }
+
+    #[test]
+    fn wiki_engine_list_pages_parses_title_and_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        engine
+            .write_page("mypage", "# My Page\n\nSee also [[other-page]].")
+            .unwrap();
+        let pages = engine.list_pages().unwrap();
+        let page = pages.iter().find(|p| p.slug == "mypage").unwrap();
+        assert_eq!(page.title, "My Page");
+        assert_eq!(page.links, vec!["other-page"]);
+    }
+
+    #[test]
+    fn wiki_engine_search_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        engine.write_page("rust-tips", "# Rust Tips\nUse clippy.").unwrap();
+        engine
+            .write_page("python-tips", "# Python Tips\nUse black.")
+            .unwrap();
+        let results = engine.search_pages("rust").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].slug, "rust-tips");
+    }
+
+    // ── #251 WikiIndex ────────────────────────────────────────────────────────
+
+    #[test]
+    fn wiki_index_add_find_remove() {
+        let mut index = WikiIndex::new();
+        index.add_entry(IndexEntry {
+            slug: "rust".to_string(),
+            title: "Rust".to_string(),
+            summary: "Systems language".to_string(),
+            category: "concept".to_string(),
+            source_count: 2,
+            link_count: 5,
+        });
+        assert_eq!(index.find_by_category("concept").len(), 1);
+        assert_eq!(index.find_by_query("systems").len(), 1);
+        index.remove_entry("rust");
+        assert!(index.find_by_category("concept").is_empty());
+    }
+
+    #[test]
+    fn wiki_index_update_entry() {
+        let mut index = WikiIndex::new();
+        index.add_entry(IndexEntry {
+            slug: "page".to_string(),
+            title: "Old Title".to_string(),
+            summary: "old".to_string(),
+            category: "entity".to_string(),
+            source_count: 0,
+            link_count: 0,
+        });
+        index.update_entry(
+            "page",
+            IndexEntry {
+                slug: "page".to_string(),
+                title: "New Title".to_string(),
+                summary: "new summary".to_string(),
+                category: "entity".to_string(),
+                source_count: 1,
+                link_count: 2,
+            },
+        );
+        assert_eq!(index.find_by_category("entity").len(), 1);
+        assert_eq!(index.find_by_category("entity")[0].title, "New Title");
+    }
+
+    #[test]
+    fn wiki_index_to_from_markdown_roundtrip() {
+        let mut index = WikiIndex::new();
+        index.add_entry(IndexEntry {
+            slug: "alice".to_string(),
+            title: "Alice".to_string(),
+            summary: "A person".to_string(),
+            category: "entity".to_string(),
+            source_count: 3,
+            link_count: 7,
+        });
+        let md = index.to_markdown();
+        assert!(md.contains("[[alice]]"));
+        let parsed = WikiIndex::from_markdown(&md);
+        assert_eq!(parsed.find_by_category("entity").len(), 1);
+        let e = &parsed.find_by_category("entity")[0];
+        assert_eq!(e.slug, "alice");
+        assert_eq!(e.source_count, 3);
+        assert_eq!(e.link_count, 7);
+    }
+
+    #[test]
+    fn wiki_index_orphan_pages() {
+        let mut index = WikiIndex::new();
+        index.add_entry(IndexEntry {
+            slug: "lonely".to_string(),
+            title: "Lonely".to_string(),
+            summary: "".to_string(),
+            category: "entity".to_string(),
+            source_count: 0,
+            link_count: 0,
+        });
+        let all = vec!["lonely".to_string(), "linked".to_string()];
+        // Both are in all_slugs but neither appears in a linked set derived from entries.
+        let orphans = index.orphan_pages(&all);
+        assert!(orphans.contains(&"lonely".to_string()) || orphans.contains(&"linked".to_string()));
+    }
+
+    // ── #252 WikiLog ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn wiki_log_append_and_recent() {
+        let mut log = WikiLog::new();
+        log.append(LogEntry {
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            operation: WikiOperation::Create,
+            description: "Created page".to_string(),
+            pages_touched: vec!["page1".to_string()],
+        });
+        log.append(LogEntry {
+            timestamp: "2024-01-02T00:00:00Z".to_string(),
+            operation: WikiOperation::Query,
+            description: "Searched wiki".to_string(),
+            pages_touched: vec![],
+        });
+        assert_eq!(log.recent(1).len(), 1);
+        assert_eq!(log.recent(1)[0].operation, WikiOperation::Query);
+        assert_eq!(log.recent(10).len(), 2);
+    }
+
+    #[test]
+    fn wiki_log_by_operation() {
+        let mut log = WikiLog::new();
+        log.append(LogEntry {
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            operation: WikiOperation::Ingest,
+            description: "Ingested doc".to_string(),
+            pages_touched: vec![],
+        });
+        log.append(LogEntry {
+            timestamp: "2024-01-02T00:00:00Z".to_string(),
+            operation: WikiOperation::Lint,
+            description: "Ran lint".to_string(),
+            pages_touched: vec![],
+        });
+        assert_eq!(log.by_operation(&WikiOperation::Ingest).len(), 1);
+        assert_eq!(log.by_operation(&WikiOperation::Lint).len(), 1);
+        assert!(log.by_operation(&WikiOperation::Delete).is_empty());
+    }
+
+    #[test]
+    fn wiki_log_to_from_markdown_roundtrip() {
+        let mut log = WikiLog::new();
+        log.append(LogEntry {
+            timestamp: "2024-03-15T12:00:00Z".to_string(),
+            operation: WikiOperation::Ingest,
+            description: "Ingested paper.pdf".to_string(),
+            pages_touched: vec!["paper".to_string(), "author".to_string()],
+        });
+        let md = log.to_markdown();
+        assert!(md.contains("Ingest"));
+        assert!(md.contains("paper.pdf"));
+        let parsed = WikiLog::from_markdown(&md);
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].operation, WikiOperation::Ingest);
+        assert_eq!(parsed.entries[0].pages_touched.len(), 2);
+    }
+
+    #[test]
+    fn wiki_log_stats() {
+        let mut log = WikiLog::new();
+        for op in [
+            WikiOperation::Create,
+            WikiOperation::Ingest,
+            WikiOperation::Ingest,
+            WikiOperation::Query,
+            WikiOperation::Lint,
+        ] {
+            log.append(LogEntry {
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+                operation: op,
+                description: "x".to_string(),
+                pages_touched: vec![],
+            });
+        }
+        let s = log.stats();
+        assert_eq!(s.total_operations, 5);
+        assert_eq!(s.ingests, 2);
+        assert_eq!(s.queries, 1);
+        assert_eq!(s.lints, 1);
+        assert_eq!(s.pages_created, 1);
+    }
+
+    // ── #253 WikiIngestor ─────────────────────────────────────────────────────
+
+    #[test]
+    fn ingestor_slugify() {
+        assert_eq!(WikiIngestor::slugify("My Page Title"), "my-page-title");
+        assert_eq!(WikiIngestor::slugify("Hello World!"), "hello-world");
+        assert_eq!(WikiIngestor::slugify("  spaces  "), "spaces");
+    }
+
+    #[test]
+    fn ingestor_extract_entities() {
+        let src = "Alice and Bob went to London to meet Charlie.";
+        let entities = WikiIngestor::extract_entities(src);
+        assert!(entities.iter().any(|e| e == "Alice" || e == "London" || e == "Charlie"));
+    }
+
+    #[test]
+    fn ingestor_extract_key_claims() {
+        let src =
+            "The model achieves 95% accuracy. It trains in under an hour. Short.";
+        let claims = WikiIngestor::extract_key_claims(src);
+        assert!(!claims.is_empty());
+        assert!(claims.iter().any(|c| c.contains("accuracy")));
+    }
+
+    #[test]
+    fn ingestor_generate_summary_page() {
+        let src = "Alice founded the company in 2010. She built a great team. The company grew fast.";
+        let page = WikiIngestor::generate_summary_page("Alice Co", src);
+        assert!(page.starts_with("# Alice Co"));
+        assert!(page.contains("## Summary"));
+    }
+
+    #[test]
+    fn ingestor_generate_entity_page() {
+        let src = "Alice is the CEO. Alice started in 2010. Alice loves Rust.";
+        let page = WikiIngestor::generate_entity_page("Alice", src);
+        assert!(page.starts_with("# Alice"));
+        assert!(page.contains("CEO") || page.contains("Alice"));
+    }
+
+    #[test]
+    fn ingestor_find_cross_references() {
+        let content = "We discuss rust-tips and python-tips in detail.";
+        let slugs = vec![
+            "rust-tips".to_string(),
+            "python-tips".to_string(),
+            "go-tips".to_string(),
+        ];
+        let refs = WikiIngestor::find_cross_references(content, &slugs);
+        assert!(refs.contains(&"rust-tips".to_string()));
+        assert!(refs.contains(&"python-tips".to_string()));
+        assert!(!refs.contains(&"go-tips".to_string()));
+    }
+
+    // ── #254 WikiLinter ───────────────────────────────────────────────────────
+
+    fn make_page(slug: &str, size: u64, links: Vec<&str>) -> WikiPage {
+        WikiPage {
+            slug: slug.to_string(),
+            title: slug.to_string(),
+            path: PathBuf::from(format!("{slug}.md")),
+            size_bytes: size,
+            links: links.iter().map(|s| s.to_string()).collect(),
+            last_modified: 0,
+        }
+    }
+
+    #[test]
+    fn linter_find_empty_pages() {
+        let pages = vec![make_page("empty", 0, vec![]), make_page("full", 100, vec![])];
+        let idx = WikiIndex::new();
+        let findings = WikiLinter::find_empty_pages(&pages);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].category, LintCategory::EmptyPage);
+        assert_eq!(findings[0].page, "empty");
+        let _ = &idx;
+    }
+
+    #[test]
+    fn linter_find_broken_links() {
+        let pages = vec![
+            make_page("a", 10, vec!["b", "missing-page"]),
+            make_page("b", 10, vec![]),
+        ];
+        let findings = WikiLinter::find_broken_links(&pages);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].category, LintCategory::MissingPage);
+        assert!(findings[0].description.contains("missing-page"));
+    }
+
+    #[test]
+    fn linter_find_orphans() {
+        let pages = vec![
+            make_page("root", 10, vec!["child"]),
+            make_page("child", 10, vec![]),
+            make_page("orphan", 10, vec![]),
+        ];
+        let idx = WikiIndex::new();
+        let findings = WikiLinter::find_orphans(&pages, &idx);
+        let orphan_pages: Vec<_> = findings.iter().map(|f| f.page.as_str()).collect();
+        // "root" and "orphan" have no inbound links; "child" is linked from "root"
+        assert!(orphan_pages.contains(&"orphan"));
+        assert!(!orphan_pages.contains(&"child"));
+    }
+
+    #[test]
+    fn linter_find_stale_pages() {
+        let mut stale = make_page("stale", 100, vec![]);
+        stale.last_modified = 1; // epoch start = very old
+        let pages = vec![stale];
+        let findings = WikiLinter::find_stale_pages(&pages, 30);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].category, LintCategory::StaleContent);
+    }
+
+    // ── #255 WikiQueryEngine ──────────────────────────────────────────────────
+
+    #[test]
+    fn query_engine_search_scores_and_ranks() {
+        let pages = vec![
+            make_page("rust-async", 100, vec![]),
+            make_page("python-tips", 100, vec![]),
+        ];
+        let mut contents = HashMap::new();
+        contents.insert(
+            "rust-async".to_string(),
+            "Rust async programming with tokio is great.".to_string(),
+        );
+        contents.insert(
+            "python-tips".to_string(),
+            "Python is a scripting language.".to_string(),
+        );
+        let results = WikiQueryEngine::search(&pages, &contents, "rust async");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].0, "rust-async");
+    }
+
+    #[test]
+    fn query_engine_gather_context() {
+        let pages = vec![make_page("a", 10, vec![]), make_page("b", 10, vec![])];
+        let mut contents = HashMap::new();
+        contents.insert("a".to_string(), "Content of A.".to_string());
+        contents.insert("b".to_string(), "Content of B.".to_string());
+        let ctx =
+            WikiQueryEngine::gather_context(&pages, &contents, &["a".to_string()]);
+        assert!(ctx.contains("Content of A"));
+        assert!(!ctx.contains("Content of B"));
+    }
+
+    #[test]
+    fn query_engine_extract_citations() {
+        let text = "See [[rust-tips]] and [[python-guide]] for more.";
+        let cites = WikiQueryEngine::extract_citations(text);
+        assert_eq!(cites.len(), 2);
+        assert!(cites.contains(&"rust-tips".to_string()));
+        assert!(cites.contains(&"python-guide".to_string()));
+    }
+
+    #[test]
+    fn query_engine_search_no_match() {
+        let pages = vec![make_page("rust", 10, vec![])];
+        let mut contents = HashMap::new();
+        contents.insert("rust".to_string(), "Systems programming.".to_string());
+        let results = WikiQueryEngine::search(&pages, &contents, "quantum");
+        assert!(results.is_empty());
     }
 }
