@@ -1524,6 +1524,58 @@ fn tokenize(input: &str) -> HashSet<String> {
         .collect()
 }
 
+/// Captures a full telemetry snapshot as a JSON value for SQLite persistence.
+/// Call this at the end of each agent turn or session to persist state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetrySnapshot {
+    pub context_rot_score: f64,
+    pub context_rot_trend: String,
+    pub drift_score: f64,
+    pub degradation_stage: String,
+    pub attention_remaining: f64,
+    pub attention_zone: String,
+    pub active_tree_branches: usize,
+    pub tree_depth: usize,
+    pub total_tokens_used: usize,
+    pub timestamp_ms: u64,
+}
+
+impl TelemetrySnapshot {
+    /// Build a snapshot from the live telemetry trackers
+    pub fn capture(
+        rot: &ContextRotDetector,
+        drift: &BehavioralDriftDetector,
+        degradation: &CognitiveDegradationBreaker,
+        attention: &AttentionBudgetTracker,
+        tree: &AgenticTreeTracker,
+    ) -> Self {
+        Self {
+            context_rot_score: rot.rot_score(),
+            context_rot_trend: format!("{:?}", rot.trend()),
+            drift_score: drift.drift_score(),
+            degradation_stage: format!("{:?}", degradation.current_stage()),
+            attention_remaining: attention.remaining_attention(),
+            attention_zone: format!("{:?}", attention.attention_zone()),
+            active_tree_branches: tree.active_branches().len(),
+            tree_depth: tree.depth(),
+            total_tokens_used: attention
+                .measurements
+                .last()
+                .map(|m| m.tokens_used)
+                .unwrap_or(0),
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }
+    }
+
+    /// Convert to serde_json::Value for storage
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
