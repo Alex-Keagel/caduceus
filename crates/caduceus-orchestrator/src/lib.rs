@@ -1538,6 +1538,7 @@ mod tests {
 
     // ── Parity test scenarios ──────────────────────────────────────────────────
 
+    use caduceus_core::ToolUse;
     use caduceus_providers::mock::MockLlmAdapter;
     use caduceus_providers::StreamChunk;
     use caduceus_tools::{BashTool, ReadFileTool};
@@ -2094,6 +2095,211 @@ mod tests {
             token.is_cancelled(),
             "cancel() should set the token to cancelled"
         );
+    }
+
+    // ── P2: Integration tests for tool loop, circuit breaker, timeout, capabilities ──
+
+    #[tokio::test]
+    async fn harness_tool_loop_executes_tool_and_continues() {
+        // Simulate: LLM returns tool_use → tool executes → LLM returns final text
+        let tool_response = ChatResponse {
+            content: "I'll read the file.".to_string(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: StopReason::ToolUse,
+            tool_calls: vec![ToolUse {
+                id: "tc_1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "test.txt"}),
+            }],
+        };
+        let final_response = make_chat_response("Done reading the file.");
+
+        let adapter = Arc::new(MockLlmAdapter::new(vec![tool_response, final_response]));
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.txt"), "hello world").unwrap();
+
+        let mut registry = caduceus_tools::ToolRegistry::new();
+        registry.register(Arc::new(ReadFileTool::new(dir.path())));
+
+        let harness = AgentHarness::new(adapter, registry, 200_000, "test");
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+
+        let result = harness.run(&mut state, &mut history, "read test.txt").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Done reading the file.");
+        // History should contain: user, assistant+tool_call, tool_result, assistant
+        assert!(history.messages().len() >= 4);
+    }
+
+    #[tokio::test]
+    async fn harness_circuit_breaker_triggers_on_failures() {
+        // 6 consecutive tool calls that all fail → circuit breaker at 5
+        let mut responses = Vec::new();
+        for i in 0..6 {
+            responses.push(ChatResponse {
+                content: format!("attempt {i}"),
+                input_tokens: 5,
+                output_tokens: 5,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                stop_reason: StopReason::ToolUse,
+                tool_calls: vec![ToolUse {
+                    id: format!("tc_{i}"),
+                    name: "nonexistent_tool".into(),
+                    input: serde_json::json!({}),
+                }],
+            });
+        }
+        let adapter = Arc::new(MockLlmAdapter::new(responses));
+        let registry = caduceus_tools::ToolRegistry::new(); // empty — all calls fail
+
+        let harness = AgentHarness::new(adapter, registry, 200_000, "test");
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+
+        let result = harness.run(&mut state, &mut history, "do something").await;
+        assert!(result.is_ok());
+        let text = result.unwrap();
+        assert!(
+            text.contains("Circuit breaker"),
+            "Expected circuit breaker message, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn harness_empty_tool_calls_with_tool_use_stop_reason() {
+        // LLM says stop_reason=ToolUse but tool_calls is empty → treat as end
+        let response = ChatResponse {
+            content: "Here's my answer.".to_string(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: StopReason::ToolUse,
+            tool_calls: vec![], // empty!
+        };
+        let adapter = Arc::new(MockLlmAdapter::new(vec![response]));
+        let registry = caduceus_tools::ToolRegistry::new();
+
+        let harness = AgentHarness::new(adapter, registry, 200_000, "test");
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+
+        let result = harness.run(&mut state, &mut history, "hello").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Here's my answer.");
+    }
+
+    #[tokio::test]
+    async fn harness_cancellation_stops_loop() {
+        // Set up a long-running scenario, cancel before it starts
+        let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response(
+            "should not reach",
+        )]));
+        let registry = caduceus_tools::ToolRegistry::new();
+
+        let token = CancellationToken::new();
+        token.cancel(); // pre-cancel
+
+        let harness =
+            AgentHarness::new(adapter, registry, 200_000, "test").with_cancellation_token(token);
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+
+        let result = harness.run(&mut state, &mut history, "hello").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn harness_tool_result_preserves_content_and_error_flag() {
+        // Tool returns an error → tool result in history should have is_error=true
+        let tool_response = ChatResponse {
+            content: "".to_string(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: StopReason::ToolUse,
+            tool_calls: vec![ToolUse {
+                id: "tc_err".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "nonexistent_file_xyz.txt"}),
+            }],
+        };
+        let final_response = make_chat_response("File not found.");
+
+        let adapter = Arc::new(MockLlmAdapter::new(vec![tool_response, final_response]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = caduceus_tools::ToolRegistry::new();
+        registry.register(Arc::new(ReadFileTool::new(dir.path())));
+
+        let harness = AgentHarness::new(adapter, registry, 200_000, "test");
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+
+        let _ = harness
+            .run(&mut state, &mut history, "read missing file")
+            .await;
+
+        // Find the tool result message
+        let tool_msg = history.messages().iter().find(|m| m.role == "tool");
+        assert!(tool_msg.is_some(), "Should have a tool result message");
+        let tool_msg = tool_msg.unwrap();
+        assert!(tool_msg.tool_result.is_some());
+        let tr = tool_msg.tool_result.as_ref().unwrap();
+        assert!(tr.is_error, "Tool result should be marked as error");
+        assert!(
+            !tr.content.is_empty(),
+            "Tool result content should not be empty"
+        );
+        assert_eq!(tr.tool_use_id.as_deref(), Some("tc_err"));
+    }
+
+    #[tokio::test]
+    async fn harness_phase_resets_on_provider_error() {
+        // Provider that always errors
+        let adapter = Arc::new(MockLlmAdapter::new(vec![])); // empty = error on chat
+        let registry = caduceus_tools::ToolRegistry::new();
+
+        let harness = AgentHarness::new(adapter, registry, 200_000, "test");
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+
+        let result = harness.run(&mut state, &mut history, "hello").await;
+        assert!(result.is_err());
+        assert_eq!(
+            state.phase,
+            SessionPhase::Idle,
+            "Phase should reset to Idle on error"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_enforcement_blocks_restricted_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry =
+            caduceus_tools::ToolRegistry::new().with_capabilities(["fs_read"].iter().copied());
+        registry.register(Arc::new(ReadFileTool::new(dir.path())));
+        // BashTool requires "process_exec" capability
+        registry.register(Arc::new(BashTool::new(dir.path())));
+
+        // Bash should be blocked
+        let result = registry
+            .execute("bash", serde_json::json!({"command": "echo hi"}))
+            .await;
+        assert!(result.is_ok());
+        let tr = result.unwrap();
+        assert!(
+            tr.is_error,
+            "Bash should be denied with fs_read-only capabilities"
+        );
+        assert!(tr.content.contains("Permission denied"));
     }
 
     // ── #234: ExecutionTreeViz tests ──────────────────────────────────────────
