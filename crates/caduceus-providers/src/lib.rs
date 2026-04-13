@@ -1427,6 +1427,15 @@ struct GeminiCandidateContent {
 struct GeminiPart {
     #[serde(default)]
     text: Option<String>,
+    #[serde(default, rename = "functionCall")]
+    function_call: Option<GeminiFunctionCall>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiFunctionCall {
+    name: String,
+    #[serde(default)]
+    args: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1474,17 +1483,41 @@ fn parse_gemini_chat_response(body: &str) -> Result<ChatResponse> {
         cached_content_token_count: 0,
     });
 
+    // Extract tool calls from function_call parts
+    let tool_calls: Vec<ToolUse> = candidate
+        .and_then(|c| c.content.as_ref())
+        .map(|content| {
+            content
+                .parts
+                .iter()
+                .filter_map(|part| {
+                    part.function_call.as_ref().map(|fc| ToolUse {
+                        id: format!("gemini_{}", fc.name),
+                        name: fc.name.clone(),
+                        input: fc.args.clone(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let stop_reason = if !tool_calls.is_empty() {
+        StopReason::ToolUse
+    } else {
+        candidate
+            .and_then(|candidate| candidate.finish_reason.as_deref())
+            .map(map_gemini_finish_reason)
+            .unwrap_or(StopReason::EndTurn)
+    };
+
     Ok(ChatResponse {
         content,
         input_tokens: usage.prompt_token_count,
         output_tokens: usage.candidates_token_count,
         cache_read_tokens: usage.cached_content_token_count,
         cache_creation_tokens: 0,
-        stop_reason: candidate
-            .and_then(|candidate| candidate.finish_reason.as_deref())
-            .map(map_gemini_finish_reason)
-            .unwrap_or(StopReason::EndTurn),
-        tool_calls: vec![],
+        stop_reason,
+        tool_calls,
     })
 }
 
@@ -1573,24 +1606,62 @@ impl GeminiAdapter {
             .iter()
             .filter(|message| message.role != "system")
         {
-            let gemini_role = if message.role == "assistant" {
-                "model"
+            if message.role == "tool" {
+                // Tool result → Gemini uses functionResponse part
+                let tool_use_id = message
+                    .tool_result
+                    .as_ref()
+                    .and_then(|r| r.tool_use_id.clone())
+                    .unwrap_or_default();
+                // Extract tool name from tool_use_id (we prefixed with "gemini_")
+                let name = tool_use_id.strip_prefix("gemini_").unwrap_or(&tool_use_id);
+                contents.push(serde_json::json!({
+                    "role": "user",
+                    "parts": [{
+                        "functionResponse": {
+                            "name": name,
+                            "response": {
+                                "content": message.content_text(),
+                            }
+                        }
+                    }]
+                }));
+            } else if message.role == "assistant" && !message.tool_calls.is_empty() {
+                // Assistant with tool calls → model role with functionCall parts
+                let mut parts: Vec<serde_json::Value> = Vec::new();
+                let text = message.content_text();
+                if !text.is_empty() {
+                    parts.push(serde_json::json!({ "text": text }));
+                }
+                for tc in &message.tool_calls {
+                    parts.push(serde_json::json!({
+                        "functionCall": {
+                            "name": tc.name,
+                            "args": tc.input,
+                        }
+                    }));
+                }
+                contents.push(serde_json::json!({ "role": "model", "parts": parts }));
             } else {
-                &message.role
-            };
-            contents.push(serde_json::json!({
-                "role": gemini_role,
-                "parts": message
-                    .content_blocks()
-                    .iter()
-                    .map(|block| match block {
-                        MessageContentBlock::Text { text, .. } => serde_json::json!({ "text": text }),
-                        MessageContentBlock::Image { base64, media_type } => serde_json::json!({
-                            "inline_data": {"mime_type": media_type, "data": base64}
-                        }),
-                    })
-                    .collect::<Vec<_>>(),
-            }));
+                let gemini_role = if message.role == "assistant" {
+                    "model"
+                } else {
+                    &message.role
+                };
+                contents.push(serde_json::json!({
+                    "role": gemini_role,
+                    "parts": message
+                        .content_blocks()
+                        .iter()
+                        .map(|block| match block {
+                            MessageContentBlock::Text { text, .. } => serde_json::json!({ "text": text }),
+                            MessageContentBlock::Image { base64, media_type } => serde_json::json!({
+                                "inline_data": {"mime_type": media_type, "data": base64}
+                            }),
+                        })
+                        .collect::<Vec<_>>(),
+                }));
+            }
         }
 
         let mut body = serde_json::json!({
@@ -1599,6 +1670,24 @@ impl GeminiAdapter {
                 "maxOutputTokens": request.max_tokens,
             }
         });
+
+        // Serialize tool definitions for Gemini
+        if !request.tools.is_empty() {
+            let function_declarations: Vec<serde_json::Value> = request
+                .tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::json!([{
+                "functionDeclarations": function_declarations,
+            }]);
+        }
 
         if let Some(ref system) = request.system {
             body["systemInstruction"] = serde_json::json!({

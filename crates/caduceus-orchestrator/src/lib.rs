@@ -549,6 +549,13 @@ impl ContextAssembler {
 
         // Reverse to restore chronological order
         to_include.reverse();
+
+        // Safety: never start with a "tool" role message (orphaned tool result).
+        // Drop leading tool messages — they need their preceding assistant+tool_calls.
+        while to_include.first().is_some_and(|m| m.role == "tool") {
+            to_include.remove(0);
+        }
+
         result.extend(to_include);
         result
     }
@@ -612,7 +619,9 @@ impl AgentEventEmitter {
     }
 
     pub async fn emit(&self, event: AgentEvent) {
-        let _ = self.tx.send(event).await;
+        // Use try_send to avoid blocking the agent loop if the event consumer is slow.
+        // Events are best-effort for UI display — dropping is better than deadlocking.
+        let _ = self.tx.try_send(event);
     }
 
     pub async fn emit_text_delta(&self, text: impl Into<String>) {
@@ -2299,6 +2308,104 @@ mod tests {
             "Bash should be denied with fs_read-only capabilities"
         );
         assert!(tr.content.contains("Permission denied"));
+    }
+
+    #[tokio::test]
+    async fn e2e_tool_round_trip_with_file() {
+        // Full E2E: user asks to read a file → LLM returns tool_use → tool executes
+        // → result fed back → LLM returns final answer
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "world").unwrap();
+
+        // Mock: first response = tool call, second = final text
+        let tool_response = ChatResponse {
+            content: "".to_string(),
+            input_tokens: 50,
+            output_tokens: 30,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: StopReason::ToolUse,
+            tool_calls: vec![ToolUse {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "hello.txt"}),
+            }],
+        };
+        let final_response = ChatResponse {
+            content: "The file contains: world".to_string(),
+            input_tokens: 80,
+            output_tokens: 10,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: StopReason::EndTurn,
+            tool_calls: vec![],
+        };
+
+        let adapter = Arc::new(MockLlmAdapter::new(vec![tool_response, final_response]));
+
+        let mut registry = caduceus_tools::ToolRegistry::new();
+        registry.register(Arc::new(ReadFileTool::new(dir.path())));
+
+        let (emitter, mut rx) = AgentEventEmitter::channel(64);
+
+        let harness = AgentHarness::new(
+            adapter.clone(),
+            registry,
+            200_000,
+            "You are a helpful assistant.",
+        )
+        .with_emitter(emitter);
+
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+
+        let result = harness
+            .run(&mut state, &mut history, "What's in hello.txt?")
+            .await;
+
+        // Verify result
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "The file contains: world");
+
+        // Verify token budget was updated
+        assert!(state.token_budget.used_input > 0);
+        assert!(state.token_budget.used_output > 0);
+
+        // Verify history has all messages: user, assistant+tool_call, tool_result, assistant
+        let msgs = history.messages();
+        assert!(msgs.len() >= 4, "Expected 4+ messages, got {}", msgs.len());
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[1].role, "assistant");
+        assert!(
+            !msgs[1].tool_calls.is_empty(),
+            "Assistant should have tool_calls"
+        );
+        assert_eq!(msgs[2].role, "tool");
+        assert!(msgs[2].tool_result.is_some());
+        assert!(!msgs[2].tool_result.as_ref().unwrap().is_error);
+        assert!(msgs[2].content.contains("world"));
+        assert_eq!(msgs[3].role, "assistant");
+
+        // Verify events were emitted (drain the channel)
+        drop(harness); // drop emitter so channel closes
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        // Should have: phase_changed(Running), thinking, text_delta OR tool_start,
+        // tool_result, turn_complete, phase_changed(Idle)
+        assert!(
+            events.len() >= 4,
+            "Expected 4+ events, got {}",
+            events.len()
+        );
+
+        // Verify the LLM received 2 calls (tool call + final)
+        let requests = adapter.recorded_requests();
+        assert_eq!(requests.len(), 2);
+        // Second request should include tool result in messages
+        let second_msgs = &requests[1].messages;
+        assert!(second_msgs.iter().any(|m| m.role == "tool"));
     }
 
     // ── #234: ExecutionTreeViz tests ──────────────────────────────────────────
