@@ -4405,6 +4405,306 @@ impl CryptoWeaknessDetector {
     }
 }
 
+// ── Additional tools needed for full agent loop ───────────────────────────────
+
+/// Think tool — allows the LLM to reason internally without taking action.
+pub struct ThinkTool;
+
+impl ThinkTool {
+    pub fn new() -> Self { Self }
+}
+
+#[async_trait]
+impl Tool for ThinkTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "think".into(),
+            description: "Use this tool to think through a problem step by step. Your reasoning will not be shown to the user — use it for internal planning.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "thought": {"type": "string", "description": "Your reasoning process"}
+                },
+                "required": ["thought"]
+            }),
+            required_capability: None,
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let thought = input["thought"].as_str().unwrap_or("");
+        Ok(ToolResult::success(format!("[Thinking complete — {} chars of reasoning]", thought.len())))
+    }
+}
+
+/// AttemptCompletion tool — signals the agent considers the task done.
+pub struct AttemptCompletionTool;
+
+impl AttemptCompletionTool {
+    pub fn new() -> Self { Self }
+}
+
+#[async_trait]
+impl Tool for AttemptCompletionTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "attempt_completion".into(),
+            description: "Use this when you believe the task is complete. Provide a summary of what was done.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "result": {"type": "string", "description": "Summary of what was accomplished"},
+                    "command": {"type": "string", "description": "Optional command to verify (e.g. test command)"}
+                },
+                "required": ["result"]
+            }),
+            required_capability: None,
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let result = input["result"].as_str().unwrap_or("Task completed.");
+        Ok(ToolResult::success(result))
+    }
+}
+
+/// AskFollowup tool — asks the user a clarifying question.
+pub struct AskFollowupTool;
+
+impl AskFollowupTool {
+    pub fn new() -> Self { Self }
+}
+
+#[async_trait]
+impl Tool for AskFollowupTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "ask_followup".into(),
+            description: "Ask the user a clarifying question when you need more information.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The question to ask"}
+                },
+                "required": ["question"]
+            }),
+            required_capability: None,
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let question = input["question"].as_str().unwrap_or("Could you clarify?");
+        Ok(ToolResult::success(format!("[Question for user: {}]", question)))
+    }
+}
+
+/// CreateFile tool — creates a new file (fails if exists).
+pub struct CreateFileTool {
+    workspace_root: PathBuf,
+}
+
+impl CreateFileTool {
+    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        Self { workspace_root: workspace_root.into() }
+    }
+}
+
+#[async_trait]
+impl Tool for CreateFileTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "create_file".into(),
+            description: "Create a new file. Fails if the file already exists.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to workspace"},
+                    "content": {"type": "string", "description": "File content"}
+                },
+                "required": ["path", "content"]
+            }),
+            required_capability: Some("write".into()),
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let path_str = input["path"].as_str().unwrap_or("");
+        let content = input["content"].as_str().unwrap_or("");
+        let full = resolve_workspace_path(&self.workspace_root, path_str)?;
+        if full.exists() {
+            return Ok(ToolResult::error(format!("File already exists: {path_str}")));
+        }
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| CaduceusError::Tool {
+                tool: "create_file".into(), message: e.to_string(),
+            })?;
+        }
+        std::fs::write(&full, content).map_err(|e| CaduceusError::Tool {
+            tool: "create_file".into(), message: e.to_string(),
+        })?;
+        Ok(ToolResult::success(format!("Created {path_str} ({} bytes)", content.len())))
+    }
+}
+
+/// DeleteFile tool.
+pub struct DeleteFileTool {
+    workspace_root: PathBuf,
+}
+
+impl DeleteFileTool {
+    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        Self { workspace_root: workspace_root.into() }
+    }
+}
+
+#[async_trait]
+impl Tool for DeleteFileTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "delete_file".into(),
+            description: "Delete a file.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to workspace"}
+                },
+                "required": ["path"]
+            }),
+            required_capability: Some("write".into()),
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let path_str = input["path"].as_str().unwrap_or("");
+        let full = resolve_workspace_path(&self.workspace_root, path_str)?;
+        std::fs::remove_file(&full).map_err(|e| CaduceusError::Tool {
+            tool: "delete_file".into(), message: e.to_string(),
+        })?;
+        Ok(ToolResult::success(format!("Deleted {path_str}")))
+    }
+}
+
+/// RenameFile tool.
+pub struct RenameFileTool {
+    workspace_root: PathBuf,
+}
+
+impl RenameFileTool {
+    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        Self { workspace_root: workspace_root.into() }
+    }
+}
+
+#[async_trait]
+impl Tool for RenameFileTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "rename_file".into(),
+            description: "Rename or move a file.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "old_path": {"type": "string", "description": "Current file path"},
+                    "new_path": {"type": "string", "description": "New file path"}
+                },
+                "required": ["old_path", "new_path"]
+            }),
+            required_capability: Some("write".into()),
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let old = input["old_path"].as_str().unwrap_or("");
+        let new = input["new_path"].as_str().unwrap_or("");
+        let old_full = resolve_workspace_path(&self.workspace_root, old)?;
+        let new_full = resolve_workspace_path(&self.workspace_root, new)?;
+        if let Some(parent) = new_full.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::rename(&old_full, &new_full).map_err(|e| CaduceusError::Tool {
+            tool: "rename_file".into(), message: e.to_string(),
+        })?;
+        Ok(ToolResult::success(format!("Renamed {old} → {new}")))
+    }
+}
+
+/// GitCommit tool.
+pub struct GitCommitTool {
+    workspace_root: PathBuf,
+}
+
+impl GitCommitTool {
+    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        Self { workspace_root: workspace_root.into() }
+    }
+}
+
+#[async_trait]
+impl Tool for GitCommitTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_commit".into(),
+            description: "Stage all changes and commit with a message.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Commit message"}
+                },
+                "required": ["message"]
+            }),
+            required_capability: Some("git_write".into()),
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let msg = input["message"].as_str().unwrap_or("auto-commit");
+        let _ = std::process::Command::new("git").args(["add", "-A"]).current_dir(&self.workspace_root).output();
+        let output = std::process::Command::new("git").args(["commit", "-m", msg])
+            .current_dir(&self.workspace_root).output()
+            .map_err(|e| CaduceusError::Tool { tool: "git_commit".into(), message: e.to_string() })?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok(ToolResult::success(format!("{stdout}{stderr}")))
+    }
+}
+
+/// GitLog tool.
+pub struct GitLogTool {
+    workspace_root: PathBuf,
+}
+
+impl GitLogTool {
+    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        Self { workspace_root: workspace_root.into() }
+    }
+}
+
+#[async_trait]
+impl Tool for GitLogTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_log".into(),
+            description: "Show recent git commit history.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "count": {"type": "integer", "description": "Number of commits (default 10)"}
+                }
+            }),
+            required_capability: None,
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let count = input["count"].as_u64().unwrap_or(10);
+        let output = std::process::Command::new("git")
+            .args(["log", "--oneline", &format!("-{count}")])
+            .current_dir(&self.workspace_root).output()
+            .map_err(|e| CaduceusError::Tool { tool: "git_log".into(), message: e.to_string() })?;
+        Ok(ToolResult::success(String::from_utf8_lossy(&output.stdout).to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
