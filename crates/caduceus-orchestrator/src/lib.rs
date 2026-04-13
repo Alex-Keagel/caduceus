@@ -26,9 +26,9 @@ pub use workers::{
 
 use caduceus_core::{
     AgentEvent, CaduceusError, CancellationToken, ModelId, ProviderId, Result, SessionId,
-    SessionPhase, SessionState, StopReason, TokenUsage, ToolCallId, WarningLevel,
+    SessionPhase, SessionState, TokenUsage, ToolCallId, WarningLevel,
 };
-use caduceus_providers::{ChatRequest, LlmAdapter};
+use caduceus_providers::{ChatRequest, ChatResponse, LlmAdapter, StopReason};
 use caduceus_tools::ToolRegistry;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -643,6 +643,7 @@ impl AgentEventEmitter {
     }
 
     pub async fn emit_turn_complete(&self, stop_reason: StopReason, usage: TokenUsage) {
+        let stop_reason = match stop_reason { StopReason::EndTurn => caduceus_core::StopReason::EndTurn, StopReason::MaxTokens => caduceus_core::StopReason::MaxTokens, StopReason::StopSequence => caduceus_core::StopReason::StopSequence, StopReason::ToolUse => caduceus_core::StopReason::ToolUse, };
         self.emit(AgentEvent::TurnComplete { stop_reason, usage })
             .await;
     }
@@ -828,7 +829,7 @@ impl AgentHarness {
     ///
     /// 1. Append user message to conversation history
     /// 2. Assemble context within token budget
-    /// 3. Send to LLM
+    /// 3. Send to LLM (non-streaming for tool calls, streaming for final text)
     /// 4. If stop_reason == ToolUse, execute each tool call, feed results back
     /// 5. Repeat until EndTurn / MaxTokens / max_turns exhausted
     /// 6. Return final assistant text
@@ -838,7 +839,6 @@ impl AgentHarness {
         history: &mut ConversationHistory,
         user_input: &str,
     ) -> Result<String> {
-        // Check cancellation before starting
         self.check_cancellation()?;
 
         state.phase = SessionPhase::Running;
@@ -850,12 +850,9 @@ impl AgentHarness {
 
         let system_prompt = self.effective_system_prompt();
         let assembler = ContextAssembler::new(self.max_context_tokens, &system_prompt);
-        let final_text;
+        let tool_specs = self.tools.specs();
 
-        // Check cancellation before LLM call
-        self.check_cancellation()?;
-
-        // Emit token warning if applicable
+        // Token budget warning
         let warning = state.token_budget.warning_level();
         if warning != WarningLevel::None {
             if let Some(ref em) = self.emitter {
@@ -869,10 +866,42 @@ impl AgentHarness {
             }
         }
 
-        {
+        let mut loop_detector = LoopDetector::new(20, 3);
+        let mut consecutive_failures: u32 = 0;
+        let mut final_text = String::new();
+        let mut tool_sequence: Vec<String> = Vec::new();
+
+        // ── Tool-calling loop ─────────────────────────────────────────────────
+        for iteration in 0..self.max_tool_rounds {
+            self.check_cancellation()?;
+
+            // Circuit breaker: too many consecutive failures
+            if consecutive_failures >= 5 {
+                if let Some(ref em) = self.emitter {
+                    em.emit_error(&format!(
+                        "Circuit breaker: {} consecutive tool failures. Last: {}",
+                        consecutive_failures,
+                        tool_sequence.last().unwrap_or(&"none".to_string())
+                    )).await;
+                }
+                final_text = format!(
+                    "🛑 Circuit breaker triggered after {} consecutive tool failures.\n\
+                    Last tools: {}\nPlease simplify the request or check the working directory.",
+                    consecutive_failures,
+                    tool_sequence.iter().rev().take(5).cloned().collect::<Vec<_>>().join(", ")
+                );
+                break;
+            }
+
+            // Emit thinking event
+            if let Some(ref em) = self.emitter {
+                em.emit_text_delta(&format!("[Thinking… iteration {}]", iteration + 1)).await;
+            }
+
+            // Assemble messages within budget
             let messages = assembler.assemble(history);
 
-            let mut request = ChatRequest {
+            let request = ChatRequest {
                 model: self.effective_model(state),
                 messages,
                 system: Some(system_prompt.clone()),
@@ -880,55 +909,119 @@ impl AgentHarness {
                 temperature: self.effective_temperature(),
                 thinking_mode: false,
                 tool_choice: None,
-                tools: vec![],
+                tools: tool_specs.clone(),
                 response_format: None,
             };
 
-            // Apply thinking mode: prepend chain-of-thought instruction
-            if request.thinking_mode {
-                if let Some(ref sys) = request.system {
-                    request.system = Some(format!("Think step by step.\n\n{}", sys));
-                }
-                request.max_tokens = request.max_tokens.max(8192);
-            }
+            // Call LLM (non-streaming to get tool_calls)
+            let response = self.provider.chat(request).await?;
 
-            let mut stream = self.provider.stream(request).await?;
-            let mut usage = TokenUsage::default();
-            let mut response_content = String::new();
-
-            while let Some(chunk) = stream.next().await {
-                // Check cancellation during streaming
-                self.check_cancellation()?;
-
-                let chunk = chunk?;
-                if !chunk.delta.is_empty() {
-                    response_content.push_str(&chunk.delta);
-                    if let Some(ref em) = self.emitter {
-                        em.emit_text_delta(&chunk.delta).await;
-                    }
-                }
-
-                if let Some(input_tokens) = chunk.input_tokens {
-                    usage.input_tokens = input_tokens;
-                }
-                if let Some(output_tokens) = chunk.output_tokens {
-                    usage.output_tokens = output_tokens;
-                }
-
-                if chunk.is_final {
-                    break;
-                }
-            }
-
-            state.token_budget.used_input += usage.input_tokens;
-            state.token_budget.used_output += usage.output_tokens;
+            // Update token budget
+            state.token_budget.used_input += response.input_tokens;
+            state.token_budget.used_output += response.output_tokens;
             state.turn_count += 1;
 
-            history.append(caduceus_providers::Message::assistant(&response_content));
-            if let Some(ref em) = self.emitter {
-                em.emit_turn_complete(StopReason::EndTurn, usage).await;
+            // Emit text content if any
+            if !response.content.is_empty() {
+                if let Some(ref em) = self.emitter {
+                    em.emit_text_delta(&response.content).await;
+                }
             }
-            final_text = response_content;
+
+            // Check stop reason
+            match response.stop_reason {
+                StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
+                    // No tool calls — final response
+                    history.append(caduceus_providers::Message::assistant(&response.content));
+                    final_text = response.content;
+                    if let Some(ref em) = self.emitter {
+                        em.emit_turn_complete(response.stop_reason.clone(), TokenUsage {
+                            input_tokens: response.input_tokens,
+                            output_tokens: response.output_tokens,
+                            cache_read_tokens: response.cache_read_tokens,
+                            cache_write_tokens: response.cache_creation_tokens,
+                        }).await;
+                    }
+                    break;
+                }
+                StopReason::ToolUse => {
+                    if response.tool_calls.is_empty() {
+                        // stop_reason says tool_use but no tool_calls — treat as end
+                        history.append(caduceus_providers::Message::assistant(&response.content));
+                        final_text = response.content;
+                        break;
+                    }
+
+                    // Store assistant message with tool calls in history
+                    let mut assistant_msg = caduceus_providers::Message::assistant(&response.content);
+                    assistant_msg.tool_calls = response.tool_calls.clone();
+                    history.append(assistant_msg);
+
+                    // Execute each tool call
+                    for tool_use in &response.tool_calls {
+                        // Loop detection
+                        if loop_detector.record(&tool_use.name, &tool_use.input) {
+                            if let Some(ref em) = self.emitter {
+                                em.emit_error(&format!(
+                                    "Loop detected: tool '{}' called repeatedly with same args",
+                                    tool_use.name
+                                )).await;
+                            }
+                            consecutive_failures += 1;
+                        }
+
+                        tool_sequence.push(tool_use.name.clone());
+
+                        // Emit tool start event
+                        if let Some(ref em) = self.emitter {
+                            em.emit_tool_call_start(caduceus_core::ToolCallId(tool_use.id.clone()), &tool_use.name).await;
+                        }
+
+                        // Execute tool
+                        let result = self.tools.execute(&tool_use.name, tool_use.input.clone()).await;
+
+                        let (result_content, is_error) = match result {
+                            Ok(r) => {
+                                if r.is_error {
+                                    consecutive_failures += 1;
+                                } else {
+                                    consecutive_failures = 0;
+                                }
+                                (r.content, r.is_error)
+                            }
+                            Err(e) => {
+                                consecutive_failures += 1;
+                                (e.to_string(), true)
+                            }
+                        };
+
+                        // Emit tool complete event
+                        if let Some(ref em) = self.emitter {
+                            em.emit_tool_result_end(caduceus_core::ToolCallId(tool_use.id.clone()), &result_content, is_error).await;
+                        }
+
+                        // Add tool result to history
+                        let mut tool_msg = caduceus_providers::Message {
+                            role: "tool".into(),
+                            content: result_content,
+                            content_blocks: None,
+                            tool_calls: vec![],
+                            tool_result: Some(caduceus_core::ToolResult::success("").with_tool_use_id(&tool_use.id)),
+                        };
+                        tool_msg.content = tool_msg.content.clone();
+                        history.append(tool_msg);
+                    }
+                }
+            }
+        }
+
+        // Fallback if loop exhausted
+        if final_text.is_empty() {
+            final_text = format!(
+                "⚠️ Agent used all {} tool iterations.\nTools: {}\nUse /compact or simplify.",
+                self.max_tool_rounds,
+                tool_sequence.join(", ")
+            );
         }
 
         state.phase = SessionPhase::Idle;
@@ -1309,6 +1402,18 @@ mod tests {
         )
     }
 
+    fn make_chat_response(text: &str) -> ChatResponse {
+        ChatResponse {
+            content: text.to_string(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: StopReason::EndTurn,
+            tool_calls: vec![],
+        }
+    }
+
     /// 1. read_only_tool_execution — read_file works without write permission
     #[tokio::test]
     async fn read_only_tool_execution() {
@@ -1384,8 +1489,7 @@ mod tests {
     #[tokio::test]
     async fn empty_input_noop() {
         let adapter = Arc::new(
-            MockLlmAdapter::new(vec![])
-                .with_stream_chunks(vec![make_final_stream("Please provide a message.")]),
+            MockLlmAdapter::new(vec![make_chat_response("Please provide a message.")]),
         );
         let harness =
             AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
@@ -1395,12 +1499,12 @@ mod tests {
         assert!(!result.is_empty());
     }
 
-    /// 6. rate_limit_recovery — successive turns both succeed (models retry after transient failure)
+    /// 6. rate_limit_recovery — successive turns both succeed
     #[tokio::test]
     async fn rate_limit_recovery() {
-        let adapter = Arc::new(MockLlmAdapter::new(vec![]).with_stream_chunks(vec![
-            make_final_stream("first response"),
-            make_final_stream("second response after recovery"),
+        let adapter = Arc::new(MockLlmAdapter::new(vec![
+            make_chat_response("first response"),
+            make_chat_response("second response after recovery"),
         ]));
         let harness =
             AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
@@ -1490,7 +1594,7 @@ mod tests {
     #[tokio::test]
     async fn session_state_persistence() {
         let adapter = Arc::new(
-            MockLlmAdapter::new(vec![]).with_stream_chunks(vec![make_final_stream("remembered")]),
+            MockLlmAdapter::new(vec![make_chat_response("remembered")]),
         );
         let harness =
             AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
@@ -1672,7 +1776,7 @@ mod tests {
         token.cancel();
 
         let adapter = Arc::new(
-            MockLlmAdapter::new(vec![]).with_stream_chunks(vec![make_final_stream("response")]),
+            MockLlmAdapter::new(vec![make_chat_response("response")]),
         );
         let harness =
             AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
@@ -1689,7 +1793,7 @@ mod tests {
     #[tokio::test]
     async fn harness_with_effort_level() {
         let adapter =
-            Arc::new(MockLlmAdapter::new(vec![]).with_stream_chunks(vec![make_final_stream("ok")]));
+            Arc::new(MockLlmAdapter::new(vec![make_chat_response("ok")]));
         let harness = AgentHarness::new(
             adapter.clone(),
             caduceus_tools::ToolRegistry::new(),
@@ -1716,7 +1820,7 @@ mod tests {
     #[tokio::test]
     async fn harness_with_query_config() {
         let adapter =
-            Arc::new(MockLlmAdapter::new(vec![]).with_stream_chunks(vec![make_final_stream("ok")]));
+            Arc::new(MockLlmAdapter::new(vec![make_chat_response("ok")]));
         let qc = QueryConfig {
             model: Some(ModelId::new("custom-model")),
             temperature: Some(0.9),
@@ -1796,7 +1900,7 @@ mod tests {
     #[tokio::test]
     async fn harness_with_mode_prepends_prompt() {
         let adapter =
-            Arc::new(MockLlmAdapter::new(vec![]).with_stream_chunks(vec![make_final_stream("ok")]));
+            Arc::new(MockLlmAdapter::new(vec![make_chat_response("ok")]));
         let harness = AgentHarness::new(
             adapter.clone(),
             caduceus_tools::ToolRegistry::new(),
