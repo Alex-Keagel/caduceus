@@ -774,6 +774,12 @@ pub struct AgentHarness {
     effort_level: Option<EffortLevel>,
     query_config: Option<QueryConfig>,
     mode: Option<modes::AgentMode>,
+    /// Tools that require approval before execution (e.g., bash, write_file in non-autopilot).
+    approval_required_tools: std::collections::HashSet<String>,
+    /// Channel to receive approval decisions from the frontend.
+    #[allow(clippy::type_complexity)]
+    approval_rx: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(String, bool)>>>>,
+    approval_tx: Option<tokio::sync::mpsc::Sender<(String, bool)>>,
 }
 
 impl AgentHarness {
@@ -797,6 +803,9 @@ impl AgentHarness {
             effort_level: None,
             query_config: None,
             mode: None,
+            approval_required_tools: std::collections::HashSet::new(),
+            approval_rx: None,
+            approval_tx: None,
         }
     }
 
@@ -813,6 +822,19 @@ impl AgentHarness {
     pub fn with_tool_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.tool_timeout = timeout;
         self
+    }
+
+    /// Set tools that need user approval before execution.
+    /// Returns the sender half for the IDE to push approval decisions.
+    pub fn with_approval_flow(
+        mut self,
+        tools: impl IntoIterator<Item = impl Into<String>>,
+    ) -> (Self, tokio::sync::mpsc::Sender<(String, bool)>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        self.approval_required_tools = tools.into_iter().map(|t| t.into()).collect();
+        self.approval_rx = Some(Arc::new(tokio::sync::Mutex::new(rx)));
+        self.approval_tx = Some(tx.clone());
+        (self, tx)
     }
 
     pub fn with_emitter(mut self, emitter: AgentEventEmitter) -> Self {
@@ -1053,10 +1075,26 @@ impl AgentHarness {
             state.token_budget.used_output += response.output_tokens;
             state.turn_count += 1;
 
-            // Emit text content if any
+            // Emit text content in chunks for smooth streaming UX
             if !response.content.is_empty() {
                 if let Some(ref em) = self.emitter {
-                    em.emit_text_delta(&response.content).await;
+                    // Split into ~100-char chunks with word boundaries for smooth display
+                    let content = &response.content;
+                    let mut pos = 0;
+                    while pos < content.len() {
+                        let end = (pos + 100).min(content.len());
+                        // Find word boundary
+                        let chunk_end = if end < content.len() {
+                            content[pos..end]
+                                .rfind(|c: char| c.is_whitespace())
+                                .map(|i| pos + i + 1)
+                                .unwrap_or(end)
+                        } else {
+                            end
+                        };
+                        em.emit_text_delta(&content[pos..chunk_end]).await;
+                        pos = chunk_end;
+                    }
                 }
             }
 
@@ -1138,6 +1176,78 @@ impl AgentHarness {
                                 &tool_use.name,
                             )
                             .await;
+                        }
+
+                        // Check if tool needs approval
+                        if self.approval_required_tools.contains(&tool_use.name) {
+                            if let Some(ref em) = self.emitter {
+                                let req_id = format!("perm_{}", tool_use.id);
+                                em.emit(AgentEvent::PermissionRequest {
+                                    id: req_id.clone(),
+                                    capability: tool_use.name.clone(),
+                                    description: format!(
+                                        "{} with args: {}",
+                                        tool_use.name,
+                                        tool_use
+                                            .input
+                                            .to_string()
+                                            .chars()
+                                            .take(200)
+                                            .collect::<String>()
+                                    ),
+                                })
+                                .await;
+
+                                // Wait for approval from frontend
+                                if let Some(ref rx) = self.approval_rx {
+                                    let mut rx_guard = rx.lock().await;
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_secs(300),
+                                        rx_guard.recv(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some((_id, approved))) => {
+                                            if !approved {
+                                                let tool_msg = caduceus_providers::Message {
+                                                    role: "tool".into(),
+                                                    content:
+                                                        "User denied permission for this tool."
+                                                            .to_string(),
+                                                    content_blocks: None,
+                                                    tool_calls: vec![],
+                                                    tool_result: Some(
+                                                        caduceus_core::ToolResult::error(
+                                                            "Permission denied by user",
+                                                        )
+                                                        .with_tool_use_id(&tool_use.id),
+                                                    ),
+                                                };
+                                                history.append(tool_msg);
+                                                continue;
+                                            }
+                                        }
+                                        _ => {
+                                            // Timeout or channel closed — deny by default
+                                            let tool_msg = caduceus_providers::Message {
+                                                role: "tool".into(),
+                                                content: "Permission request timed out."
+                                                    .to_string(),
+                                                content_blocks: None,
+                                                tool_calls: vec![],
+                                                tool_result: Some(
+                                                    caduceus_core::ToolResult::error(
+                                                        "Permission timed out",
+                                                    )
+                                                    .with_tool_use_id(&tool_use.id),
+                                                ),
+                                            };
+                                            history.append(tool_msg);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         // Execute tool (with timeout)
