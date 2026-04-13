@@ -970,7 +970,17 @@ impl AgentHarness {
             };
 
             // Call LLM (non-streaming to get tool_calls)
-            let response = self.provider.chat(request).await?;
+            let response = match self.provider.chat(request).await {
+                Ok(r) => r,
+                Err(e) => {
+                    state.phase = SessionPhase::Idle;
+                    if let Some(ref em) = self.emitter {
+                        em.emit_phase_changed(SessionPhase::Idle).await;
+                        em.emit_error(&format!("Provider error: {e}")).await;
+                    }
+                    return Err(e);
+                }
+            };
 
             // Update token budget
             state.token_budget.used_input += response.input_tokens;
@@ -1018,8 +1028,8 @@ impl AgentHarness {
                         // Loop detection
                         if loop_detector.record(&tool_use.name, &tool_use.input) {
                             if let Some(ref em) = self.emitter {
-                                em.emit_circuit_breaker(consecutive_failures, tool_sequence.iter().rev().take(5).cloned().collect()).await;
-                    em.emit_error(&format!(
+                                em.emit_loop_detected(&tool_use.name, 3).await;
+                                em.emit_error(&format!(
                                     "Loop detected: tool '{}' called repeatedly with same args",
                                     tool_use.name
                                 )).await;
@@ -1058,14 +1068,17 @@ impl AgentHarness {
                         }
 
                         // Add tool result to history
-                        let mut tool_msg = caduceus_providers::Message {
+                        let tool_msg = caduceus_providers::Message {
                             role: "tool".into(),
-                            content: result_content,
+                            content: result_content.clone(),
                             content_blocks: None,
                             tool_calls: vec![],
-                            tool_result: Some(caduceus_core::ToolResult::success("").with_tool_use_id(&tool_use.id)),
+                            tool_result: Some(if is_error {
+                                caduceus_core::ToolResult::error(&result_content).with_tool_use_id(&tool_use.id)
+                            } else {
+                                caduceus_core::ToolResult::success(&result_content).with_tool_use_id(&tool_use.id)
+                            }),
                         };
-                        tool_msg.content = tool_msg.content.clone();
                         history.append(tool_msg);
                     }
                 }
