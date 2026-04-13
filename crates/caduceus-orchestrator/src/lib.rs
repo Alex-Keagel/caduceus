@@ -1060,6 +1060,26 @@ impl AgentHarness {
                 }
             }
 
+            // Emit reasoning events if the response contains thinking/reasoning
+            // Providers that support extended thinking embed it in the content
+            // with <thinking>...</thinking> tags. Extract and emit.
+            if response.content.contains("<thinking>") {
+                if let Some(ref em) = self.emitter {
+                    let start = std::time::Instant::now();
+                    if let Some(thinking_start) = response.content.find("<thinking>") {
+                        if let Some(thinking_end) = response.content.find("</thinking>") {
+                            let thinking = &response.content[thinking_start + 10..thinking_end];
+                            em.emit_reasoning_delta(thinking).await;
+                            em.emit_reasoning_complete(
+                                thinking,
+                                start.elapsed().as_millis() as u64,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+
             // Check stop reason
             match response.stop_reason {
                 StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {

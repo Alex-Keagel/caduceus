@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use caduceus_core::{CaduceusError, Result, ToolResult, ToolSpec};
 use caduceus_runtime::{BashSandbox, ExecRequest, FileOps};
+use futures::FutureExt;
 use glob::glob;
 use regex::RegexBuilder;
 use serde::Deserialize;
@@ -8,6 +9,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::IpAddr;
+use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,7 +79,14 @@ impl ToolRegistry {
             }
         }
 
-        tool.call(input).await
+        // Execute with panic protection — a tool panic shouldn't crash the IDE
+        match AssertUnwindSafe(tool.call(input)).catch_unwind().await {
+            Ok(result) => result,
+            Err(_panic) => Ok(ToolResult::error(format!(
+                "Tool '{}' panicked during execution. This is a bug.",
+                name
+            ))),
+        }
     }
 
     pub async fn call(&self, name: &str, input: Value) -> Result<ToolResult> {
