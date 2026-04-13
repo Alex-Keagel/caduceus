@@ -658,6 +658,60 @@ impl AgentEventEmitter {
     pub async fn emit_phase_changed(&self, phase: SessionPhase) {
         self.emit(AgentEvent::SessionPhaseChanged { phase }).await;
     }
+
+    // ── New events for rich visualization ──────────────────────────────────────
+
+    pub async fn emit_thinking_started(&self, iteration: u32) {
+        self.emit(AgentEvent::ThinkingStarted { iteration }).await;
+    }
+
+    pub async fn emit_reasoning_delta(&self, content: impl Into<String>) {
+        self.emit(AgentEvent::ReasoningDelta { content: content.into() }).await;
+    }
+
+    pub async fn emit_reasoning_complete(&self, content: impl Into<String>, duration_ms: u64) {
+        self.emit(AgentEvent::ReasoningComplete { content: content.into(), duration_ms }).await;
+    }
+
+    pub async fn emit_context_warning(&self, level: impl Into<String>, used: u32, max: u32) {
+        self.emit(AgentEvent::ContextWarning {
+            level: level.into(), used_tokens: used, max_tokens: max,
+        }).await;
+    }
+
+    pub async fn emit_context_compacted(&self, freed: u32, before: u32, after: u32) {
+        self.emit(AgentEvent::ContextCompacted {
+            freed_tokens: freed, before, after,
+        }).await;
+    }
+
+    pub async fn emit_loop_detected(&self, tool_name: impl Into<String>, count: u32) {
+        self.emit(AgentEvent::LoopDetected {
+            tool_name: tool_name.into(), consecutive_count: count,
+        }).await;
+    }
+
+    pub async fn emit_circuit_breaker(&self, failures: u32, last_tools: Vec<String>) {
+        self.emit(AgentEvent::CircuitBreakerTriggered {
+            consecutive_failures: failures, last_tools,
+        }).await;
+    }
+
+    pub async fn emit_tree_node(&self, id: impl Into<String>, parent_id: Option<String>, label: impl Into<String>, status: impl Into<String>) {
+        self.emit(AgentEvent::ExecutionTreeNode {
+            id: id.into(), parent_id, label: label.into(), status: status.into(),
+        }).await;
+    }
+
+    pub async fn emit_tree_update(&self, id: impl Into<String>, status: impl Into<String>, detail: Option<String>) {
+        self.emit(AgentEvent::ExecutionTreeUpdate {
+            id: id.into(), status: status.into(), detail,
+        }).await;
+    }
+
+    pub async fn emit_message_part(&self, part: caduceus_core::MessagePartType) {
+        self.emit(AgentEvent::MessagePart { part_type: part }).await;
+    }
 }
 
 // ── Agent harness ──────────────────────────────────────────────────────────────
@@ -878,6 +932,7 @@ impl AgentHarness {
             // Circuit breaker: too many consecutive failures
             if consecutive_failures >= 5 {
                 if let Some(ref em) = self.emitter {
+                    em.emit_circuit_breaker(consecutive_failures, tool_sequence.iter().rev().take(5).cloned().collect()).await;
                     em.emit_error(&format!(
                         "Circuit breaker: {} consecutive tool failures. Last: {}",
                         consecutive_failures,
@@ -895,7 +950,8 @@ impl AgentHarness {
 
             // Emit thinking event
             if let Some(ref em) = self.emitter {
-                em.emit_text_delta(&format!("[Thinking… iteration {}]", iteration + 1)).await;
+                em.emit_thinking_started(iteration as u32).await;
+                    em.emit_tree_node(format!("turn-{}", iteration), None, format!("Turn {} — Thinking", iteration + 1), "running").await;
             }
 
             // Assemble messages within budget
@@ -962,7 +1018,8 @@ impl AgentHarness {
                         // Loop detection
                         if loop_detector.record(&tool_use.name, &tool_use.input) {
                             if let Some(ref em) = self.emitter {
-                                em.emit_error(&format!(
+                                em.emit_circuit_breaker(consecutive_failures, tool_sequence.iter().rev().take(5).cloned().collect()).await;
+                    em.emit_error(&format!(
                                     "Loop detected: tool '{}' called repeatedly with same args",
                                     tool_use.name
                                 )).await;

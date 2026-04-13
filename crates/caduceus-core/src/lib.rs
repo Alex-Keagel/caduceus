@@ -240,9 +240,12 @@ impl LlmResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AgentEvent {
+    // ── Streaming text ────────────────────────────────────────────────────────
     TextDelta {
         text: String,
     },
+
+    // ── Tool lifecycle ────────────────────────────────────────────────────────
     ToolCallStart {
         id: ToolCallId,
         name: String,
@@ -263,11 +266,67 @@ pub enum AgentEvent {
         content: String,
         is_error: bool,
     },
+
+    // ── Thinking / reasoning ──────────────────────────────────────────────────
+    ThinkingStarted {
+        iteration: u32,
+    },
+    ReasoningDelta {
+        content: String,
+    },
+    ReasoningComplete {
+        content: String,
+        duration_ms: u64,
+    },
+
+    // ── Context management ────────────────────────────────────────────────────
+    ContextWarning {
+        level: String,     // "warning_70", "warning_85", "critical_95"
+        used_tokens: u32,
+        max_tokens: u32,
+    },
+    ContextCompacted {
+        freed_tokens: u32,
+        before: u32,
+        after: u32,
+    },
+
+    // ── Loop / failure detection ──────────────────────────────────────────────
+    LoopDetected {
+        tool_name: String,
+        consecutive_count: u32,
+    },
+    CircuitBreakerTriggered {
+        consecutive_failures: u32,
+        last_tools: Vec<String>,
+    },
+
+    // ── Execution tree ────────────────────────────────────────────────────────
+    ExecutionTreeNode {
+        id: String,
+        parent_id: Option<String>,
+        label: String,
+        status: String, // "pending", "running", "completed", "failed"
+    },
+    ExecutionTreeUpdate {
+        id: String,
+        status: String,
+        detail: Option<String>,
+    },
+
+    // ── Structured message parts (for AI Elements rendering) ──────────────────
+    MessagePart {
+        part_type: MessagePartType,
+    },
+
+    // ── Permission / approval ─────────────────────────────────────────────────
     PermissionRequest {
         id: String,
         capability: String,
         description: String,
     },
+
+    // ── Turn lifecycle ────────────────────────────────────────────────────────
     TurnComplete {
         stop_reason: StopReason,
         usage: TokenUsage,
@@ -277,6 +336,41 @@ pub enum AgentEvent {
     },
     SessionPhaseChanged {
         phase: SessionPhase,
+    },
+}
+
+/// Structured message part types for rich chat rendering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MessagePartType {
+    Text {
+        content: String,
+    },
+    Reasoning {
+        content: String,
+        duration_ms: u64,
+        is_complete: bool,
+    },
+    ToolInvocation {
+        tool_use_id: String,
+        name: String,
+        params: serde_json::Value,
+        status: String, // "pending", "running", "complete", "error"
+        result: Option<String>,
+        error: Option<String>,
+    },
+    CodeArtifact {
+        filename: String,
+        language: String,
+        content: String,
+        diff: Option<String>,
+    },
+    Source {
+        href: String,
+        title: String,
+    },
+    Suggestion {
+        text: String,
     },
 }
 
