@@ -4428,6 +4428,7 @@ impl CryptoWeaknessDetector {
 // ── Additional tools needed for full agent loop ───────────────────────────────
 
 /// Think tool — allows the LLM to reason internally without taking action.
+#[derive(Default)]
 pub struct ThinkTool;
 
 impl ThinkTool {
@@ -4463,6 +4464,7 @@ impl Tool for ThinkTool {
 }
 
 /// AttemptCompletion tool — signals the agent considers the task done.
+#[derive(Default)]
 pub struct AttemptCompletionTool;
 
 impl AttemptCompletionTool {
@@ -4496,6 +4498,7 @@ impl Tool for AttemptCompletionTool {
 }
 
 /// AskFollowup tool — asks the user a clarifying question.
+#[derive(Default)]
 pub struct AskFollowupTool;
 
 impl AskFollowupTool {

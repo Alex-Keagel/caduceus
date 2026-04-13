@@ -28,9 +28,8 @@ use caduceus_core::{
     AgentEvent, CaduceusError, CancellationToken, ModelId, ProviderId, Result, SessionId,
     SessionPhase, SessionState, StopReason, TokenUsage, ToolCallId, WarningLevel,
 };
-use caduceus_providers::{ChatRequest, ChatResponse, LlmAdapter};
+use caduceus_providers::{ChatRequest, LlmAdapter};
 use caduceus_tools::ToolRegistry;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -1060,7 +1059,7 @@ impl AgentHarness {
                     final_text = response.content;
                     if let Some(ref em) = self.emitter {
                         em.emit_turn_complete(
-                            response.stop_reason.clone(),
+                            response.stop_reason,
                             TokenUsage {
                                 input_tokens: response.input_tokens,
                                 output_tokens: response.output_tokens,
@@ -1540,7 +1539,7 @@ mod tests {
 
     use caduceus_core::ToolUse;
     use caduceus_providers::mock::MockLlmAdapter;
-    use caduceus_providers::StreamChunk;
+    use caduceus_providers::{ChatResponse, StreamChunk};
     use caduceus_tools::{BashTool, ReadFileTool};
     use std::sync::Arc;
 
