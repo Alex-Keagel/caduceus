@@ -1128,6 +1128,39 @@ fn build_openai_request_body(
                 "role": msg.role,
                 "content": parts,
             }));
+        } else if msg.role == "tool" {
+            // Tool result message
+            let tool_use_id = msg.tool_result.as_ref()
+                .and_then(|r| r.tool_use_id.clone())
+                .unwrap_or_default();
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": tool_use_id,
+                "content": msg.content_text(),
+            }));
+        } else if !msg.tool_calls.is_empty() {
+            // Assistant message with tool calls
+            let tool_calls_json: Vec<serde_json::Value> = msg.tool_calls.iter().map(|tc| {
+                serde_json::json!({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": tc.input.to_string(),
+                    }
+                })
+            }).collect();
+            let mut m = serde_json::json!({
+                "role": "assistant",
+                "tool_calls": tool_calls_json,
+            });
+            let text = msg.content_text();
+            if !text.is_empty() {
+                m["content"] = serde_json::Value::String(text);
+            } else {
+                m["content"] = serde_json::Value::Null;
+            }
+            messages.push(m);
         } else {
             messages.push(serde_json::json!({
                 "role": msg.role,
@@ -1173,6 +1206,21 @@ fn build_openai_request_body(
                 serde_json::json!({"type": "json_schema", "json_schema": schema})
             }
         };
+    }
+
+    // Serialize tool definitions for the API
+    if !request.tools.is_empty() {
+        let tools_json: Vec<serde_json::Value> = request.tools.iter().map(|t| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                }
+            })
+        }).collect();
+        body["tools"] = serde_json::Value::Array(tools_json);
     }
 
     body
@@ -2089,10 +2137,33 @@ pub struct CopilotLmAdapter {
 }
 
 impl CopilotLmAdapter {
-    /// Create a new adapter using the `GITHUB_TOKEN` environment variable.
+    /// Create a new adapter using env vars or gh CLI for token.
     pub fn from_env() -> std::result::Result<Self, String> {
-        let token = std::env::var("GITHUB_TOKEN")
-            .map_err(|_| "GITHUB_TOKEN env var not set".to_string())?;
+        let token = std::env::var("COPILOT_GITHUB_TOKEN")
+            .or_else(|_| std::env::var("GH_TOKEN"))
+            .or_else(|_| std::env::var("GITHUB_TOKEN"))
+            .or_else(|_| {
+                // Try cached token
+                let home = std::env::var("HOME").unwrap_or_default();
+                std::fs::read_to_string(format!("{home}/.caduceus/github_token"))
+                    .map(|t| t.trim().to_string())
+                    .map_err(|e| std::env::VarError::NotUnicode(e.to_string().into()))
+            })
+            .or_else(|_| {
+                // Try gh CLI with common paths
+                for gh in &["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
+                    if let Ok(output) = std::process::Command::new(gh).args(["auth", "token"]).output() {
+                        if output.status.success() {
+                            let t = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                            if !t.is_empty() {
+                                return Ok(t);
+                            }
+                        }
+                    }
+                }
+                Err(std::env::VarError::NotPresent)
+            })
+            .map_err(|_| "No GitHub token found. Set GITHUB_TOKEN or run 'gh auth login'.".to_string())?;
         Ok(Self::new(token))
     }
 
@@ -2101,8 +2172,11 @@ impl CopilotLmAdapter {
         Self {
             provider_id: ProviderId::new("copilot"),
             token: token.into(),
-            base_url: "http://localhost:1234".into(),
-            client: reqwest::Client::new(),
+            base_url: "https://api.githubcopilot.com".into(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -2122,6 +2196,15 @@ impl CopilotLmAdapter {
     fn build_request_body(&self, request: &ChatRequest, stream: bool) -> serde_json::Value {
         build_openai_request_body(request, stream, true)
     }
+
+    /// Add Copilot-specific headers to a request.
+    fn copilot_headers(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        builder
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", &self.token))
+            .header("editor-version", "vscode/1.96.0")
+            .header("copilot-integration-id", "vscode-chat")
+    }
 }
 
 #[async_trait]
@@ -2133,19 +2216,12 @@ impl LlmAdapter for CopilotLmAdapter {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let body = self.build_request_body(&request, false);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let token = self.token.clone();
         let client = self.client.clone();
         let retry = RetryConfig::default();
 
         let resp = send_with_retry(
             &client,
-            || {
-                client
-                    .post(&url)
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", &token))
-                    .json(&body)
-            },
+            || self.copilot_headers(client.post(&url)).json(&body),
             &retry,
         )
         .await?;
@@ -2161,19 +2237,12 @@ impl LlmAdapter for CopilotLmAdapter {
     async fn stream(&self, request: ChatRequest) -> Result<StreamResult> {
         let body = self.build_request_body(&request, true);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let token = self.token.clone();
         let client = self.client.clone();
         let retry = RetryConfig::default();
 
         let resp = send_with_retry(
             &client,
-            || {
-                client
-                    .post(&url)
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", &token))
-                    .json(&body)
-            },
+            || self.copilot_headers(client.post(&url)).json(&body),
             &retry,
         )
         .await?;
@@ -2192,11 +2261,40 @@ impl LlmAdapter for CopilotLmAdapter {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelId>> {
-        Ok(vec![
-            ModelId::new("gpt-4o"),
-            ModelId::new("gpt-4o-mini"),
-            ModelId::new("claude-sonnet-4-5"),
-        ])
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let resp = self.copilot_headers(self.client.get(&url))
+            .send()
+            .await
+            .map_err(|e| CaduceusError::Provider(format!("Failed to list models: {}", e)))?;
+
+        if !resp.status().is_success() {
+            return Ok(vec![
+                ModelId::new("claude-sonnet-4.6"),
+                ModelId::new("gpt-5.2"),
+            ]);
+        }
+
+        let body: serde_json::Value = resp.json().await
+            .map_err(|e| CaduceusError::Provider(format!("Failed to parse models: {}", e)))?;
+
+        let models = body["data"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter(|m| {
+                        m["model_picker_enabled"].as_bool().unwrap_or(false)
+                            && m["policy"]["state"].as_str() == Some("enabled")
+                            && m["supported_endpoints"]
+                                .as_array()
+                                .map(|eps| eps.iter().any(|e| e.as_str() == Some("/chat/completions")))
+                                .unwrap_or(false)
+                    })
+                    .filter_map(|m| m["id"].as_str().map(ModelId::new))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(models)
     }
 }
 
@@ -3072,7 +3170,7 @@ mod tests {
         let adapter = CopilotLmAdapter::new("gh-token-123");
         assert_eq!(adapter.provider_id().0, "copilot");
         assert_eq!(adapter.token(), "gh-token-123");
-        assert_eq!(adapter.base_url(), "http://localhost:1234");
+        assert_eq!(adapter.base_url(), "https://api.githubcopilot.com");
     }
 
     #[test]
