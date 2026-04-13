@@ -370,10 +370,21 @@ pub struct ToolSpec {
     pub required_capability: Option<String>,
 }
 
+/// An LLM's request to invoke a tool (extracted from the API response).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolUse {
+    pub id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
     pub content: String,
     pub is_error: bool,
+    /// The tool_use id this result corresponds to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
 }
 
 impl ToolResult {
@@ -381,6 +392,7 @@ impl ToolResult {
         Self {
             content: content.into(),
             is_error: false,
+            tool_use_id: None,
         }
     }
 
@@ -388,7 +400,13 @@ impl ToolResult {
         Self {
             content: message.into(),
             is_error: true,
+            tool_use_id: None,
         }
+    }
+
+    pub fn with_tool_use_id(mut self, id: impl Into<String>) -> Self {
+        self.tool_use_id = Some(id.into());
+        self
     }
 }
 

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use caduceus_core::{
     AuthStore, CaduceusError, ImageContent, ImageSource, ModelId, ProviderId, Result, ToolResult,
+    ToolSpec, ToolUse,
 };
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
@@ -21,6 +22,12 @@ pub struct Message {
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_blocks: Option<Vec<MessageContentBlock>>,
+    /// Tool calls requested by the assistant (populated when role = "assistant").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolUse>,
+    /// Tool result (populated when role = "tool").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result: Option<ToolResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +65,8 @@ impl Message {
             role: "user".into(),
             content: content.clone(),
             content_blocks: Some(vec![MessageContentBlock::text(content)]),
+            tool_calls: Vec::new(),
+            tool_result: None,
         }
     }
 
@@ -67,6 +76,8 @@ impl Message {
             role: "assistant".into(),
             content: content.clone(),
             content_blocks: Some(vec![MessageContentBlock::text(content)]),
+            tool_calls: Vec::new(),
+            tool_result: None,
         }
     }
 
@@ -76,6 +87,8 @@ impl Message {
             role: "system".into(),
             content: content.clone(),
             content_blocks: Some(vec![MessageContentBlock::text(content)]),
+            tool_calls: Vec::new(),
+            tool_result: None,
         }
     }
 
@@ -192,13 +205,15 @@ pub struct ChatRequest {
     pub system: Option<String>,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
-    /// When true, prepend "Think step by step" to system prompt and use higher max_tokens.
     #[serde(default)]
     pub thinking_mode: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ResponseFormat>,
+    /// Tool definitions available for the LLM to call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +224,9 @@ pub struct ChatResponse {
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
     pub stop_reason: StopReason,
+    /// Tool calls requested by the LLM (when stop_reason = ToolUse).
+    #[serde(default)]
+    pub tool_calls: Vec<ToolUse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -539,6 +557,20 @@ fn parse_anthropic_chat_response(body: &str) -> Result<ChatResponse> {
         .collect::<Vec<_>>()
         .join("");
 
+    // Extract tool calls from content blocks
+    let tool_calls: Vec<ToolUse> = resp
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            AnthropicContentBlock::ToolUse { id, name, input } => Some(ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+
     let stop_reason = resp
         .stop_reason
         .as_deref()
@@ -552,6 +584,7 @@ fn parse_anthropic_chat_response(body: &str) -> Result<ChatResponse> {
         cache_read_tokens: resp.usage.cache_read_input_tokens,
         cache_creation_tokens: resp.usage.cache_creation_input_tokens,
         stop_reason,
+        tool_calls,
     })
 }
 
@@ -847,6 +880,20 @@ struct OpenAiChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAiMessage {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OpenAiToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiToolCall {
+    id: String,
+    function: OpenAiToolFunction,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiToolFunction {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -939,6 +986,22 @@ fn parse_openai_chat_response(body: &str) -> Result<ChatResponse> {
         })
         .unwrap_or((0, 0, 0));
 
+    // Extract tool calls from OpenAI format
+    let tool_calls: Vec<ToolUse> = choice
+        .message
+        .as_ref()
+        .and_then(|m| m.tool_calls.as_ref())
+        .map(|tcs| {
+            tcs.iter()
+                .map(|tc| ToolUse {
+                    id: tc.id.clone(),
+                    name: tc.function.name.clone(),
+                    input: serde_json::from_str(&tc.function.arguments).unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(ChatResponse {
         content,
         input_tokens,
@@ -946,6 +1009,7 @@ fn parse_openai_chat_response(body: &str) -> Result<ChatResponse> {
         cache_read_tokens,
         cache_creation_tokens: 0,
         stop_reason,
+        tool_calls,
     })
 }
 
@@ -1312,6 +1376,7 @@ fn parse_gemini_chat_response(body: &str) -> Result<ChatResponse> {
             .and_then(|candidate| candidate.finish_reason.as_deref())
             .map(map_gemini_finish_reason)
             .unwrap_or(StopReason::EndTurn),
+        tool_calls: vec![],
     })
 }
 
@@ -1893,6 +1958,7 @@ where
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
+            tools: vec![],
         };
 
         match provider_id.0.as_str() {
@@ -2732,6 +2798,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
+            tools: vec![],
         };
 
         let body = adapter.build_request_body(&request, false);
@@ -2755,6 +2822,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
+            tools: vec![],
         };
 
         let body = adapter.build_request_body(&request, true);
@@ -2864,6 +2932,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
+            tools: vec![],
         };
 
         let body = adapter.build_request_body(&request, true);
@@ -2922,6 +2991,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
+            tools: vec![],
         };
 
         let mut stream = adapter.stream(request).await.unwrap();
@@ -2988,6 +3058,7 @@ mod tests {
             thinking_mode: true,
             tool_choice: None,
             response_format: None,
+            tools: vec![],
         };
         assert!(req.thinking_mode);
         let json = serde_json::to_string(&req).unwrap();
@@ -3023,6 +3094,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
+            tools: vec![],
         };
 
         let body = adapter.build_request_body(&request, true);
@@ -3050,6 +3122,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
+            tools: vec![],
         };
 
         let resp = adapter.chat(request).await.unwrap();
@@ -3142,6 +3215,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
+            tools: vec![],
         };
         let body = adapter.build_request_body(&request, false);
         let content = &body["messages"][0]["content"];
@@ -3167,6 +3241,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
+            tools: vec![],
         };
         let body = build_openai_request_body(&request, false, true);
         let content = &body["messages"][0]["content"];
@@ -3215,6 +3290,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: Some(ToolChoice::Required),
             response_format: None,
+            tools: vec![],
         };
         let body = adapter.build_request_body(&request, false);
         assert_eq!(body["tool_choice"]["type"], "any");
@@ -3228,6 +3304,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: Some(ToolChoice::Specific("my_tool".into())),
             response_format: None,
+            tools: vec![],
         };
         let body2 = adapter.build_request_body(&request2, false);
         assert_eq!(body2["tool_choice"]["type"], "tool");
@@ -3245,6 +3322,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: Some(ToolChoice::Required),
             response_format: None,
+            tools: vec![],
         };
         let body = build_openai_request_body(&request, false, true);
         assert_eq!(body["tool_choice"], "required");
@@ -3258,6 +3336,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: Some(ToolChoice::Specific("my_func".into())),
             response_format: None,
+            tools: vec![],
         };
         let body2 = build_openai_request_body(&request2, false, true);
         assert_eq!(body2["tool_choice"]["type"], "function");
@@ -3277,6 +3356,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: Some(ResponseFormat::JsonObject),
+            tools: vec![],
         };
         let body = build_openai_request_body(&request, false, true);
         assert_eq!(body["response_format"]["type"], "json_object");
@@ -3307,6 +3387,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             stop_reason: StopReason::EndTurn,
+            tool_calls: vec![],
         };
 
         let mock = MockLlmAdapter::new(vec![success_response.clone()]);
@@ -3319,6 +3400,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
+            tools: vec![],
         };
 
         let response = mock.chat(request).await.unwrap();
@@ -3340,6 +3422,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
+            tools: vec![],
         };
 
         let result = mock.chat(request).await;
@@ -3374,6 +3457,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             stop_reason: StopReason::EndTurn,
+            tool_calls: vec![],
         };
 
         let mock = MockLlmAdapter::new(vec![empty_response]);
@@ -3386,6 +3470,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
+            tools: vec![],
         };
 
         let response = mock.chat(request).await.unwrap();
@@ -3494,6 +3579,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
+            tools: vec![],
         };
         let body = adapter.build_request_body(&request);
         assert!(body["contents"].is_array());

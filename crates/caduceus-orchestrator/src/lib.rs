@@ -880,6 +880,7 @@ impl AgentHarness {
                 temperature: self.effective_temperature(),
                 thinking_mode: false,
                 tool_choice: None,
+                tools: vec![],
                 response_format: None,
             };
 

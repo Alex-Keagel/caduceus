@@ -241,6 +241,7 @@ impl BugBot {
             temperature: Some(0.1),
             thinking_mode: false,
             tool_choice: None,
+            tools: vec![],
             response_format: None,
         };
 
@@ -256,6 +257,7 @@ impl BugBot {
             temperature: Some(0.1),
             thinking_mode: false,
             tool_choice: None,
+            tools: vec![],
             response_format: None,
         };
 
@@ -362,6 +364,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             stop_reason: StopReason::EndTurn,
+            tool_calls: vec![],
         }]))
     }
 

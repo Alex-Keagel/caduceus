@@ -355,6 +355,7 @@ impl Coordinator {
             temperature: None,
             thinking_mode: false,
             tool_choice: None,
+            tools: vec![],
             response_format: None,
         };
 
@@ -444,6 +445,7 @@ impl Coordinator {
             temperature: None,
             thinking_mode: false,
             tool_choice: None,
+            tools: vec![],
             response_format: None,
         };
 
@@ -524,6 +526,7 @@ async fn run_task(
         temperature: None,
         thinking_mode: false,
         tool_choice: None,
+        tools: vec![],
         response_format: None,
     };
 

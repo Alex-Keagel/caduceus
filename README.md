@@ -20,36 +20,36 @@ Caduceus is organized into six conceptual layers, each implemented as one or mor
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  LAYER 1 — PRESENTATION                                                    ║
-║  Tauri 2 + React/TypeScript frontend                                       ║
-║  xterm.js terminal • CodeMirror editor • split panes • command palette     ║
-║  Typed Tauri IPC bridge (invoke/event) to Rust backend                     ║
+║  LAYER 1 — PRESENTATION                                                      ║
+║  Tauri 2 + React/TypeScript frontend                                         ║
+║  xterm.js terminal • CodeMirror editor • split panes • command palette       ║
+║  Typed Tauri IPC bridge (invoke/event) to Rust backend                       ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  LAYER 2 — ORCHESTRATION                                             [v1]  ║
-║  Rust agent harness engine                                                 ║
-║  Conversation loop • Tool registry & dispatch • Permission enforcement     ║
-║  Session persistence (SQLite WAL) • System prompt assembly                 ║
-║  Multi-provider LLM adapter layer (Anthropic / OpenAI-compatible)          ║
+║  LAYER 2 — ORCHESTRATION                                             [v1]    ║
+║  Rust agent harness engine                                                   ║
+║  Conversation loop • Tool registry & dispatch • Permission enforcement       ║
+║  Session persistence (SQLite WAL) • System prompt assembly                   ║
+║  Multi-provider LLM adapter layer (Anthropic / OpenAI-compatible)            ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  LAYER 3 — WORKERS (multi-agent)                               [post-v1]  ║
-║  Coordinator-driven multi-agent runtime                                    ║
-║  Task DAG with dependency resolution • Agent pool with concurrency control ║
-║  Team message bus + shared memory • Loop detection • Scheduler             ║
+║  LAYER 3 — WORKERS (multi-agent)                               [post-v1]     ║
+║  Coordinator-driven multi-agent runtime                                      ║
+║  Task DAG with dependency resolution • Agent pool with concurrency control   ║
+║  Team message bus + shared memory • Loop detection • Scheduler               ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  LAYER 4 — SANDBOX (E2B micro-VM)                              [post-v1]  ║
-║  Secure sandboxed code execution                                           ║
-║  Process/PTY via gRPC-web • Filesystem CRUD • Port forwarding              ║
-║  Snapshots • Volumes • Templates • MCP gateway                             ║
+║  LAYER 4 — SANDBOX (E2B micro-VM)                              [post-v1]     ║
+║  Secure sandboxed code execution                                             ║
+║  Process/PTY via gRPC-web • Filesystem CRUD • Port forwarding                ║
+║  Snapshots • Volumes • Templates • MCP gateway                               ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  LAYER 5 — OMNISCIENCE                                               [v1]  ║
-║  AST parsing (tree-sitter): incremental parse, query-driven chunk extract  ║
-║  Vector search (qdrant-edge): embedded EdgeShard, semantic code retrieval  ║
-║  Chunking pipeline: parse → extract → embed → upsert → search             ║
+║  LAYER 5 — OMNISCIENCE                                               [v1]    ║
+║  AST parsing (tree-sitter): incremental parse, query-driven chunk extract    ║
+║  Vector search (qdrant-edge): embedded EdgeShard, semantic code retrieval    ║
+║  Chunking pipeline: parse → extract → embed → upsert → search                ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  LAYER 6 — MULTIPLAYER (CRDT)                                  [post-v1]  ║
-║  RGA-based CRDT text buffer with Lamport timestamps                        ║
-║  Anchor system for stable positions • Fragment-based tombstone model       ║
-║  Rope data structure (B+ tree) • Version vectors • Remote AI cursors       ║
+║  LAYER 6 — MULTIPLAYER (CRDT)                                  [post-v1]     ║
+║  RGA-based CRDT text buffer with Lamport timestamps                          ║
+║  Anchor system for stable positions • Fragment-based tombstone model         ║
+║  Rope data structure (B+ tree) • Version vectors • Remote AI cursors         ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
 
