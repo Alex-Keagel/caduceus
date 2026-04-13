@@ -2979,6 +2979,83 @@ mod tests {
     }
 
     #[test]
+    fn test_anthropic_tool_round_trip() {
+        let adapter = AnthropicAdapter::new("test-key");
+
+        // Build a request with tools + tool history
+        let tool_spec = ToolSpec {
+            name: "read_file".into(),
+            description: "Read a file".into(),
+            input_schema: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+            required_capability: None,
+        };
+
+        // History: user → assistant+tool_use → tool_result → assistant
+        let mut assistant_msg = Message::assistant("I'll read the file.");
+        assistant_msg.tool_calls = vec![ToolUse {
+            id: "tc_123".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({"path": "test.txt"}),
+        }];
+
+        let tool_msg = Message {
+            role: "tool".into(),
+            content: "file contents here".into(),
+            content_blocks: None,
+            tool_calls: vec![],
+            tool_result: Some(ToolResult::success("file contents here").with_tool_use_id("tc_123")),
+        };
+
+        let request = ChatRequest {
+            model: ModelId::new("claude-sonnet-4-5"),
+            messages: vec![
+                Message::user("Read test.txt"),
+                assistant_msg,
+                tool_msg,
+                Message::user("What did the file say?"),
+            ],
+            system: Some("You are helpful.".into()),
+            max_tokens: 1024,
+            temperature: None,
+            thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
+            tools: vec![tool_spec],
+        };
+
+        let body = adapter.build_request_body(&request, false);
+
+        // 1. Tools are serialized
+        assert!(body["tools"].is_array(), "tools should be present");
+        assert_eq!(body["tools"][0]["name"], "read_file");
+        assert!(body["tools"][0]["input_schema"].is_object());
+
+        // 2. Assistant message has tool_use content block
+        let msgs = body["messages"].as_array().unwrap();
+        // msg[0] = user, msg[1] = assistant with tool_use, msg[2] = tool_result, msg[3] = user
+        let assistant = &msgs[1];
+        assert_eq!(assistant["role"], "assistant");
+        let content = assistant["content"].as_array().unwrap();
+        let tool_use_block = content.iter().find(|b| b["type"] == "tool_use");
+        assert!(
+            tool_use_block.is_some(),
+            "assistant should have tool_use block"
+        );
+        let tub = tool_use_block.unwrap();
+        assert_eq!(tub["id"], "tc_123");
+        assert_eq!(tub["name"], "read_file");
+
+        // 3. Tool result is serialized as user message with tool_result block
+        let tool_result_msg = &msgs[2];
+        assert_eq!(tool_result_msg["role"], "user");
+        let tr_content = tool_result_msg["content"].as_array().unwrap();
+        let tr_block = &tr_content[0];
+        assert_eq!(tr_block["type"], "tool_result");
+        assert_eq!(tr_block["tool_use_id"], "tc_123");
+        assert_eq!(tr_block["content"], "file contents here");
+    }
+
+    #[test]
     fn test_openai_request_body_construction() {
         let adapter = OpenAiCompatibleAdapter::new("openai", "key", "https://api.openai.com/v1");
         let request = ChatRequest {
