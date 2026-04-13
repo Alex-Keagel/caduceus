@@ -110,9 +110,9 @@ impl EffortLevel {
         match self {
             Self::Min => 256,
             Self::Low => 1024,
-            Self::Medium => 4096,
-            Self::High => 8192,
-            Self::Max => 16384,
+            Self::Medium => 8192,
+            Self::High => 16384,
+            Self::Max => 32768,
         }
     }
 
@@ -917,7 +917,8 @@ impl AgentHarness {
         prompt
     }
 
-    /// Resolve effective max_tokens: query_config > effort_level > default.
+    /// Resolve effective max_tokens: query_config > effort_level > model max.
+    /// Default is high (128K) — providers will cap to their actual limit.
     fn effective_max_tokens(&self) -> u32 {
         if let Some(ref qc) = self.query_config {
             if let Some(tokens) = qc.max_tokens {
@@ -927,7 +928,8 @@ impl AgentHarness {
         if let Some(ref effort) = self.effort_level {
             return effort.max_tokens();
         }
-        4096
+        // No artificial limit — let the provider cap it
+        128_000
     }
 
     /// Resolve effective temperature: query_config > effort_level > None.
@@ -1152,24 +1154,18 @@ impl AgentHarness {
                     assistant_msg.tool_calls = response.tool_calls.clone();
                     history.append(assistant_msg);
 
-                    // Execute each tool call
+                    // Execute tool calls — parallel when possible
+                    // Pre-check: loop detection + approval (sequential, fast)
+                    let mut tool_tasks: Vec<(String, String, serde_json::Value, bool)> = Vec::new(); // (id, name, input, skip)
                     for tool_use in &response.tool_calls {
-                        // Loop detection
                         if loop_detector.record(&tool_use.name, &tool_use.input) {
                             if let Some(ref em) = self.emitter {
                                 em.emit_loop_detected(&tool_use.name, 3).await;
-                                em.emit_error(&format!(
-                                    "Loop detected: tool '{}' called repeatedly with same args",
-                                    tool_use.name
-                                ))
-                                .await;
                             }
                             consecutive_failures += 1;
                         }
-
                         tool_sequence.push(tool_use.name.clone());
 
-                        // Emit tool start event
                         if let Some(ref em) = self.emitter {
                             em.emit_tool_call_start(
                                 caduceus_core::ToolCallId(tool_use.id.clone()),
@@ -1178,7 +1174,8 @@ impl AgentHarness {
                             .await;
                         }
 
-                        // Check if tool needs approval
+                        // Approval check (sequential — can't approve in parallel)
+                        let mut skip = false;
                         if self.approval_required_tools.contains(&tool_use.name) {
                             if let Some(ref em) = self.emitter {
                                 let req_id = format!("perm_{}", tool_use.id);
@@ -1198,7 +1195,6 @@ impl AgentHarness {
                                 })
                                 .await;
 
-                                // Wait for approval from frontend
                                 if let Some(ref rx) = self.approval_rx {
                                     let mut rx_guard = rx.lock().await;
                                     match tokio::time::timeout(
@@ -1207,93 +1203,83 @@ impl AgentHarness {
                                     )
                                     .await
                                     {
-                                        Ok(Some((_id, approved))) => {
-                                            if !approved {
-                                                let tool_msg = caduceus_providers::Message {
-                                                    role: "tool".into(),
-                                                    content:
-                                                        "User denied permission for this tool."
-                                                            .to_string(),
-                                                    content_blocks: None,
-                                                    tool_calls: vec![],
-                                                    tool_result: Some(
-                                                        caduceus_core::ToolResult::error(
-                                                            "Permission denied by user",
-                                                        )
-                                                        .with_tool_use_id(&tool_use.id),
-                                                    ),
-                                                };
-                                                history.append(tool_msg);
-                                                continue;
-                                            }
+                                        Ok(Some((_id, approved))) if !approved => {
+                                            skip = true;
                                         }
+                                        Ok(Some(_)) => {}
                                         _ => {
-                                            // Timeout or channel closed — deny by default
-                                            let tool_msg = caduceus_providers::Message {
-                                                role: "tool".into(),
-                                                content: "Permission request timed out."
-                                                    .to_string(),
-                                                content_blocks: None,
-                                                tool_calls: vec![],
-                                                tool_result: Some(
-                                                    caduceus_core::ToolResult::error(
-                                                        "Permission timed out",
-                                                    )
-                                                    .with_tool_use_id(&tool_use.id),
-                                                ),
-                                            };
-                                            history.append(tool_msg);
-                                            continue;
+                                            skip = true;
                                         }
                                     }
                                 }
                             }
                         }
+                        tool_tasks.push((
+                            tool_use.id.clone(),
+                            tool_use.name.clone(),
+                            tool_use.input.clone(),
+                            skip,
+                        ));
+                    }
 
-                        // Execute tool (with timeout)
-                        let result = tokio::time::timeout(
-                            self.tool_timeout,
-                            self.tools.execute(&tool_use.name, tool_use.input.clone()),
-                        )
-                        .await;
+                    // Execute all approved tools in parallel
+                    let timeout = self.tool_timeout;
+                    let mut join_set = tokio::task::JoinSet::new();
+                    for (idx, (_id, name, input, skip)) in tool_tasks.iter().enumerate() {
+                        if *skip {
+                            continue;
+                        }
+                        let tools = self.tools.clone_registry();
+                        let name = name.clone();
+                        let input = input.clone();
+                        join_set.spawn(async move {
+                            let result =
+                                tokio::time::timeout(timeout, tools.execute(&name, input)).await;
+                            (idx, result)
+                        });
+                    }
 
-                        let (result_content, is_error) = match result {
-                            Ok(Ok(r)) => {
-                                if r.is_error {
-                                    consecutive_failures += 1;
-                                } else {
-                                    consecutive_failures = 0;
+                    // Collect results in submission order
+                    let mut results: std::collections::HashMap<usize, (String, bool)> =
+                        std::collections::HashMap::new();
+                    while let Some(join_result) = join_set.join_next().await {
+                        if let Ok((idx, result)) = join_result {
+                            let (content, is_error) = match result {
+                                Ok(Ok(r)) => (r.content, r.is_error),
+                                Ok(Err(e)) => (e.to_string(), true),
+                                Err(_) => {
+                                    (format!("Tool timed out after {}s", timeout.as_secs()), true)
                                 }
-                                (r.content, r.is_error)
-                            }
-                            Ok(Err(e)) => {
-                                consecutive_failures += 1;
-                                (e.to_string(), true)
-                            }
-                            Err(_elapsed) => {
-                                consecutive_failures += 1;
-                                (
-                                    format!(
-                                        "Tool '{}' timed out after {}s",
-                                        tool_use.name,
-                                        self.tool_timeout.as_secs()
-                                    ),
-                                    true,
-                                )
-                            }
+                            };
+                            results.insert(idx, (content, is_error));
+                        }
+                    }
+
+                    // Append results to history in original order
+                    for (idx, (id, _name, _input, skip)) in tool_tasks.iter().enumerate() {
+                        let (result_content, is_error) = if *skip {
+                            ("Permission denied by user".to_string(), true)
+                        } else {
+                            results
+                                .remove(&idx)
+                                .unwrap_or(("Tool execution failed".to_string(), true))
                         };
 
-                        // Emit tool complete event
+                        if is_error {
+                            consecutive_failures += 1;
+                        } else {
+                            consecutive_failures = 0;
+                        }
+
                         if let Some(ref em) = self.emitter {
                             em.emit_tool_result_end(
-                                caduceus_core::ToolCallId(tool_use.id.clone()),
+                                caduceus_core::ToolCallId(id.clone()),
                                 &result_content,
                                 is_error,
                             )
                             .await;
                         }
 
-                        // Add tool result to history
                         let tool_msg = caduceus_providers::Message {
                             role: "tool".into(),
                             content: result_content.clone(),
@@ -1301,10 +1287,10 @@ impl AgentHarness {
                             tool_calls: vec![],
                             tool_result: Some(if is_error {
                                 caduceus_core::ToolResult::error(&result_content)
-                                    .with_tool_use_id(&tool_use.id)
+                                    .with_tool_use_id(id)
                             } else {
                                 caduceus_core::ToolResult::success(&result_content)
-                                    .with_tool_use_id(&tool_use.id)
+                                    .with_tool_use_id(id)
                             }),
                         };
                         history.append(tool_msg);

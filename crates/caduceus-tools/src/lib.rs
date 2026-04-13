@@ -22,6 +22,7 @@ pub trait Tool: Send + Sync {
     async fn call(&self, input: Value) -> Result<ToolResult>;
 }
 
+#[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     allowed_capabilities: Option<std::collections::HashSet<String>>,
@@ -33,6 +34,11 @@ impl ToolRegistry {
             tools: HashMap::new(),
             allowed_capabilities: None,
         }
+    }
+
+    /// Cheap clone for parallel tool execution (tools are Arc, so this is O(n) pointer copies).
+    pub fn clone_registry(&self) -> Self {
+        self.clone()
     }
 
     /// Set allowed capabilities. Tools with a `required_capability` not in this set will be denied.
