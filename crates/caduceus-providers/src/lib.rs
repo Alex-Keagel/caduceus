@@ -684,11 +684,48 @@ impl AnthropicAdapter {
             .iter()
             .filter(|m| m.role != "system")
             .map(|m| {
-                let content_blocks = anthropic_content_blocks(&m.content_blocks());
-                serde_json::json!({
-                    "role": m.role,
-                    "content": content_blocks,
-                })
+                if m.role == "tool" {
+                    // Tool result → Anthropic uses role "user" with tool_result content block
+                    let tool_use_id = m
+                        .tool_result
+                        .as_ref()
+                        .and_then(|r| r.tool_use_id.clone())
+                        .unwrap_or_default();
+                    let is_error = m.tool_result.as_ref().map(|r| r.is_error).unwrap_or(false);
+                    let mut block = serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": m.content_text(),
+                    });
+                    if is_error {
+                        block["is_error"] = serde_json::json!(true);
+                    }
+                    serde_json::json!({
+                        "role": "user",
+                        "content": [block],
+                    })
+                } else if m.role == "assistant" && !m.tool_calls.is_empty() {
+                    // Assistant message with tool calls → add tool_use content blocks
+                    let mut content = anthropic_content_blocks(&m.content_blocks());
+                    for tc in &m.tool_calls {
+                        content.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.name,
+                            "input": tc.input,
+                        }));
+                    }
+                    serde_json::json!({
+                        "role": "assistant",
+                        "content": content,
+                    })
+                } else {
+                    let content_blocks = anthropic_content_blocks(&m.content_blocks());
+                    serde_json::json!({
+                        "role": m.role,
+                        "content": content_blocks,
+                    })
+                }
             })
             .collect();
 
@@ -698,6 +735,22 @@ impl AnthropicAdapter {
             "messages": messages,
             "stream": stream,
         });
+
+        // Serialize tool definitions for Anthropic
+        if !request.tools.is_empty() {
+            let tools_json: Vec<serde_json::Value> = request
+                .tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.input_schema,
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::Value::Array(tools_json);
+        }
 
         let mut system_blocks = Vec::new();
         if let Some(ref system) = request.system {
