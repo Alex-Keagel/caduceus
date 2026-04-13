@@ -2065,6 +2065,138 @@ mod tests {
         let json = tree.to_react_flow_json();
         assert_eq!(json["edges"].as_array().unwrap().len(), 0);
     }
+    // ── Phase 1e: Tool loop + circuit breaker + event tests ───────────────────
+
+    #[tokio::test]
+    async fn tool_loop_executes_tool_and_returns_final() {
+        // Script: first response has tool_call, second is final text
+        let tool_response = ChatResponse {
+            content: String::new(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: caduceus_providers::StopReason::ToolUse,
+            tool_calls: vec![caduceus_core::ToolUse {
+                id: "tc1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "hello.txt"}),
+            }],
+        };
+        let final_response = make_chat_response("Here is the file content.");
+
+        let adapter = Arc::new(MockLlmAdapter::new(vec![tool_response, final_response]));
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "hello world").unwrap();
+        let mut registry = caduceus_tools::ToolRegistry::new();
+        registry.register(Arc::new(caduceus_tools::ReadFileTool::new(dir.path())));
+
+        let harness = AgentHarness::new(adapter, registry, 4096, "system");
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+        let result = harness.run(&mut state, &mut history, "read hello.txt").await.unwrap();
+
+        assert_eq!(result, "Here is the file content.");
+        assert!(state.turn_count >= 2, "should have at least 2 turns (tool + final)");
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_stops_after_consecutive_failures() {
+        // Script: 10 tool_call responses that will all fail (unknown tool)
+        let bad_responses: Vec<ChatResponse> = (0..10).map(|i| ChatResponse {
+            content: String::new(),
+            input_tokens: 5,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: caduceus_providers::StopReason::ToolUse,
+            tool_calls: vec![caduceus_core::ToolUse {
+                id: format!("tc{i}"),
+                name: "nonexistent_tool".into(),
+                input: serde_json::json!({}),
+            }],
+        }).collect();
+
+        let adapter = Arc::new(MockLlmAdapter::new(bad_responses));
+        let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+        let result = harness.run(&mut state, &mut history, "do something").await.unwrap();
+
+        assert!(result.contains("Circuit breaker"), "should trigger circuit breaker: {result}");
+        // Should stop well before 10 iterations
+        assert!(state.turn_count <= 6, "should stop early, got {} turns", state.turn_count);
+    }
+
+    #[tokio::test]
+    async fn events_emitted_during_tool_loop() {
+        let tool_response = ChatResponse {
+            content: "Let me read that.".into(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: caduceus_providers::StopReason::ToolUse,
+            tool_calls: vec![caduceus_core::ToolUse {
+                id: "tc1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "test.txt"}),
+            }],
+        };
+        let final_response = make_chat_response("Done!");
+
+        let adapter = Arc::new(MockLlmAdapter::new(vec![tool_response, final_response]));
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.txt"), "content").unwrap();
+        let mut registry = caduceus_tools::ToolRegistry::new();
+        registry.register(Arc::new(caduceus_tools::ReadFileTool::new(dir.path())));
+
+        let (emitter, mut rx) = AgentEventEmitter::channel(64);
+        let harness = AgentHarness::new(adapter, registry, 4096, "system")
+            .with_emitter(emitter);
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+        let _result = harness.run(&mut state, &mut history, "read test.txt").await.unwrap();
+
+        // Collect all events
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        // Should have: phase_changed, thinking, text_delta, tool_call_start, tool_result_end, turn_complete, phase_changed
+        let event_types: Vec<String> = events.iter().map(|e| format!("{:?}", std::mem::discriminant(e))).collect();
+        assert!(events.len() >= 5, "expected ≥5 events, got {}: {:?}", events.len(), event_types);
+
+        // Check specific events exist
+        let has_tool_start = events.iter().any(|e| matches!(e, AgentEvent::ToolCallStart { .. }));
+        let has_tool_end = events.iter().any(|e| matches!(e, AgentEvent::ToolResultEnd { .. }));
+        let has_turn_complete = events.iter().any(|e| matches!(e, AgentEvent::TurnComplete { .. }));
+        assert!(has_tool_start, "missing ToolCallStart event");
+        assert!(has_tool_end, "missing ToolResultEnd event");
+        assert!(has_turn_complete, "missing TurnComplete event");
+    }
+
+    #[tokio::test]
+    async fn tool_specs_sent_in_request() {
+        let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("hi")]));
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = caduceus_tools::ToolRegistry::new();
+        registry.register(Arc::new(caduceus_tools::ReadFileTool::new(dir.path())));
+
+        let harness = AgentHarness::new(adapter.clone(), registry, 4096, "system");
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+        let _ = harness.run(&mut state, &mut history, "test").await;
+
+        let requests = adapter.recorded_requests();
+        assert!(!requests.is_empty());
+        assert!(!requests[0].tools.is_empty(), "tools should be sent in request");
+        assert!(requests[0].tools.iter().any(|t| t.name == "read_file"), "read_file tool should be in request");
+    }
+
 }
 
 // ── #236: PRD Parser ─────────────────────────────────────────────────────────
@@ -3886,5 +4018,6 @@ mod feature_tests_259_261 {
         let out = InstructionsScaffolder::template_for("cobol");
         assert!(out.contains("cobol"));
         assert!(out.contains("make build"));
-    }
+
+}
 }
