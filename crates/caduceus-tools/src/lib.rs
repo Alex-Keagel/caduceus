@@ -22,13 +22,21 @@ pub trait Tool: Send + Sync {
 
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    allowed_capabilities: Option<std::collections::HashSet<String>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            allowed_capabilities: None,
         }
+    }
+
+    /// Set allowed capabilities. Tools with a `required_capability` not in this set will be denied.
+    pub fn with_capabilities(mut self, caps: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.allowed_capabilities = Some(caps.into_iter().map(|c| c.into()).collect());
+        self
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
@@ -56,6 +64,18 @@ impl ToolRegistry {
                 message: format!("Unknown tool: {name}"),
             });
         };
+
+        // Enforce capability restrictions if set
+        if let Some(ref allowed) = self.allowed_capabilities {
+            if let Some(ref cap) = tool.spec().required_capability {
+                if !allowed.contains(cap.as_str()) {
+                    return Ok(ToolResult::error(format!(
+                        "Permission denied: tool '{}' requires capability '{}' which is not allowed in current mode",
+                        name, cap
+                    )));
+                }
+            }
+        }
 
         tool.call(input).await
     }

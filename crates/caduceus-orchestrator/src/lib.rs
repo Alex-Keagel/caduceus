@@ -725,6 +725,7 @@ pub struct AgentHarness {
     max_context_tokens: u32,
     max_turns: usize,
     max_tool_rounds: usize,
+    tool_timeout: std::time::Duration,
     emitter: Option<AgentEventEmitter>,
     instruction_set: Option<instructions::InstructionSet>,
     cancellation_token: Option<CancellationToken>,
@@ -747,6 +748,7 @@ impl AgentHarness {
             max_context_tokens,
             max_turns: 50,
             max_tool_rounds: 25,
+            tool_timeout: std::time::Duration::from_secs(120),
             emitter: None,
             instruction_set: None,
             cancellation_token: None,
@@ -763,6 +765,11 @@ impl AgentHarness {
 
     pub fn with_max_tool_rounds(mut self, n: usize) -> Self {
         self.max_tool_rounds = n;
+        self
+    }
+
+    pub fn with_tool_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.tool_timeout = timeout;
         self
     }
 
@@ -1044,11 +1051,14 @@ impl AgentHarness {
                             em.emit_tool_call_start(caduceus_core::ToolCallId(tool_use.id.clone()), &tool_use.name).await;
                         }
 
-                        // Execute tool
-                        let result = self.tools.execute(&tool_use.name, tool_use.input.clone()).await;
+                        // Execute tool (with timeout)
+                        let result = tokio::time::timeout(
+                            self.tool_timeout,
+                            self.tools.execute(&tool_use.name, tool_use.input.clone()),
+                        ).await;
 
                         let (result_content, is_error) = match result {
-                            Ok(r) => {
+                            Ok(Ok(r)) => {
                                 if r.is_error {
                                     consecutive_failures += 1;
                                 } else {
@@ -1056,9 +1066,13 @@ impl AgentHarness {
                                 }
                                 (r.content, r.is_error)
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 consecutive_failures += 1;
                                 (e.to_string(), true)
+                            }
+                            Err(_elapsed) => {
+                                consecutive_failures += 1;
+                                (format!("Tool '{}' timed out after {}s", tool_use.name, self.tool_timeout.as_secs()), true)
                             }
                         };
 
