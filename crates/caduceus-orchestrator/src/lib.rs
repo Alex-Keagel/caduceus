@@ -26,9 +26,9 @@ pub use workers::{
 
 use caduceus_core::{
     AgentEvent, CaduceusError, CancellationToken, ModelId, ProviderId, Result, SessionId,
-    SessionPhase, SessionState, TokenUsage, ToolCallId, WarningLevel,
+    SessionPhase, SessionState, StopReason, TokenUsage, ToolCallId, WarningLevel,
 };
-use caduceus_providers::{ChatRequest, ChatResponse, LlmAdapter, StopReason};
+use caduceus_providers::{ChatRequest, ChatResponse, LlmAdapter};
 use caduceus_tools::ToolRegistry;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -643,7 +643,6 @@ impl AgentEventEmitter {
     }
 
     pub async fn emit_turn_complete(&self, stop_reason: StopReason, usage: TokenUsage) {
-        let stop_reason = match stop_reason { StopReason::EndTurn => caduceus_core::StopReason::EndTurn, StopReason::MaxTokens => caduceus_core::StopReason::MaxTokens, StopReason::StopSequence => caduceus_core::StopReason::StopSequence, StopReason::ToolUse => caduceus_core::StopReason::ToolUse, };
         self.emit(AgentEvent::TurnComplete { stop_reason, usage })
             .await;
     }
@@ -666,47 +665,82 @@ impl AgentEventEmitter {
     }
 
     pub async fn emit_reasoning_delta(&self, content: impl Into<String>) {
-        self.emit(AgentEvent::ReasoningDelta { content: content.into() }).await;
+        self.emit(AgentEvent::ReasoningDelta {
+            content: content.into(),
+        })
+        .await;
     }
 
     pub async fn emit_reasoning_complete(&self, content: impl Into<String>, duration_ms: u64) {
-        self.emit(AgentEvent::ReasoningComplete { content: content.into(), duration_ms }).await;
+        self.emit(AgentEvent::ReasoningComplete {
+            content: content.into(),
+            duration_ms,
+        })
+        .await;
     }
 
     pub async fn emit_context_warning(&self, level: impl Into<String>, used: u32, max: u32) {
         self.emit(AgentEvent::ContextWarning {
-            level: level.into(), used_tokens: used, max_tokens: max,
-        }).await;
+            level: level.into(),
+            used_tokens: used,
+            max_tokens: max,
+        })
+        .await;
     }
 
     pub async fn emit_context_compacted(&self, freed: u32, before: u32, after: u32) {
         self.emit(AgentEvent::ContextCompacted {
-            freed_tokens: freed, before, after,
-        }).await;
+            freed_tokens: freed,
+            before,
+            after,
+        })
+        .await;
     }
 
     pub async fn emit_loop_detected(&self, tool_name: impl Into<String>, count: u32) {
         self.emit(AgentEvent::LoopDetected {
-            tool_name: tool_name.into(), consecutive_count: count,
-        }).await;
+            tool_name: tool_name.into(),
+            consecutive_count: count,
+        })
+        .await;
     }
 
     pub async fn emit_circuit_breaker(&self, failures: u32, last_tools: Vec<String>) {
         self.emit(AgentEvent::CircuitBreakerTriggered {
-            consecutive_failures: failures, last_tools,
-        }).await;
+            consecutive_failures: failures,
+            last_tools,
+        })
+        .await;
     }
 
-    pub async fn emit_tree_node(&self, id: impl Into<String>, parent_id: Option<String>, label: impl Into<String>, status: impl Into<String>) {
+    pub async fn emit_tree_node(
+        &self,
+        id: impl Into<String>,
+        parent_id: Option<String>,
+        label: impl Into<String>,
+        status: impl Into<String>,
+    ) {
         self.emit(AgentEvent::ExecutionTreeNode {
-            id: id.into(), parent_id, label: label.into(), status: status.into(),
-        }).await;
+            id: id.into(),
+            parent_id,
+            label: label.into(),
+            status: status.into(),
+        })
+        .await;
     }
 
-    pub async fn emit_tree_update(&self, id: impl Into<String>, status: impl Into<String>, detail: Option<String>) {
+    pub async fn emit_tree_update(
+        &self,
+        id: impl Into<String>,
+        status: impl Into<String>,
+        detail: Option<String>,
+    ) {
         self.emit(AgentEvent::ExecutionTreeUpdate {
-            id: id.into(), status: status.into(), detail,
-        }).await;
+            id: id.into(),
+            status: status.into(),
+            detail,
+        })
+        .await;
     }
 
     pub async fn emit_message_part(&self, part: caduceus_core::MessagePartType) {
@@ -939,18 +973,29 @@ impl AgentHarness {
             // Circuit breaker: too many consecutive failures
             if consecutive_failures >= 5 {
                 if let Some(ref em) = self.emitter {
-                    em.emit_circuit_breaker(consecutive_failures, tool_sequence.iter().rev().take(5).cloned().collect()).await;
+                    em.emit_circuit_breaker(
+                        consecutive_failures,
+                        tool_sequence.iter().rev().take(5).cloned().collect(),
+                    )
+                    .await;
                     em.emit_error(&format!(
                         "Circuit breaker: {} consecutive tool failures. Last: {}",
                         consecutive_failures,
                         tool_sequence.last().unwrap_or(&"none".to_string())
-                    )).await;
+                    ))
+                    .await;
                 }
                 final_text = format!(
                     "🛑 Circuit breaker triggered after {} consecutive tool failures.\n\
                     Last tools: {}\nPlease simplify the request or check the working directory.",
                     consecutive_failures,
-                    tool_sequence.iter().rev().take(5).cloned().collect::<Vec<_>>().join(", ")
+                    tool_sequence
+                        .iter()
+                        .rev()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
                 break;
             }
@@ -958,7 +1003,13 @@ impl AgentHarness {
             // Emit thinking event
             if let Some(ref em) = self.emitter {
                 em.emit_thinking_started(iteration as u32).await;
-                    em.emit_tree_node(format!("turn-{}", iteration), None, format!("Turn {} — Thinking", iteration + 1), "running").await;
+                em.emit_tree_node(
+                    format!("turn-{}", iteration),
+                    None,
+                    format!("Turn {} — Thinking", iteration + 1),
+                    "running",
+                )
+                .await;
             }
 
             // Assemble messages within budget
@@ -1008,12 +1059,16 @@ impl AgentHarness {
                     history.append(caduceus_providers::Message::assistant(&response.content));
                     final_text = response.content;
                     if let Some(ref em) = self.emitter {
-                        em.emit_turn_complete(response.stop_reason.clone(), TokenUsage {
-                            input_tokens: response.input_tokens,
-                            output_tokens: response.output_tokens,
-                            cache_read_tokens: response.cache_read_tokens,
-                            cache_write_tokens: response.cache_creation_tokens,
-                        }).await;
+                        em.emit_turn_complete(
+                            response.stop_reason.clone(),
+                            TokenUsage {
+                                input_tokens: response.input_tokens,
+                                output_tokens: response.output_tokens,
+                                cache_read_tokens: response.cache_read_tokens,
+                                cache_write_tokens: response.cache_creation_tokens,
+                            },
+                        )
+                        .await;
                     }
                     break;
                 }
@@ -1026,7 +1081,8 @@ impl AgentHarness {
                     }
 
                     // Store assistant message with tool calls in history
-                    let mut assistant_msg = caduceus_providers::Message::assistant(&response.content);
+                    let mut assistant_msg =
+                        caduceus_providers::Message::assistant(&response.content);
                     assistant_msg.tool_calls = response.tool_calls.clone();
                     history.append(assistant_msg);
 
@@ -1039,7 +1095,8 @@ impl AgentHarness {
                                 em.emit_error(&format!(
                                     "Loop detected: tool '{}' called repeatedly with same args",
                                     tool_use.name
-                                )).await;
+                                ))
+                                .await;
                             }
                             consecutive_failures += 1;
                         }
@@ -1048,14 +1105,19 @@ impl AgentHarness {
 
                         // Emit tool start event
                         if let Some(ref em) = self.emitter {
-                            em.emit_tool_call_start(caduceus_core::ToolCallId(tool_use.id.clone()), &tool_use.name).await;
+                            em.emit_tool_call_start(
+                                caduceus_core::ToolCallId(tool_use.id.clone()),
+                                &tool_use.name,
+                            )
+                            .await;
                         }
 
                         // Execute tool (with timeout)
                         let result = tokio::time::timeout(
                             self.tool_timeout,
                             self.tools.execute(&tool_use.name, tool_use.input.clone()),
-                        ).await;
+                        )
+                        .await;
 
                         let (result_content, is_error) = match result {
                             Ok(Ok(r)) => {
@@ -1072,13 +1134,25 @@ impl AgentHarness {
                             }
                             Err(_elapsed) => {
                                 consecutive_failures += 1;
-                                (format!("Tool '{}' timed out after {}s", tool_use.name, self.tool_timeout.as_secs()), true)
+                                (
+                                    format!(
+                                        "Tool '{}' timed out after {}s",
+                                        tool_use.name,
+                                        self.tool_timeout.as_secs()
+                                    ),
+                                    true,
+                                )
                             }
                         };
 
                         // Emit tool complete event
                         if let Some(ref em) = self.emitter {
-                            em.emit_tool_result_end(caduceus_core::ToolCallId(tool_use.id.clone()), &result_content, is_error).await;
+                            em.emit_tool_result_end(
+                                caduceus_core::ToolCallId(tool_use.id.clone()),
+                                &result_content,
+                                is_error,
+                            )
+                            .await;
                         }
 
                         // Add tool result to history
@@ -1088,9 +1162,11 @@ impl AgentHarness {
                             content_blocks: None,
                             tool_calls: vec![],
                             tool_result: Some(if is_error {
-                                caduceus_core::ToolResult::error(&result_content).with_tool_use_id(&tool_use.id)
+                                caduceus_core::ToolResult::error(&result_content)
+                                    .with_tool_use_id(&tool_use.id)
                             } else {
-                                caduceus_core::ToolResult::success(&result_content).with_tool_use_id(&tool_use.id)
+                                caduceus_core::ToolResult::success(&result_content)
+                                    .with_tool_use_id(&tool_use.id)
                             }),
                         };
                         history.append(tool_msg);
@@ -1572,9 +1648,9 @@ mod tests {
     /// 5. empty_input_noop — empty string returns a graceful message, not an error
     #[tokio::test]
     async fn empty_input_noop() {
-        let adapter = Arc::new(
-            MockLlmAdapter::new(vec![make_chat_response("Please provide a message.")]),
-        );
+        let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response(
+            "Please provide a message.",
+        )]));
         let harness =
             AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
         let mut state = make_session();
@@ -1677,9 +1753,7 @@ mod tests {
     /// 10. session_state_persistence — serialize conversation history, reload, verify state intact
     #[tokio::test]
     async fn session_state_persistence() {
-        let adapter = Arc::new(
-            MockLlmAdapter::new(vec![make_chat_response("remembered")]),
-        );
+        let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("remembered")]));
         let harness =
             AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
         let mut state = make_session();
@@ -1859,9 +1933,7 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
 
-        let adapter = Arc::new(
-            MockLlmAdapter::new(vec![make_chat_response("response")]),
-        );
+        let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("response")]));
         let harness =
             AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
                 .with_cancellation_token(token);
@@ -1876,8 +1948,7 @@ mod tests {
 
     #[tokio::test]
     async fn harness_with_effort_level() {
-        let adapter =
-            Arc::new(MockLlmAdapter::new(vec![make_chat_response("ok")]));
+        let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("ok")]));
         let harness = AgentHarness::new(
             adapter.clone(),
             caduceus_tools::ToolRegistry::new(),
@@ -1903,8 +1974,7 @@ mod tests {
 
     #[tokio::test]
     async fn harness_with_query_config() {
-        let adapter =
-            Arc::new(MockLlmAdapter::new(vec![make_chat_response("ok")]));
+        let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("ok")]));
         let qc = QueryConfig {
             model: Some(ModelId::new("custom-model")),
             temperature: Some(0.9),
@@ -1983,8 +2053,7 @@ mod tests {
 
     #[tokio::test]
     async fn harness_with_mode_prepends_prompt() {
-        let adapter =
-            Arc::new(MockLlmAdapter::new(vec![make_chat_response("ok")]));
+        let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("ok")]));
         let harness = AgentHarness::new(
             adapter.clone(),
             caduceus_tools::ToolRegistry::new(),
@@ -2122,38 +2191,57 @@ mod tests {
         let harness = AgentHarness::new(adapter, registry, 4096, "system");
         let mut state = make_session();
         let mut history = ConversationHistory::new();
-        let result = harness.run(&mut state, &mut history, "read hello.txt").await.unwrap();
+        let result = harness
+            .run(&mut state, &mut history, "read hello.txt")
+            .await
+            .unwrap();
 
         assert_eq!(result, "Here is the file content.");
-        assert!(state.turn_count >= 2, "should have at least 2 turns (tool + final)");
+        assert!(
+            state.turn_count >= 2,
+            "should have at least 2 turns (tool + final)"
+        );
     }
 
     #[tokio::test]
     async fn circuit_breaker_stops_after_consecutive_failures() {
         // Script: 10 tool_call responses that will all fail (unknown tool)
-        let bad_responses: Vec<ChatResponse> = (0..10).map(|i| ChatResponse {
-            content: String::new(),
-            input_tokens: 5,
-            output_tokens: 5,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            stop_reason: caduceus_providers::StopReason::ToolUse,
-            tool_calls: vec![caduceus_core::ToolUse {
-                id: format!("tc{i}"),
-                name: "nonexistent_tool".into(),
-                input: serde_json::json!({}),
-            }],
-        }).collect();
+        let bad_responses: Vec<ChatResponse> = (0..10)
+            .map(|i| ChatResponse {
+                content: String::new(),
+                input_tokens: 5,
+                output_tokens: 5,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                stop_reason: caduceus_providers::StopReason::ToolUse,
+                tool_calls: vec![caduceus_core::ToolUse {
+                    id: format!("tc{i}"),
+                    name: "nonexistent_tool".into(),
+                    input: serde_json::json!({}),
+                }],
+            })
+            .collect();
 
         let adapter = Arc::new(MockLlmAdapter::new(bad_responses));
-        let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+        let harness =
+            AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
         let mut state = make_session();
         let mut history = ConversationHistory::new();
-        let result = harness.run(&mut state, &mut history, "do something").await.unwrap();
+        let result = harness
+            .run(&mut state, &mut history, "do something")
+            .await
+            .unwrap();
 
-        assert!(result.contains("Circuit breaker"), "should trigger circuit breaker: {result}");
+        assert!(
+            result.contains("Circuit breaker"),
+            "should trigger circuit breaker: {result}"
+        );
         // Should stop well before 10 iterations
-        assert!(state.turn_count <= 6, "should stop early, got {} turns", state.turn_count);
+        assert!(
+            state.turn_count <= 6,
+            "should stop early, got {} turns",
+            state.turn_count
+        );
     }
 
     #[tokio::test]
@@ -2181,11 +2269,13 @@ mod tests {
         registry.register(Arc::new(caduceus_tools::ReadFileTool::new(dir.path())));
 
         let (emitter, mut rx) = AgentEventEmitter::channel(64);
-        let harness = AgentHarness::new(adapter, registry, 4096, "system")
-            .with_emitter(emitter);
+        let harness = AgentHarness::new(adapter, registry, 4096, "system").with_emitter(emitter);
         let mut state = make_session();
         let mut history = ConversationHistory::new();
-        let _result = harness.run(&mut state, &mut history, "read test.txt").await.unwrap();
+        let _result = harness
+            .run(&mut state, &mut history, "read test.txt")
+            .await
+            .unwrap();
 
         // Collect all events
         let mut events = Vec::new();
@@ -2194,13 +2284,27 @@ mod tests {
         }
 
         // Should have: phase_changed, thinking, text_delta, tool_call_start, tool_result_end, turn_complete, phase_changed
-        let event_types: Vec<String> = events.iter().map(|e| format!("{:?}", std::mem::discriminant(e))).collect();
-        assert!(events.len() >= 5, "expected ≥5 events, got {}: {:?}", events.len(), event_types);
+        let event_types: Vec<String> = events
+            .iter()
+            .map(|e| format!("{:?}", std::mem::discriminant(e)))
+            .collect();
+        assert!(
+            events.len() >= 5,
+            "expected ≥5 events, got {}: {:?}",
+            events.len(),
+            event_types
+        );
 
         // Check specific events exist
-        let has_tool_start = events.iter().any(|e| matches!(e, AgentEvent::ToolCallStart { .. }));
-        let has_tool_end = events.iter().any(|e| matches!(e, AgentEvent::ToolResultEnd { .. }));
-        let has_turn_complete = events.iter().any(|e| matches!(e, AgentEvent::TurnComplete { .. }));
+        let has_tool_start = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCallStart { .. }));
+        let has_tool_end = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolResultEnd { .. }));
+        let has_turn_complete = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnComplete { .. }));
         assert!(has_tool_start, "missing ToolCallStart event");
         assert!(has_tool_end, "missing ToolResultEnd event");
         assert!(has_turn_complete, "missing TurnComplete event");
@@ -2220,10 +2324,15 @@ mod tests {
 
         let requests = adapter.recorded_requests();
         assert!(!requests.is_empty());
-        assert!(!requests[0].tools.is_empty(), "tools should be sent in request");
-        assert!(requests[0].tools.iter().any(|t| t.name == "read_file"), "read_file tool should be in request");
+        assert!(
+            !requests[0].tools.is_empty(),
+            "tools should be sent in request"
+        );
+        assert!(
+            requests[0].tools.iter().any(|t| t.name == "read_file"),
+            "read_file tool should be in request"
+        );
     }
-
 }
 
 // ── #236: PRD Parser ─────────────────────────────────────────────────────────
@@ -4045,6 +4154,5 @@ mod feature_tests_259_261 {
         let out = InstructionsScaffolder::template_for("cobol");
         assert!(out.contains("cobol"));
         assert!(out.contains("make build"));
-
-}
+    }
 }

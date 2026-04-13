@@ -281,7 +281,7 @@ pub enum AgentEvent {
 
     // ── Context management ────────────────────────────────────────────────────
     ContextWarning {
-        level: String,     // "warning_70", "warning_85", "critical_95"
+        level: String, // "warning_70", "warning_85", "critical_95"
         used_tokens: u32,
         max_tokens: u32,
     },

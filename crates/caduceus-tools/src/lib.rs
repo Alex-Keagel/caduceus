@@ -4431,7 +4431,9 @@ impl CryptoWeaknessDetector {
 pub struct ThinkTool;
 
 impl ThinkTool {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 #[async_trait]
@@ -4453,7 +4455,10 @@ impl Tool for ThinkTool {
 
     async fn call(&self, input: Value) -> Result<ToolResult> {
         let thought = input["thought"].as_str().unwrap_or("");
-        Ok(ToolResult::success(format!("[Thinking complete — {} chars of reasoning]", thought.len())))
+        Ok(ToolResult::success(format!(
+            "[Thinking complete — {} chars of reasoning]",
+            thought.len()
+        )))
     }
 }
 
@@ -4461,7 +4466,9 @@ impl Tool for ThinkTool {
 pub struct AttemptCompletionTool;
 
 impl AttemptCompletionTool {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 #[async_trait]
@@ -4492,7 +4499,9 @@ impl Tool for AttemptCompletionTool {
 pub struct AskFollowupTool;
 
 impl AskFollowupTool {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 #[async_trait]
@@ -4500,7 +4509,8 @@ impl Tool for AskFollowupTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "ask_followup".into(),
-            description: "Ask the user a clarifying question when you need more information.".into(),
+            description: "Ask the user a clarifying question when you need more information."
+                .into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -4514,7 +4524,10 @@ impl Tool for AskFollowupTool {
 
     async fn call(&self, input: Value) -> Result<ToolResult> {
         let question = input["question"].as_str().unwrap_or("Could you clarify?");
-        Ok(ToolResult::success(format!("[Question for user: {}]", question)))
+        Ok(ToolResult::success(format!(
+            "[Question for user: {}]",
+            question
+        )))
     }
 }
 
@@ -4525,7 +4538,9 @@ pub struct CreateFileTool {
 
 impl CreateFileTool {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
-        Self { workspace_root: workspace_root.into() }
+        Self {
+            workspace_root: workspace_root.into(),
+        }
     }
 }
 
@@ -4552,17 +4567,24 @@ impl Tool for CreateFileTool {
         let content = input["content"].as_str().unwrap_or("");
         let full = resolve_workspace_path(&self.workspace_root, path_str)?;
         if full.exists() {
-            return Ok(ToolResult::error(format!("File already exists: {path_str}")));
+            return Ok(ToolResult::error(format!(
+                "File already exists: {path_str}"
+            )));
         }
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).map_err(|e| CaduceusError::Tool {
-                tool: "create_file".into(), message: e.to_string(),
+                tool: "create_file".into(),
+                message: e.to_string(),
             })?;
         }
         std::fs::write(&full, content).map_err(|e| CaduceusError::Tool {
-            tool: "create_file".into(), message: e.to_string(),
+            tool: "create_file".into(),
+            message: e.to_string(),
         })?;
-        Ok(ToolResult::success(format!("Created {path_str} ({} bytes)", content.len())))
+        Ok(ToolResult::success(format!(
+            "Created {path_str} ({} bytes)",
+            content.len()
+        )))
     }
 }
 
@@ -4573,7 +4595,9 @@ pub struct DeleteFileTool {
 
 impl DeleteFileTool {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
-        Self { workspace_root: workspace_root.into() }
+        Self {
+            workspace_root: workspace_root.into(),
+        }
     }
 }
 
@@ -4598,7 +4622,8 @@ impl Tool for DeleteFileTool {
         let path_str = input["path"].as_str().unwrap_or("");
         let full = resolve_workspace_path(&self.workspace_root, path_str)?;
         std::fs::remove_file(&full).map_err(|e| CaduceusError::Tool {
-            tool: "delete_file".into(), message: e.to_string(),
+            tool: "delete_file".into(),
+            message: e.to_string(),
         })?;
         Ok(ToolResult::success(format!("Deleted {path_str}")))
     }
@@ -4611,7 +4636,9 @@ pub struct RenameFileTool {
 
 impl RenameFileTool {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
-        Self { workspace_root: workspace_root.into() }
+        Self {
+            workspace_root: workspace_root.into(),
+        }
     }
 }
 
@@ -4642,7 +4669,8 @@ impl Tool for RenameFileTool {
             let _ = std::fs::create_dir_all(parent);
         }
         std::fs::rename(&old_full, &new_full).map_err(|e| CaduceusError::Tool {
-            tool: "rename_file".into(), message: e.to_string(),
+            tool: "rename_file".into(),
+            message: e.to_string(),
         })?;
         Ok(ToolResult::success(format!("Renamed {old} → {new}")))
     }
@@ -4655,7 +4683,9 @@ pub struct GitCommitTool {
 
 impl GitCommitTool {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
-        Self { workspace_root: workspace_root.into() }
+        Self {
+            workspace_root: workspace_root.into(),
+        }
     }
 }
 
@@ -4678,10 +4708,18 @@ impl Tool for GitCommitTool {
 
     async fn call(&self, input: Value) -> Result<ToolResult> {
         let msg = input["message"].as_str().unwrap_or("auto-commit");
-        let _ = std::process::Command::new("git").args(["add", "-A"]).current_dir(&self.workspace_root).output();
-        let output = std::process::Command::new("git").args(["commit", "-m", msg])
-            .current_dir(&self.workspace_root).output()
-            .map_err(|e| CaduceusError::Tool { tool: "git_commit".into(), message: e.to_string() })?;
+        let _ = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&self.workspace_root)
+            .output();
+        let output = std::process::Command::new("git")
+            .args(["commit", "-m", msg])
+            .current_dir(&self.workspace_root)
+            .output()
+            .map_err(|e| CaduceusError::Tool {
+                tool: "git_commit".into(),
+                message: e.to_string(),
+            })?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         Ok(ToolResult::success(format!("{stdout}{stderr}")))
@@ -4695,7 +4733,9 @@ pub struct GitLogTool {
 
 impl GitLogTool {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
-        Self { workspace_root: workspace_root.into() }
+        Self {
+            workspace_root: workspace_root.into(),
+        }
     }
 }
 
@@ -4719,9 +4759,15 @@ impl Tool for GitLogTool {
         let count = input["count"].as_u64().unwrap_or(10);
         let output = std::process::Command::new("git")
             .args(["log", "--oneline", &format!("-{count}")])
-            .current_dir(&self.workspace_root).output()
-            .map_err(|e| CaduceusError::Tool { tool: "git_log".into(), message: e.to_string() })?;
-        Ok(ToolResult::success(String::from_utf8_lossy(&output.stdout).to_string()))
+            .current_dir(&self.workspace_root)
+            .output()
+            .map_err(|e| CaduceusError::Tool {
+                tool: "git_log".into(),
+                message: e.to_string(),
+            })?;
+        Ok(ToolResult::success(
+            String::from_utf8_lossy(&output.stdout).to_string(),
+        ))
     }
 }
 

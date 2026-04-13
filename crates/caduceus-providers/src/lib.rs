@@ -14,6 +14,9 @@ use tracing::warn;
 
 pub mod mock;
 
+// Re-export StopReason from core — canonical definition lives in caduceus_core
+pub use caduceus_core::StopReason;
+
 // ── Message types ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,13 +232,7 @@ pub struct ChatResponse {
     pub tool_calls: Vec<ToolUse>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StopReason {
-    EndTurn,
-    MaxTokens,
-    StopSequence,
-    ToolUse,
-}
+// StopReason is re-exported from caduceus_core — canonical definition lives there.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChunk {
@@ -1130,7 +1127,9 @@ fn build_openai_request_body(
             }));
         } else if msg.role == "tool" {
             // Tool result message
-            let tool_use_id = msg.tool_result.as_ref()
+            let tool_use_id = msg
+                .tool_result
+                .as_ref()
                 .and_then(|r| r.tool_use_id.clone())
                 .unwrap_or_default();
             messages.push(serde_json::json!({
@@ -1140,16 +1139,20 @@ fn build_openai_request_body(
             }));
         } else if !msg.tool_calls.is_empty() {
             // Assistant message with tool calls
-            let tool_calls_json: Vec<serde_json::Value> = msg.tool_calls.iter().map(|tc| {
-                serde_json::json!({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.name,
-                        "arguments": tc.input.to_string(),
-                    }
+            let tool_calls_json: Vec<serde_json::Value> = msg
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.input.to_string(),
+                        }
+                    })
                 })
-            }).collect();
+                .collect();
             let mut m = serde_json::json!({
                 "role": "assistant",
                 "tool_calls": tool_calls_json,
@@ -1210,16 +1213,20 @@ fn build_openai_request_body(
 
     // Serialize tool definitions for the API
     if !request.tools.is_empty() {
-        let tools_json: Vec<serde_json::Value> = request.tools.iter().map(|t| {
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.input_schema,
-                }
+        let tools_json: Vec<serde_json::Value> = request
+            .tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    }
+                })
             })
-        }).collect();
+            .collect();
         body["tools"] = serde_json::Value::Array(tools_json);
     }
 
@@ -2152,7 +2159,10 @@ impl CopilotLmAdapter {
             .or_else(|_| {
                 // Try gh CLI with common paths
                 for gh in &["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
-                    if let Ok(output) = std::process::Command::new(gh).args(["auth", "token"]).output() {
+                    if let Ok(output) = std::process::Command::new(gh)
+                        .args(["auth", "token"])
+                        .output()
+                    {
                         if output.status.success() {
                             let t = String::from_utf8_lossy(&output.stdout).trim().to_string();
                             if !t.is_empty() {
@@ -2163,7 +2173,9 @@ impl CopilotLmAdapter {
                 }
                 Err(std::env::VarError::NotPresent)
             })
-            .map_err(|_| "No GitHub token found. Set GITHUB_TOKEN or run 'gh auth login'.".to_string())?;
+            .map_err(|_| {
+                "No GitHub token found. Set GITHUB_TOKEN or run 'gh auth login'.".to_string()
+            })?;
         Ok(Self::new(token))
     }
 
@@ -2262,7 +2274,8 @@ impl LlmAdapter for CopilotLmAdapter {
 
     async fn list_models(&self) -> Result<Vec<ModelId>> {
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
-        let resp = self.copilot_headers(self.client.get(&url))
+        let resp = self
+            .copilot_headers(self.client.get(&url))
             .send()
             .await
             .map_err(|e| CaduceusError::Provider(format!("Failed to list models: {}", e)))?;
@@ -2274,7 +2287,9 @@ impl LlmAdapter for CopilotLmAdapter {
             ]);
         }
 
-        let body: serde_json::Value = resp.json().await
+        let body: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| CaduceusError::Provider(format!("Failed to parse models: {}", e)))?;
 
         let models = body["data"]
@@ -2286,7 +2301,9 @@ impl LlmAdapter for CopilotLmAdapter {
                             && m["policy"]["state"].as_str() == Some("enabled")
                             && m["supported_endpoints"]
                                 .as_array()
-                                .map(|eps| eps.iter().any(|e| e.as_str() == Some("/chat/completions")))
+                                .map(|eps| {
+                                    eps.iter().any(|e| e.as_str() == Some("/chat/completions"))
+                                })
                                 .unwrap_or(false)
                     })
                     .filter_map(|m| m["id"].as_str().map(ModelId::new))
