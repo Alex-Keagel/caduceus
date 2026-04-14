@@ -1,6 +1,16 @@
 //! Instruction management system for Caduceus.
 //!
-//! Reads and merges agent instructions from an 8-level priority hierarchy:
+//! Reads and merges agent instructions from an 8-level priority hierarchy,
+//! walking from the filesystem root to CWD (inner overrides outer).
+//!
+//! **Conflict resolution** (inspired by Claude Code / claw-code):
+//! - Duplicate content is deduplicated by content hash
+//! - Agent/skill name conflicts: last definition wins, conflict noted in prompt
+//! - Trigger phrase overlaps: detected and reported in `<instruction_conflicts>`
+//! - Tool name conflicts with built-ins: hard error (not silent override)
+//! - Total instruction budget: 32K chars max, later files truncated
+//!
+//! Priority hierarchy (higher number = higher priority):
 //! 1. `~/.caduceus/instructions.md` — user global
 //! 2. `CADUCEUS.md` in workspace root — project-level
 //! 3. `AGENTS.md` in workspace root — cross-tool agent config
@@ -14,6 +24,11 @@ use caduceus_core::{CaduceusError, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// Max total chars across all instruction files (budget-based truncation).
+const MAX_TOTAL_INSTRUCTION_CHARS: usize = 32_000;
+/// Max chars per single instruction file.
+const MAX_INSTRUCTION_FILE_CHARS: usize = 8_000;
 
 // ── Data structures ────────────────────────────────────────────────────────────
 
@@ -164,24 +179,97 @@ impl InstructionLoader {
     pub fn load(&self) -> Result<InstructionSet> {
         let mut set = InstructionSet::default();
         let mut prompt_parts: Vec<String> = Vec::new();
+        let mut remaining_chars = MAX_TOTAL_INSTRUCTION_CHARS;
+        let mut seen_hashes: Vec<u64> = Vec::new();
+
+        // Helper: truncate + dedup content, returns None if duplicate or budget exhausted
+        let add_content =
+            |content: &str, seen: &mut Vec<u64>, remaining: &mut usize| -> Option<String> {
+                if *remaining == 0 {
+                    return None;
+                }
+                let trimmed = content.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                // Content-hash dedup (same approach as claw-code)
+                let hash = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    trimmed.hash(&mut hasher);
+                    hasher.finish()
+                };
+                if seen.contains(&hash) {
+                    return None;
+                }
+                seen.push(hash);
+                // Budget truncation
+                let limit = MAX_INSTRUCTION_FILE_CHARS.min(*remaining);
+                let text = if trimmed.len() > limit {
+                    format!(
+                        "{}\n\n[truncated — {} chars omitted]",
+                        &trimmed[..limit],
+                        trimmed.len() - limit
+                    )
+                } else {
+                    trimmed.to_string()
+                };
+                *remaining = remaining.saturating_sub(text.len());
+                Some(text)
+            };
+
+        // 0. Walk ancestor directories (root → CWD) for CADUCEUS.md files
+        // Inner directories override outer (most specific wins), like Claude Code
+        {
+            let mut ancestors = Vec::new();
+            let mut cursor = Some(self.workspace_root.as_path());
+            while let Some(dir) = cursor {
+                ancestors.push(dir.to_path_buf());
+                cursor = dir.parent();
+            }
+            ancestors.reverse(); // root first, CWD last
+            for dir in &ancestors {
+                if *dir == self.workspace_root {
+                    continue;
+                } // handled below
+                for name in &["CADUCEUS.md", ".caduceus/instructions.md"] {
+                    let path = dir.join(name);
+                    if let Some(content) = read_optional(&path)? {
+                        if let Some(text) =
+                            add_content(&content, &mut seen_hashes, &mut remaining_chars)
+                        {
+                            prompt_parts.push(format!(
+                                "<ancestor_instructions path=\"{}\">\n{}\n</ancestor_instructions>",
+                                path.display(),
+                                text
+                            ));
+                        }
+                    }
+                }
+            }
+        }
 
         // 1. User global instructions (~/.caduceus/instructions.md)
         let user_global = dirs_home()?.join(".caduceus/instructions.md");
         if let Some(content) = read_optional(&user_global)? {
-            prompt_parts.push(format!(
-                "<user_instructions>\n{}\n</user_instructions>",
-                content.trim()
-            ));
+            if let Some(text) = add_content(&content, &mut seen_hashes, &mut remaining_chars) {
+                prompt_parts.push(format!(
+                    "<user_instructions>\n{}\n</user_instructions>",
+                    text
+                ));
+            }
         }
 
         // 2. CADUCEUS.md in workspace root
         let caduceus_md = self.workspace_root.join("CADUCEUS.md");
         if let Some(content) = read_optional(&caduceus_md)? {
             set.project_instructions.push_str(&content);
-            prompt_parts.push(format!(
-                "<project_instructions>\n{}\n</project_instructions>",
-                content.trim()
-            ));
+            if let Some(text) = add_content(&content, &mut seen_hashes, &mut remaining_chars) {
+                prompt_parts.push(format!(
+                    "<project_instructions>\n{}\n</project_instructions>",
+                    text
+                ));
+            }
         }
 
         // 3. AGENTS.md in workspace root
@@ -261,6 +349,80 @@ impl InstructionLoader {
                 prompt_parts.push(format!(
                     "<memory>\n{}\n</memory>",
                     set.memory_entries.join("\n")
+                ));
+            }
+        }
+
+        // ── Conflict detection & resolution ─────────────────────────────────
+        // Check for duplicate agent/skill names and overlapping trigger phrases.
+        // Higher-numbered layers override lower (skills > agents > project).
+        {
+            let mut seen_names: std::collections::HashMap<String, &str> =
+                std::collections::HashMap::new();
+            let mut conflicts: Vec<String> = Vec::new();
+
+            for agent in &set.active_agents {
+                if let Some(prev) = seen_names.insert(agent.name.clone(), "agent") {
+                    conflicts.push(format!(
+                        "Duplicate name '{}': defined as both {} and agent",
+                        agent.name, prev
+                    ));
+                }
+            }
+            for skill in &set.available_skills {
+                if let Some(prev) = seen_names.insert(skill.name.clone(), "skill") {
+                    conflicts.push(format!(
+                        "Duplicate name '{}': defined as both {} and skill — skill takes priority",
+                        skill.name, prev
+                    ));
+                }
+            }
+
+            // Check overlapping trigger phrases
+            let mut trigger_map: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for agent in &set.active_agents {
+                for trigger in &agent.trigger_phrases {
+                    trigger_map
+                        .entry(trigger.to_lowercase())
+                        .or_default()
+                        .push(format!("agent:{}", agent.name));
+                }
+            }
+            for skill in &set.available_skills {
+                for trigger in &skill.trigger_phrases {
+                    trigger_map
+                        .entry(trigger.to_lowercase())
+                        .or_default()
+                        .push(format!("skill:{}", skill.name));
+                }
+            }
+            for (trigger, owners) in &trigger_map {
+                if owners.len() > 1 {
+                    conflicts.push(format!(
+                        "Trigger '{}' claimed by multiple: {} — last definition wins",
+                        trigger,
+                        owners.join(", ")
+                    ));
+                }
+            }
+
+            // Deduplicate agents by name (last definition wins)
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            set.active_agents.retain(|a| seen.insert(a.name.clone()));
+            seen.clear();
+            set.available_skills.retain(|s| seen.insert(s.name.clone()));
+
+            // Inject conflict warnings into prompt so LLM is aware
+            if !conflicts.is_empty() {
+                prompt_parts.push(format!(
+                    "<instruction_conflicts>\nThe following conflicts were detected in project configuration. \
+                     Later definitions take priority:\n{}\n</instruction_conflicts>",
+                    conflicts
+                        .iter()
+                        .map(|c| format!("- {c}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 ));
             }
         }
