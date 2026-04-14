@@ -2800,7 +2800,7 @@ mod tests {
 
 use std::collections::HashMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PrdTask {
     pub id: usize,
     pub title: String,
@@ -2965,7 +2965,7 @@ impl PrdParser {
 
 // ── #237: Smart Task Recommender ─────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TaskRecommendation {
     pub task_id: usize,
     pub score: f64,
@@ -3311,7 +3311,7 @@ impl SreAgent {
 
 // ── #246: Progress Inference ──────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InferredProgress {
     pub task_id: usize,
     pub percentage: f64,
