@@ -802,8 +802,8 @@ impl AgentHarness {
             tools,
             system_prompt: system_prompt.into(),
             max_context_tokens,
-            max_turns: 50,
-            max_tool_rounds: 25,
+            max_turns: 100,
+            max_tool_rounds: 50,
             tool_timeout: std::time::Duration::from_secs(120),
             emitter: None,
             instruction_set: None,
@@ -1383,13 +1383,59 @@ impl AgentHarness {
             }
         }
 
-        // Fallback if loop exhausted
+        // Fallback if loop exhausted — attempt one final summary call
         if final_text.is_empty() {
-            final_text = format!(
-                "⚠️ Agent used all {} tool iterations.\nTools: {}\nUse /compact or simplify.",
-                self.max_tool_rounds,
-                tool_sequence.join(", ")
-            );
+            // Try to get a summary from the LLM with accumulated context
+            let summary_request = ChatRequest {
+                model: self.effective_model(state),
+                messages: assembler.assemble(history),
+                system: Some(format!(
+                    "{}\n\nYou have used all {} tool iterations. \
+                     Summarize what you found and provide your answer now. \
+                     Do NOT call any more tools.",
+                    system_prompt, self.max_tool_rounds
+                )),
+                max_tokens: self.effective_max_tokens(),
+                temperature: self.effective_temperature(),
+                thinking_mode: false,
+                tool_choice: None,
+                tools: vec![], // No tools — force text response
+                response_format: None,
+            };
+            match self.provider.chat(summary_request).await {
+                Ok(summary) if !summary.content.is_empty() => {
+                    final_text = summary.content;
+                    if let Some(ref em) = self.emitter {
+                        let content = &final_text;
+                        let mut pos = 0;
+                        while pos < content.len() {
+                            let end = (pos + 100).min(content.len());
+                            let chunk_end = if end < content.len() {
+                                content[pos..end]
+                                    .rfind(|c: char| c.is_whitespace())
+                                    .map(|i| pos + i + 1)
+                                    .unwrap_or(end)
+                            } else {
+                                end
+                            };
+                            em.emit_text_delta(&content[pos..chunk_end]).await;
+                            pos = chunk_end;
+                        }
+                    }
+                }
+                _ => {
+                    final_text = format!(
+                        "⚠️ Agent used all {} tool iterations without a final answer.\n\
+                         Tools used: {}\n\
+                         Try /compact to free context, or simplify your request.",
+                        self.max_tool_rounds,
+                        tool_sequence.join(", ")
+                    );
+                    if let Some(ref em) = self.emitter {
+                        em.emit_text_delta(&final_text).await;
+                    }
+                }
+            }
         }
 
         state.phase = SessionPhase::Idle;
@@ -2535,7 +2581,7 @@ mod tests {
         let adapter: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
         let harness =
             AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
-        assert_eq!(harness.max_tool_rounds, 25);
+        assert_eq!(harness.max_tool_rounds, 50);
     }
 
     #[test]
