@@ -3490,6 +3490,117 @@ impl LspBridgeTool {
     pub fn supports(&self, cap: &LspCapability) -> bool {
         self.capabilities.contains(cap)
     }
+
+    /// Build a textDocument/hover request.
+    pub fn hover_request(file: &str, line: u32, character: u32) -> LspRequest {
+        LspRequest {
+            method: "textDocument/hover".into(),
+            file: file.into(),
+            line,
+            character,
+        }
+    }
+
+    /// Build a textDocument/definition request.
+    pub fn goto_definition_request(file: &str, line: u32, character: u32) -> LspRequest {
+        LspRequest {
+            method: "textDocument/definition".into(),
+            file: file.into(),
+            line,
+            character,
+        }
+    }
+
+    /// Build a textDocument/references request.
+    pub fn find_references_request(file: &str, line: u32, character: u32) -> LspRequest {
+        LspRequest {
+            method: "textDocument/references".into(),
+            file: file.into(),
+            line,
+            character,
+        }
+    }
+
+    /// Build a textDocument/publishDiagnostics request.
+    pub fn diagnostics_request(file: &str) -> LspRequest {
+        LspRequest {
+            method: "textDocument/publishDiagnostics".into(),
+            file: file.into(),
+            line: 0,
+            character: 0,
+        }
+    }
+
+    /// Build a textDocument/completion request.
+    pub fn completion_request(file: &str, line: u32, character: u32) -> LspRequest {
+        LspRequest {
+            method: "textDocument/completion".into(),
+            file: file.into(),
+            line,
+            character,
+        }
+    }
+
+    /// Detect the appropriate LSP server command for a given file language.
+    pub fn detect_lsp_server(language: &str) -> Option<&'static str> {
+        match language {
+            "rust" => Some("rust-analyzer"),
+            "typescript" | "javascript" | "typescriptreact" | "javascriptreact" => {
+                Some("typescript-language-server --stdio")
+            }
+            "python" => Some("pyright-langserver --stdio"),
+            "go" => Some("gopls"),
+            "java" => Some("jdtls"),
+            "c" | "cpp" | "objc" => Some("clangd"),
+            "csharp" => Some("OmniSharp"),
+            "ruby" => Some("solargraph stdio"),
+            "php" => Some("phpactor language-server"),
+            _ => None,
+        }
+    }
+
+    /// Parse locations from a definition/references LSP response.
+    pub fn parse_locations(json: &str) -> Vec<LspLocation> {
+        let mut locations = Vec::new();
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(json) else {
+            return locations;
+        };
+        let results = val
+            .get("result")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_else(|| {
+                // Single location result
+                val.get("result")
+                    .map(|r| vec![r.clone()])
+                    .unwrap_or_default()
+            });
+
+        for loc in &results {
+            let file = loc
+                .get("uri")
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .trim_start_matches("file://")
+                .to_string();
+            let range = loc.get("range").and_then(|r| r.get("start"));
+            let line = range
+                .and_then(|s| s.get("line"))
+                .and_then(|l| l.as_u64())
+                .unwrap_or(0) as u32;
+            let character = range
+                .and_then(|s| s.get("character"))
+                .and_then(|c| c.as_u64())
+                .unwrap_or(0) as u32;
+            locations.push(LspLocation {
+                file,
+                line,
+                character,
+                preview: String::new(),
+            });
+        }
+        locations
+    }
 }
 
 // ── Feature #75: Notebook Cell Tool ───────────────────────────────────────────
