@@ -2627,6 +2627,132 @@ impl Tool for WorktreeExitTool {
     }
 }
 
+// ── Tool 20: CronCreateTool ─────────────────────────────────────────────────
+
+pub struct CronCreateTool {
+    workspace_root: PathBuf,
+}
+
+impl CronCreateTool {
+    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace_root: canonical_or_self(workspace_root.into()),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CronCreateInput {
+    name: String,
+    schedule: String,
+    command: String,
+}
+
+#[derive(Debug, serde::Serialize, Deserialize)]
+struct CronConfig {
+    entries: Vec<CronEntry>,
+}
+
+#[derive(Debug, serde::Serialize, Deserialize)]
+struct CronEntry {
+    name: String,
+    schedule: String,
+    command: String,
+}
+
+#[async_trait]
+impl Tool for CronCreateTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "cron_create".into(),
+            description: "Create a cron entry persisted to .caduceus/cron.json.".into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["name", "schedule", "command"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "schedule": {"type": "string"},
+                    "command": {"type": "string"}
+                },
+                "additionalProperties": false
+            }),
+            required_capability: Some("fs_write".into()),
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let parsed: CronCreateInput = match serde_json::from_value(input) {
+            Ok(v) => v,
+            Err(err) => return Ok(tool_error(format!("invalid input: {err}"))),
+        };
+        if parsed.name.trim().is_empty() {
+            return Ok(tool_error("'name' must not be empty"));
+        }
+        if parsed.schedule.trim().is_empty() {
+            return Ok(tool_error("'schedule' must not be empty"));
+        }
+        if parsed.command.trim().is_empty() {
+            return Ok(tool_error("'command' must not be empty"));
+        }
+
+        let cron_dir = self.workspace_root.join(".caduceus");
+        let cron_path = cron_dir.join("cron.json");
+
+        let mut config = if cron_path.exists() {
+            match std::fs::read_to_string(&cron_path) {
+                Ok(contents) => {
+                    serde_json::from_str::<CronConfig>(&contents).unwrap_or(CronConfig {
+                        entries: Vec::new(),
+                    })
+                }
+                Err(_) => CronConfig {
+                    entries: Vec::new(),
+                },
+            }
+        } else {
+            CronConfig {
+                entries: Vec::new(),
+            }
+        };
+
+        if config.entries.iter().any(|e| e.name == parsed.name) {
+            return Ok(tool_error(format!(
+                "cron entry '{}' already exists",
+                parsed.name
+            )));
+        }
+
+        config.entries.push(CronEntry {
+            name: parsed.name.clone(),
+            schedule: parsed.schedule.clone(),
+            command: parsed.command.clone(),
+        });
+
+        if let Err(err) = std::fs::create_dir_all(&cron_dir) {
+            return Ok(tool_error(format!(
+                "failed to create .caduceus directory: {err}"
+            )));
+        }
+
+        let json = match serde_json::to_string_pretty(&config) {
+            Ok(j) => j,
+            Err(err) => return Ok(tool_error(format!("failed to serialize config: {err}"))),
+        };
+
+        if let Err(err) = std::fs::write(&cron_path, json) {
+            return Ok(tool_error(format!("failed to write cron.json: {err}")));
+        }
+
+        Ok(json_result(json!({
+            "status": "created",
+            "name": parsed.name,
+            "schedule": parsed.schedule,
+            "command": parsed.command,
+            "config_path": cron_path.to_string_lossy(),
+        })))
+    }
+}
+
 // ── Tool 8: PdfExtractTool ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
