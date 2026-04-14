@@ -450,71 +450,114 @@ impl InstructionLoader {
             }
         }
 
-        // Append agent/skill summaries so the LLM knows what's available
-        if !set.active_agents.is_empty() {
-            let mut agent_info = String::from("<available_agents>\n");
-            for agent in &set.active_agents {
-                agent_info.push_str(&format!(
-                    "- {} — {} (triggers: {})\n",
-                    agent.name,
-                    agent.description,
-                    agent.trigger_phrases.join(", ")
-                ));
-            }
-            agent_info.push_str("</available_agents>");
-            prompt_parts.push(agent_info);
-        }
+        // Append agent/skill summaries — compact catalog for semantic routing.
+        // The orchestrator automatically activates relevant agents/skills based
+        // on semantic similarity. The LLM sees the full list here as a catalog
+        // and may suggest which to use, but activation is handled by the engine.
+        if !set.active_agents.is_empty() || !set.available_skills.is_empty() {
+            let mut routing_info = String::from(
+                "<semantic_routing>\n\
+                 The orchestrator automatically detects which agents and skills are relevant \
+                 to each user message using semantic matching. When activated, their full \
+                 instructions appear in <activated_agent> or <activated_skill> tags.\n\n",
+            );
 
-        if !set.available_skills.is_empty() {
-            let mut skill_info = String::from("<available_skills>\n");
-            for skill in &set.available_skills {
-                skill_info.push_str(&format!(
-                    "- {} — {} (triggers: {})\n",
-                    skill.name,
-                    skill.description,
-                    skill.trigger_phrases.join(", ")
-                ));
+            if !set.active_agents.is_empty() {
+                routing_info.push_str("Available agents:\n");
+                for agent in &set.active_agents {
+                    routing_info.push_str(&format!("- {} — {}\n", agent.name, agent.description,));
+                }
             }
-            skill_info.push_str("</available_skills>");
-            prompt_parts.push(skill_info);
+
+            if !set.available_skills.is_empty() {
+                routing_info.push_str("\nAvailable skills:\n");
+                for skill in &set.available_skills {
+                    routing_info.push_str(&format!("- {} — {}\n", skill.name, skill.description,));
+                }
+            }
+
+            routing_info.push_str("</semantic_routing>");
+            prompt_parts.push(routing_info);
         }
 
         set.system_prompt = prompt_parts.join("\n\n");
         Ok(set)
     }
 
-    /// Resolve lazy content for a user message — check if any agent/skill triggers match.
-    /// Returns additional system prompt content to inject for this turn only.
+    /// Resolve which agents/skills to activate using semantic similarity.
+    ///
+    /// Instead of rigid keyword matching, this:
+    /// 1. Builds a description string for each agent/skill
+    /// 2. Uses word-overlap scoring (TF-IDF-like) to rank relevance
+    /// 3. Activates top matches above a threshold
+    /// 4. Falls back to trigger-phrase matching for exact matches
+    ///
+    /// The LLM then decides which activated agents/skills to actually use.
     pub fn resolve_lazy(&self, set: &InstructionSet, user_message: &str) -> String {
         let msg_lower = user_message.to_lowercase();
-        let mut activated = Vec::new();
+        let msg_words: Vec<&str> = msg_lower.split_whitespace().collect();
+        let mut scored: Vec<(f64, &str, &str)> = Vec::new(); // (score, type, name)
 
+        // Score each agent by semantic relevance
         for agent in &set.active_agents {
-            for trigger in &agent.trigger_phrases {
-                if msg_lower.contains(&trigger.to_lowercase()) {
-                    if let Some(content) = set.lazy_content.get(&agent.name) {
-                        activated.push(format!(
-                            "<activated_agent name=\"{}\">\n{}\n</activated_agent>",
-                            agent.name, content
-                        ));
-                    }
-                    break;
-                }
+            let score = semantic_match_score(
+                &msg_words,
+                &agent.name,
+                &agent.description,
+                &agent.trigger_phrases,
+            );
+            if score > 0.0 {
+                scored.push((score, "agent", &agent.name));
             }
         }
 
+        // Score each skill by semantic relevance
         for skill in &set.available_skills {
-            for trigger in &skill.trigger_phrases {
-                if msg_lower.contains(&trigger.to_lowercase()) {
-                    if let Some(content) = set.lazy_content.get(&skill.name) {
-                        activated.push(format!(
-                            "<activated_skill name=\"{}\">\n{}\n</activated_skill>",
-                            skill.name, content
-                        ));
-                    }
-                    break;
-                }
+            let score = semantic_match_score(
+                &msg_words,
+                &skill.name,
+                &skill.description,
+                &skill.trigger_phrases,
+            );
+            if score > 0.0 {
+                scored.push((score, "skill", &skill.name));
             }
+        }
+
+        // Sort by score descending, take top 3 (don't overload context)
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut activated = Vec::new();
+        let threshold = 2.0; // minimum score to activate
+
+        for (score, kind, name) in scored.iter().take(3) {
+            if *score < threshold {
+                break;
+            }
+            if let Some(content) = set.lazy_content.get(*name) {
+                let tag = if *kind == "agent" {
+                    "activated_agent"
+                } else {
+                    "activated_skill"
+                };
+                activated.push(format!(
+                    "<{tag} name=\"{name}\" relevance=\"{score:.1}\">\n{content}\n</{tag}>"
+                ));
+            }
+        }
+
+        if !activated.is_empty() {
+            let names: Vec<&str> = scored
+                .iter()
+                .take(3)
+                .filter(|(s, _, _)| *s >= threshold)
+                .map(|(_, _, n)| *n)
+                .collect();
+            tracing::info!(
+                "Semantic routing activated: {:?} (from {} candidates)",
+                names,
+                set.active_agents.len() + set.available_skills.len()
+            );
         }
 
         activated.join("\n\n")
@@ -750,6 +793,79 @@ fn serde_yaml_lite_parse<T: serde::de::DeserializeOwned>(yaml: &str) -> Option<T
 
 /// Smart compaction — extract key rules from verbose instruction text.
 /// Instead of truncating at a char limit, extract structured directives.
+/// Semantic match scoring — word overlap with positional weighting.
+/// Higher score = more relevant to the user's message.
+///
+/// Scoring:
+/// - Name word match: +10 (agent/skill name directly mentioned)
+/// - Description word match: +2 (semantic alignment)
+/// - Trigger phrase exact substring: +15 (explicit match)
+/// - Bigram match: +3 (catches "create readme", "code review")
+/// - Penalize very common words (the, a, and, etc.)
+fn semantic_match_score(
+    msg_words: &[&str],
+    name: &str,
+    description: &str,
+    triggers: &[String],
+) -> f64 {
+    let stop_words = [
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
+        "to", "of", "in", "for", "on", "with", "at", "by", "from", "as", "into", "through",
+        "during", "before", "after", "above", "below", "between", "under", "again", "further",
+        "then", "once", "here", "there", "when", "where", "why", "how", "all", "each", "every",
+        "both", "few", "more", "most", "other", "some", "such", "no", "nor", "not", "only", "same",
+        "so", "than", "too", "very", "just", "because", "but", "and", "or", "if", "it", "its",
+        "this", "that", "these", "those", "i", "me", "my", "we", "our", "you", "your", "he", "she",
+        "they", "them", "what", "which", "who", "whom",
+    ];
+
+    let mut score = 0.0;
+    let name_lower = name.to_lowercase();
+    let desc_lower = description.to_lowercase();
+    let name_words: Vec<&str> = name_lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let desc_words: Vec<&str> = desc_lower.split_whitespace().collect();
+    let msg_joined = msg_words.join(" ");
+
+    for word in msg_words {
+        if word.len() < 2 || stop_words.contains(word) {
+            continue;
+        }
+        // Name match — strongest signal
+        if name_words.iter().any(|nw| nw == word || nw.contains(word)) {
+            score += 10.0;
+        }
+        // Description match
+        if desc_words.iter().any(|dw| dw == word || dw.contains(word)) {
+            score += 2.0;
+        }
+    }
+
+    // Trigger phrase substring match — very strong signal
+    for trigger in triggers {
+        let trigger_lower = trigger.to_lowercase();
+        if msg_joined.contains(&trigger_lower) {
+            score += 15.0;
+        }
+    }
+
+    // Bigram matching (catches "code review", "create readme", etc.)
+    for window in msg_words.windows(2) {
+        let bigram = format!("{} {}", window[0], window[1]);
+        if name_lower.contains(&bigram) {
+            score += 5.0;
+        }
+        if desc_lower.contains(&bigram) {
+            score += 3.0;
+        }
+    }
+
+    score
+}
+
 pub fn compact_instructions(content: &str, max_chars: usize) -> String {
     if content.len() <= max_chars {
         return content.to_string();
@@ -1056,9 +1172,8 @@ mod tests {
         let loader = InstructionLoader::new(dir.path());
         let set = loader.load().unwrap();
 
-        assert!(set.system_prompt.contains("<available_agents>"));
+        assert!(set.system_prompt.contains("<semantic_routing>"));
         assert!(set.system_prompt.contains("reviewer"));
-        assert!(set.system_prompt.contains("<available_skills>"));
         assert!(set.system_prompt.contains("deploy"));
     }
 
