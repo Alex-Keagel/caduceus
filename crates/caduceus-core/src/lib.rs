@@ -697,6 +697,61 @@ pub trait AuthStore: Send + Sync {
 
 // ── P0: Directory Conventions ──────────────────────────────────────────────────
 
+/// Runtime feature toggles — read from `CADUCEUS_FEATURE_*` environment variables.
+/// These control which subsystems are active in the current process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureFlags {
+    pub proactive_mode: bool,
+    pub voice_input: bool,
+    pub team_sync: bool,
+    pub mcp_runtime: bool,
+    pub crdt_collab: bool,
+    pub auto_memory: bool,
+    pub otel_tracing: bool,
+}
+
+impl Default for FeatureFlags {
+    fn default() -> Self {
+        Self {
+            proactive_mode: false,
+            voice_input: false,
+            team_sync: false,
+            mcp_runtime: true,
+            crdt_collab: true,
+            auto_memory: true,
+            otel_tracing: false,
+        }
+    }
+}
+
+impl FeatureFlags {
+    pub fn from_env() -> Self {
+        Self {
+            proactive_mode: std::env::var("CADUCEUS_FEATURE_PROACTIVE")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false),
+            voice_input: std::env::var("CADUCEUS_FEATURE_VOICE")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false),
+            team_sync: std::env::var("CADUCEUS_FEATURE_TEAM_SYNC")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false),
+            mcp_runtime: std::env::var("CADUCEUS_FEATURE_MCP")
+                .map(|v| v != "0" && v != "false")
+                .unwrap_or(true),
+            crdt_collab: std::env::var("CADUCEUS_FEATURE_CRDT")
+                .map(|v| v != "0" && v != "false")
+                .unwrap_or(true),
+            auto_memory: std::env::var("CADUCEUS_FEATURE_AUTO_MEMORY")
+                .map(|v| v != "0" && v != "false")
+                .unwrap_or(true),
+            otel_tracing: std::env::var("CADUCEUS_FEATURE_OTEL")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false),
+        }
+    }
+}
+
 /// Standardized paths for Caduceus configuration, storage, and cache.
 pub struct CaduceusPaths;
 
@@ -941,11 +996,11 @@ pub struct FeatureFlag {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct FeatureFlags {
+pub struct FeatureFlagRegistry {
     flags: HashMap<String, FeatureFlag>,
 }
 
-impl FeatureFlags {
+impl FeatureFlagRegistry {
     pub fn new() -> Self {
         Self::default()
     }
@@ -1613,7 +1668,7 @@ log_level = "debug"
 
     #[test]
     fn feature_flags_register_and_check() {
-        let mut flags = FeatureFlags::new();
+        let mut flags = FeatureFlagRegistry::new();
         flags.register("dark-mode", "Enable dark mode UI", false);
         flags.register("beta-search", "New search engine", true);
 
@@ -1624,7 +1679,7 @@ log_level = "debug"
 
     #[test]
     fn feature_flags_enable_disable() {
-        let mut flags = FeatureFlags::new();
+        let mut flags = FeatureFlagRegistry::new();
         flags.register("my-feature", "desc", false);
 
         assert!(!flags.is_enabled("my-feature"));
@@ -1636,14 +1691,14 @@ log_level = "debug"
 
     #[test]
     fn feature_flags_set_on_unknown_is_noop() {
-        let mut flags = FeatureFlags::new();
+        let mut flags = FeatureFlagRegistry::new();
         flags.set("ghost", true); // should not panic
         assert!(!flags.is_enabled("ghost"));
     }
 
     #[test]
     fn feature_flags_rollout_zero() {
-        let mut flags = FeatureFlags::new();
+        let mut flags = FeatureFlagRegistry::new();
         flags.register("rollout-zero", "0% rollout", true);
         flags.set_rollout("rollout-zero", 0);
         // No user should get this
@@ -1654,7 +1709,7 @@ log_level = "debug"
 
     #[test]
     fn feature_flags_rollout_hundred() {
-        let mut flags = FeatureFlags::new();
+        let mut flags = FeatureFlagRegistry::new();
         flags.register("rollout-full", "100% rollout", true);
         flags.set_rollout("rollout-full", 100);
         // Every user should get this
@@ -1665,7 +1720,7 @@ log_level = "debug"
 
     #[test]
     fn feature_flags_rollout_fifty() {
-        let mut flags = FeatureFlags::new();
+        let mut flags = FeatureFlagRegistry::new();
         flags.register("rollout-half", "50% rollout", true);
         flags.set_rollout("rollout-half", 50);
         // Users 0-49 get it, 50-99 don't (deterministic)
@@ -1677,7 +1732,7 @@ log_level = "debug"
 
     #[test]
     fn feature_flags_rollout_respects_disabled() {
-        let mut flags = FeatureFlags::new();
+        let mut flags = FeatureFlagRegistry::new();
         flags.register("feat", "desc", false);
         flags.set_rollout("feat", 100);
         // Even 100% rollout should return false when feature is disabled
@@ -1686,7 +1741,7 @@ log_level = "debug"
 
     #[test]
     fn feature_flags_all_flags() {
-        let mut flags = FeatureFlags::new();
+        let mut flags = FeatureFlagRegistry::new();
         flags.register("a", "desc a", true);
         flags.register("b", "desc b", false);
         let all = flags.all_flags();

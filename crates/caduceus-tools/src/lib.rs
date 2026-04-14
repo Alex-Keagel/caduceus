@@ -4900,6 +4900,271 @@ impl Tool for GitLogTool {
     }
 }
 
+// ── Task management tools ─────────────────────────────────────────────────────
+
+/// TaskCreateTool — creates a task entry and persists it to `.caduceus/tasks.md`.
+pub struct TaskCreateTool {
+    workspace_root: PathBuf,
+}
+
+impl TaskCreateTool {
+    pub fn new(root: &Path) -> Self {
+        Self {
+            workspace_root: root.to_path_buf(),
+        }
+    }
+
+    fn tasks_path(&self) -> PathBuf {
+        self.workspace_root.join(".caduceus/tasks.md")
+    }
+}
+
+#[async_trait]
+impl Tool for TaskCreateTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "task_create".into(),
+            description: "Create a new task entry. Persists to .caduceus/tasks.md.".into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["title"],
+                "properties": {
+                    "title": {"type": "string", "description": "Task title"},
+                    "description": {"type": "string", "description": "Task description"},
+                    "priority": {"type": "string", "enum": ["low", "medium", "high"], "description": "Task priority"}
+                },
+                "additionalProperties": false
+            }),
+            required_capability: Some("fs_write".into()),
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let map = match validate_input_object(input) {
+            Ok(m) => m,
+            Err(e) => return Ok(tool_error(e)),
+        };
+        let title = match get_required_string(&map, "title") {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_error(e)),
+        };
+        let description = get_optional_string(&map, "description").unwrap_or_default();
+        let priority = get_optional_string(&map, "priority").unwrap_or_else(|| "medium".into());
+
+        let tasks_path = self.tasks_path();
+        if let Some(parent) = tasks_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let existing = std::fs::read_to_string(&tasks_path).unwrap_or_default();
+        let task_id = existing.matches("- [ ]").count()
+            + existing.matches("- [x]").count()
+            + existing.matches("- [~]").count()
+            + 1;
+
+        let entry = format!(
+            "- [ ] **#{task_id}** [{priority}] {title}{}\n",
+            if description.is_empty() {
+                String::new()
+            } else {
+                format!("\n  {description}")
+            }
+        );
+
+        let mut content = existing;
+        if content.is_empty() {
+            content = "# Tasks\n\n".to_string();
+        }
+        content.push_str(&entry);
+
+        std::fs::write(&tasks_path, &content).map_err(CaduceusError::Io)?;
+
+        Ok(ToolResult::success(format!(
+            "Created task #{task_id}: {title} [{priority}]"
+        )))
+    }
+}
+
+/// TaskUpdateTool — updates the status of an existing task in `.caduceus/tasks.md`.
+pub struct TaskUpdateTool {
+    workspace_root: PathBuf,
+}
+
+impl TaskUpdateTool {
+    pub fn new(root: &Path) -> Self {
+        Self {
+            workspace_root: root.to_path_buf(),
+        }
+    }
+
+    fn tasks_path(&self) -> PathBuf {
+        self.workspace_root.join(".caduceus/tasks.md")
+    }
+}
+
+#[async_trait]
+impl Tool for TaskUpdateTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "task_update".into(),
+            description:
+                "Update a task's status (pending→in_progress→done). Reads/writes .caduceus/tasks.md."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["task_id", "status"],
+                "properties": {
+                    "task_id": {"type": "integer", "description": "Task number to update"},
+                    "status": {"type": "string", "enum": ["pending", "in_progress", "done"], "description": "New task status"}
+                },
+                "additionalProperties": false
+            }),
+            required_capability: Some("fs_write".into()),
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let map = match validate_input_object(input) {
+            Ok(m) => m,
+            Err(e) => return Ok(tool_error(e)),
+        };
+        let task_id = match map.get("task_id").and_then(|v| v.as_u64()) {
+            Some(id) => id,
+            None => return Ok(tool_error("missing or invalid 'task_id'")),
+        };
+        let status = match get_required_string(&map, "status") {
+            Ok(s) => s,
+            Err(e) => return Ok(tool_error(e)),
+        };
+
+        let tasks_path = self.tasks_path();
+        let content = match std::fs::read_to_string(&tasks_path) {
+            Ok(c) => c,
+            Err(_) => return Ok(tool_error("No tasks file found. Create tasks first.")),
+        };
+
+        let marker = format!("**#{task_id}**");
+        let checkbox = match status.as_str() {
+            "pending" => "- [ ]",
+            "in_progress" => "- [~]",
+            "done" => "- [x]",
+            _ => return Ok(tool_error("status must be pending, in_progress, or done")),
+        };
+
+        let mut found = false;
+        let updated: String = content
+            .lines()
+            .map(|line| {
+                if line.contains(&marker) {
+                    found = true;
+                    let rest = if let Some(pos) = line.find("**#") {
+                        &line[pos..]
+                    } else {
+                        line
+                    };
+                    format!("{checkbox} {rest}")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if !found {
+            return Ok(tool_error(format!("Task #{task_id} not found")));
+        }
+
+        std::fs::write(&tasks_path, &updated).map_err(CaduceusError::Io)?;
+        Ok(ToolResult::success(format!(
+            "Task #{task_id} updated to {status}"
+        )))
+    }
+}
+
+// ── Plan mode tools ───────────────────────────────────────────────────────────
+
+/// EnterPlanModeTool — signals the LLM is entering read-only plan/analysis mode.
+pub struct EnterPlanModeTool;
+
+impl EnterPlanModeTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for EnterPlanModeTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for EnterPlanModeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "enter_plan_mode".into(),
+            description:
+                "Enter plan mode — read-only analysis. No file writes or code changes will be made."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "Why entering plan mode"}
+                },
+                "additionalProperties": false
+            }),
+            required_capability: None,
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let reason = input["reason"].as_str().unwrap_or("analysis requested");
+        Ok(ToolResult::success(format!(
+            "🗺️ Plan mode is now active (read-only analysis). Reason: {reason}\n\
+             Write operations are disabled. Use exit_plan_mode to return to act mode."
+        )))
+    }
+}
+
+/// ExitPlanModeTool — signals the LLM is leaving plan mode, restoring act mode.
+pub struct ExitPlanModeTool;
+
+impl ExitPlanModeTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for ExitPlanModeTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for ExitPlanModeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "exit_plan_mode".into(),
+            description:
+                "Exit plan mode and restore act mode — file writes and code changes are re-enabled."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_capability: None,
+        }
+    }
+
+    async fn call(&self, _input: Value) -> Result<ToolResult> {
+        Ok(ToolResult::success(
+            "🚀 Act mode restored. File writes and code changes are now enabled.",
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

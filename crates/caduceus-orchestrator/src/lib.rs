@@ -1747,6 +1747,101 @@ impl ExecutionTreeViz {
     }
 }
 
+// ── Proactive watcher ─────────────────────────────────────────────────────────
+
+/// Watches for file changes and can trigger automatic actions (lint, test).
+/// This is a skeleton that can be fleshed out later.
+pub struct ProactiveWatcher {
+    /// Watched directory root.
+    pub root: std::path::PathBuf,
+    /// Whether proactive mode is currently enabled.
+    pub enabled: bool,
+    /// Recorded file timestamps for change detection.
+    pub timestamps: std::collections::HashMap<String, u64>,
+    /// Actions to trigger on file changes.
+    pub auto_actions: Vec<String>,
+}
+
+impl ProactiveWatcher {
+    /// Create a new watcher for the given project root.
+    pub fn new(root: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            enabled: false,
+            timestamps: std::collections::HashMap::new(),
+            auto_actions: vec!["lint".into(), "test".into()],
+        }
+    }
+
+    /// Enable proactive file watching.
+    pub fn enable(&mut self) {
+        self.enabled = true;
+    }
+
+    /// Disable proactive file watching.
+    pub fn disable(&mut self) {
+        self.enabled = false;
+    }
+
+    /// Check for changed files by comparing modified timestamps.
+    /// Returns the list of file paths that have been modified since last check.
+    pub fn check_changes(&mut self) -> Vec<String> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let mut changed = Vec::new();
+        self.walk_dir(&self.root.clone(), 0, 4, &mut changed);
+        changed
+    }
+
+    fn walk_dir(
+        &mut self,
+        dir: &std::path::Path,
+        depth: usize,
+        max_depth: usize,
+        changed: &mut Vec<String>,
+    ) {
+        if depth > max_depth {
+            return;
+        }
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                self.walk_dir(&path, depth + 1, max_depth, changed);
+            } else if path.is_file() {
+                let path_str = path.to_string_lossy().to_string();
+                let mtime = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                if let Some(&prev) = self.timestamps.get(&path_str) {
+                    if mtime > prev {
+                        changed.push(path_str.clone());
+                    }
+                }
+                self.timestamps.insert(path_str, mtime);
+            }
+        }
+    }
+
+    /// Get the list of auto-actions configured to run on file changes.
+    pub fn pending_actions(&self) -> &[String] {
+        if self.enabled {
+            &self.auto_actions
+        } else {
+            &[]
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
