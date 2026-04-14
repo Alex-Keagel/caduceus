@@ -337,6 +337,25 @@ pub enum AgentEvent {
     SessionPhaseChanged {
         phase: SessionPhase,
     },
+
+    // ── Routing decisions ─────────────────────────────────────────────────
+    RoutingDecision {
+        /// All scored candidates (name, kind, score)
+        candidates: Vec<RoutingCandidate>,
+        /// Which were activated (above threshold)
+        activated: Vec<String>,
+        /// The threshold used
+        threshold: f64,
+    },
+}
+
+/// A candidate agent/skill evaluated during semantic routing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingCandidate {
+    pub name: String,
+    pub kind: String, // "agent" or "skill"
+    pub score: f64,
+    pub activated: bool,
 }
 
 /// Structured message part types for rich chat rendering.

@@ -20,7 +20,7 @@
 //! 7. `.caduceus/mcp.json` — MCP server configurations
 //! 8. `.caduceus/memory.md` — persistent memory
 
-use caduceus_core::{CaduceusError, Result};
+use caduceus_core::{CaduceusError, Result, RoutingCandidate};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -99,6 +99,19 @@ pub struct McpServerConfig {
     pub command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+}
+
+/// Result of semantic routing evaluation.
+#[derive(Debug, Clone, Default)]
+pub struct RoutingResult {
+    /// Lazy content to inject into the system prompt.
+    pub content: String,
+    /// All evaluated candidates with scores.
+    pub candidates: Vec<RoutingCandidate>,
+    /// Names of activated agents/skills.
+    pub activated: Vec<String>,
+    /// The threshold used for activation.
+    pub threshold: f64,
 }
 
 // ── YAML frontmatter helpers ───────────────────────────────────────────────────
@@ -493,7 +506,8 @@ impl InstructionLoader {
     /// 4. Falls back to trigger-phrase matching for exact matches
     ///
     /// The LLM then decides which activated agents/skills to actually use.
-    pub fn resolve_lazy(&self, set: &InstructionSet, user_message: &str) -> String {
+    /// Returns a `RoutingResult` with content to inject plus decision metadata.
+    pub fn resolve_lazy(&self, set: &InstructionSet, user_message: &str) -> RoutingResult {
         let msg_lower = user_message.to_lowercase();
         let msg_words: Vec<&str> = msg_lower.split_whitespace().collect();
         let mut scored: Vec<(f64, &str, &str)> = Vec::new(); // (score, type, name)
@@ -527,40 +541,52 @@ impl InstructionLoader {
         // Sort by score descending, take top 3 (don't overload context)
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        let mut activated = Vec::new();
-        let threshold = 2.0; // minimum score to activate
+        let threshold = 2.0;
+        let mut activated_content = Vec::new();
+        let mut activated_names = Vec::new();
 
         for (score, kind, name) in scored.iter().take(3) {
             if *score < threshold {
                 break;
             }
+            activated_names.push(name.to_string());
             if let Some(content) = set.lazy_content.get(*name) {
                 let tag = if *kind == "agent" {
                     "activated_agent"
                 } else {
                     "activated_skill"
                 };
-                activated.push(format!(
+                activated_content.push(format!(
                     "<{tag} name=\"{name}\" relevance=\"{score:.1}\">\n{content}\n</{tag}>"
                 ));
             }
         }
 
-        if !activated.is_empty() {
-            let names: Vec<&str> = scored
-                .iter()
-                .take(3)
-                .filter(|(s, _, _)| *s >= threshold)
-                .map(|(_, _, n)| *n)
-                .collect();
+        if !activated_names.is_empty() {
             tracing::info!(
                 "Semantic routing activated: {:?} (from {} candidates)",
-                names,
+                activated_names,
                 set.active_agents.len() + set.available_skills.len()
             );
         }
 
-        activated.join("\n\n")
+        // Build candidates list for decision visualization
+        let candidates: Vec<RoutingCandidate> = scored
+            .iter()
+            .map(|(score, kind, name)| RoutingCandidate {
+                name: name.to_string(),
+                kind: kind.to_string(),
+                score: *score,
+                activated: *score >= threshold && activated_names.iter().any(|n| n == *name),
+            })
+            .collect();
+
+        RoutingResult {
+            content: activated_content.join("\n\n"),
+            candidates,
+            activated: activated_names,
+            threshold,
+        }
     }
 
     /// Return path-specific instructions whose glob matches the given file path.
@@ -1334,16 +1360,26 @@ mod tests {
 
         let result = loader.resolve_lazy(&set, "please review this code for bugs");
         assert!(
-            result.contains("activated_agent"),
+            result.content.contains("activated_agent"),
             "Should activate matching agent"
         );
         assert!(
-            result.contains("code-reviewer"),
+            result.content.contains("code-reviewer"),
             "Activated tag should contain agent name"
         );
         assert!(
-            result.contains("code reviewer"),
+            result.content.contains("code reviewer"),
             "Should include lazy content body"
+        );
+        // Check structured routing data
+        assert!(
+            result.activated.contains(&"code-reviewer".to_string()),
+            "activated list should include the agent"
+        );
+        assert!(!result.candidates.is_empty(), "Should have candidates");
+        assert!(
+            result.candidates[0].activated,
+            "Top candidate should be activated"
         );
     }
 
@@ -1358,12 +1394,12 @@ mod tests {
 
         let result = loader.resolve_lazy(&set, "deploy the application please");
         assert!(
-            result.contains("activated_skill"),
+            result.content.contains("activated_skill"),
             "Should activate matching skill"
         );
         assert!(
-            result.contains("deploy"),
-            "Activated tag should contain skill name"
+            result.activated.contains(&"deploy".to_string()),
+            "activated list should include the skill"
         );
     }
 
@@ -1379,9 +1415,10 @@ mod tests {
         // Completely unrelated message
         let result = loader.resolve_lazy(&set, "what is the weather today");
         assert!(
-            result.is_empty(),
-            "Unrelated message should not activate any agent: '{result}'"
+            result.content.is_empty(),
+            "Unrelated message should not activate any agent"
         );
+        assert!(result.activated.is_empty(), "No agents should be activated");
     }
 
     #[test]
@@ -1408,11 +1445,15 @@ mod tests {
         let set = loader.load().unwrap();
 
         let result = loader.resolve_lazy(&set, "run tests on the testing suite");
-        // Each activated agent creates <activated_agent> and </activated_agent> tags
-        let activated_count = result.matches("<activated_agent ").count();
         assert!(
-            activated_count <= 3,
-            "Should activate at most 3 agents, got {activated_count}"
+            result.activated.len() <= 3,
+            "Should activate at most 3 agents, got {}",
+            result.activated.len()
+        );
+        // But all 4 should appear as candidates
+        assert!(
+            result.candidates.len() >= 4,
+            "All matching agents should be candidates"
         );
     }
 
@@ -1427,8 +1468,13 @@ mod tests {
 
         let result = loader.resolve_lazy(&set, "review my code");
         assert!(
-            result.contains("relevance=\""),
-            "Should include relevance score attribute: {result}"
+            result.content.contains("relevance=\""),
+            "Should include relevance score attribute"
+        );
+        // Check candidate has score
+        assert!(
+            result.candidates[0].score > 0.0,
+            "Candidate should have a positive score"
         );
     }
 
@@ -1757,7 +1803,14 @@ mod tests {
         let loader = InstructionLoader::new(dir.path());
         let set = loader.load().unwrap();
         let result = loader.resolve_lazy(&set, "do something");
-        assert!(result.is_empty(), "Empty set should produce empty result");
+        assert!(
+            result.content.is_empty(),
+            "Empty set should produce empty content"
+        );
+        assert!(
+            result.candidates.is_empty(),
+            "Empty set should have no candidates"
+        );
     }
 
     #[test]

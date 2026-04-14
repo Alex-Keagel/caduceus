@@ -988,10 +988,23 @@ impl AgentHarness {
         // Lazy resolution: inject agent/skill content when trigger phrases match
         if let Some(ref iset) = self.instruction_set {
             let loader = instructions::InstructionLoader::new(&state.project_root);
-            let lazy_content = loader.resolve_lazy(iset, user_input);
-            if !lazy_content.is_empty() {
+            let routing = loader.resolve_lazy(iset, user_input);
+
+            // Emit routing decision event for visualization
+            if !routing.candidates.is_empty() {
+                if let Some(ref em) = self.emitter {
+                    em.emit(AgentEvent::RoutingDecision {
+                        candidates: routing.candidates,
+                        activated: routing.activated,
+                        threshold: routing.threshold,
+                    })
+                    .await;
+                }
+            }
+
+            if !routing.content.is_empty() {
                 system_prompt.push_str("\n\n");
-                system_prompt.push_str(&lazy_content);
+                system_prompt.push_str(&routing.content);
             }
         }
 
