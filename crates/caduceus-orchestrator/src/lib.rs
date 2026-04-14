@@ -983,7 +983,18 @@ impl AgentHarness {
 
         history.append(caduceus_providers::Message::user(user_input));
 
-        let system_prompt = self.effective_system_prompt();
+        let mut system_prompt = self.effective_system_prompt();
+
+        // Lazy resolution: inject agent/skill content when trigger phrases match
+        if let Some(ref iset) = self.instruction_set {
+            let loader = instructions::InstructionLoader::new(&state.project_root);
+            let lazy_content = loader.resolve_lazy(iset, user_input);
+            if !lazy_content.is_empty() {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&lazy_content);
+            }
+        }
+
         let assembler = ContextAssembler::new(self.max_context_tokens, &system_prompt);
         // Build tool specs once — reused across iterations (only messages change)
         let tool_specs = self.tools.specs();

@@ -30,6 +30,19 @@ const MAX_TOTAL_INSTRUCTION_CHARS: usize = 32_000;
 /// Max chars per single instruction file.
 const MAX_INSTRUCTION_FILE_CHARS: usize = 8_000;
 
+// ── Loading strategy ──────────────────────────────────────────────────────────
+
+/// Controls how instructions are loaded into the system prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadStrategy {
+    /// Always include in system prompt (CADUCEUS.md, user global, memory).
+    Eager,
+    /// Only include when a trigger phrase matches the user's message.
+    Lazy,
+    /// Include a compact summary; full content loaded on demand.
+    Compacted,
+}
+
 // ── Data structures ────────────────────────────────────────────────────────────
 
 /// The fully-merged instruction set for a workspace.
@@ -49,6 +62,8 @@ pub struct InstructionSet {
     pub mcp_servers: Vec<McpServerConfig>,
     /// Persistent memory entries from `.caduceus/memory.md`.
     pub memory_entries: Vec<String>,
+    /// Lazy-loaded agent/skill content (full body, loaded on trigger match).
+    pub lazy_content: HashMap<String, String>,
 }
 
 /// A path-specific instruction override.
@@ -297,25 +312,33 @@ impl InstructionLoader {
             }
         }
 
-        // 5. Custom agent definitions (.caduceus/agents/*.md)
+        // 5. Custom agent definitions (.caduceus/agents/*.md) — LAZY loaded
+        // Only name/description/triggers go into system prompt.
+        // Full body stored in lazy_content, injected when trigger matches.
         let agents_dir = self.workspace_root.join(".caduceus/agents");
         if agents_dir.is_dir() {
             let mut entries = read_dir_md_files(&agents_dir)?;
             entries.sort();
             for path in entries {
                 if let Some(agent) = self.load_agent_definition(&path)? {
+                    // Store full system_prompt as lazy content
+                    set.lazy_content
+                        .insert(agent.name.clone(), agent.system_prompt.clone());
                     set.active_agents.push(agent);
                 }
             }
         }
 
-        // 6. Skill definitions (.caduceus/skills/*.md)
+        // 6. Skill definitions (.caduceus/skills/*.md) — LAZY loaded
         let skills_dir = self.workspace_root.join(".caduceus/skills");
         if skills_dir.is_dir() {
             let mut entries = read_dir_md_files(&skills_dir)?;
             entries.sort();
             for path in entries {
                 if let Some(skill) = self.load_skill_definition(&path)? {
+                    // Store full steps as lazy content
+                    set.lazy_content
+                        .insert(skill.name.clone(), skill.steps.join("\n"));
                     set.available_skills.push(skill);
                 }
             }
@@ -458,6 +481,43 @@ impl InstructionLoader {
 
         set.system_prompt = prompt_parts.join("\n\n");
         Ok(set)
+    }
+
+    /// Resolve lazy content for a user message — check if any agent/skill triggers match.
+    /// Returns additional system prompt content to inject for this turn only.
+    pub fn resolve_lazy(&self, set: &InstructionSet, user_message: &str) -> String {
+        let msg_lower = user_message.to_lowercase();
+        let mut activated = Vec::new();
+
+        for agent in &set.active_agents {
+            for trigger in &agent.trigger_phrases {
+                if msg_lower.contains(&trigger.to_lowercase()) {
+                    if let Some(content) = set.lazy_content.get(&agent.name) {
+                        activated.push(format!(
+                            "<activated_agent name=\"{}\">\n{}\n</activated_agent>",
+                            agent.name, content
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+
+        for skill in &set.available_skills {
+            for trigger in &skill.trigger_phrases {
+                if msg_lower.contains(&trigger.to_lowercase()) {
+                    if let Some(content) = set.lazy_content.get(&skill.name) {
+                        activated.push(format!(
+                            "<activated_skill name=\"{}\">\n{}\n</activated_skill>",
+                            skill.name, content
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+
+        activated.join("\n\n")
     }
 
     /// Return path-specific instructions whose glob matches the given file path.
@@ -686,6 +746,80 @@ fn serde_yaml_lite_parse<T: serde::de::DeserializeOwned>(yaml: &str) -> Option<T
 
     let json_value = serde_json::Value::Object(obj);
     serde_json::from_value(json_value).ok()
+}
+
+/// Smart compaction — extract key rules from verbose instruction text.
+/// Instead of truncating at a char limit, extract structured directives.
+pub fn compact_instructions(content: &str, max_chars: usize) -> String {
+    if content.len() <= max_chars {
+        return content.to_string();
+    }
+
+    let mut rules: Vec<String> = Vec::new();
+    let mut in_code_block = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Track code blocks
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block {
+            continue;
+        }
+
+        // Extract: headings, bullet rules, MUST/NEVER/ALWAYS directives, key-value configs
+        let is_heading = trimmed.starts_with('#');
+        let is_rule =
+            trimmed.starts_with('-') || trimmed.starts_with('*') || trimmed.starts_with("•");
+        let is_directive = {
+            let upper = trimmed.to_uppercase();
+            upper.contains("MUST")
+                || upper.contains("NEVER")
+                || upper.contains("ALWAYS")
+                || upper.contains("IMPORTANT")
+                || upper.contains("CRITICAL")
+                || upper.contains("DO NOT")
+                || upper.contains("REQUIRED")
+        };
+        let is_config = trimmed.contains(':') && trimmed.len() < 100 && !trimmed.contains("http");
+
+        if is_heading || is_rule || is_directive || is_config {
+            rules.push(trimmed.to_string());
+        }
+    }
+
+    // If extraction produced enough, use it; otherwise fall back to truncation
+    let extracted = rules.join("\n");
+    if extracted.len() > max_chars / 4 {
+        // Good extraction — use compacted form
+        let result = if extracted.len() > max_chars {
+            format!(
+                "{}\n\n[compacted from {} chars — {} rules extracted]",
+                &extracted[..max_chars],
+                content.len(),
+                rules.len()
+            )
+        } else {
+            format!(
+                "{}\n\n[compacted from {} chars — {} rules extracted, {} chars saved]",
+                extracted,
+                content.len(),
+                rules.len(),
+                content.len() - extracted.len()
+            )
+        };
+        result
+    } else {
+        // Not enough structure — fall back to head truncation
+        format!(
+            "{}\n\n[truncated — {} chars omitted]",
+            &content[..max_chars],
+            content.len() - max_chars
+        )
+    }
 }
 
 /// Simple glob matching supporting `*`, `**`, and `?`.
