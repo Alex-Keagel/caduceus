@@ -2340,6 +2340,149 @@ impl Tool for AgentSpawnTool {
     }
 }
 
+// ── Tool 16: TeamCreateTool ──────────────────────────────────────────────────
+
+static TEAM_REGISTRY: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<String>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+pub struct TeamCreateTool;
+
+impl Default for TeamCreateTool {
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl TeamCreateTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamCreateInput {
+    team_name: String,
+    agent_count: usize,
+    task_description: String,
+}
+
+#[async_trait]
+impl Tool for TeamCreateTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "team_create".into(),
+            description: "Create a named team of agents for collaborative work.".into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["team_name", "agent_count", "task_description"],
+                "properties": {
+                    "team_name": {"type": "string"},
+                    "agent_count": {"type": "integer", "minimum": 1, "maximum": 50},
+                    "task_description": {"type": "string"}
+                },
+                "additionalProperties": false
+            }),
+            required_capability: Some("agent_spawn".into()),
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let parsed: TeamCreateInput = match serde_json::from_value(input) {
+            Ok(v) => v,
+            Err(err) => return Ok(tool_error(format!("invalid input: {err}"))),
+        };
+        if parsed.team_name.trim().is_empty() {
+            return Ok(tool_error("'team_name' must not be empty"));
+        }
+        if parsed.task_description.trim().is_empty() {
+            return Ok(tool_error("'task_description' must not be empty"));
+        }
+
+        let team_id = format!("team-{}", uuid::Uuid::new_v4());
+        let agents: Vec<String> = (0..parsed.agent_count)
+            .map(|i| format!("{}-agent-{}", parsed.team_name, i))
+            .collect();
+
+        {
+            let mut registry = TEAM_REGISTRY.lock().unwrap();
+            registry.insert(parsed.team_name.clone(), agents.clone());
+        }
+
+        Ok(json_result(json!({
+            "status": "created",
+            "team_id": team_id,
+            "team_name": parsed.team_name,
+            "agent_count": parsed.agent_count,
+            "agents": agents,
+            "task_description": parsed.task_description,
+        })))
+    }
+}
+
+// ── Tool 17: TeamDeleteTool ──────────────────────────────────────────────────
+
+pub struct TeamDeleteTool;
+
+impl Default for TeamDeleteTool {
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl TeamDeleteTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamDeleteInput {
+    team_name: String,
+}
+
+#[async_trait]
+impl Tool for TeamDeleteTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "team_delete".into(),
+            description: "Delete a named team of agents.".into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["team_name"],
+                "properties": {
+                    "team_name": {"type": "string"}
+                },
+                "additionalProperties": false
+            }),
+            required_capability: Some("agent_spawn".into()),
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let parsed: TeamDeleteInput = match serde_json::from_value(input) {
+            Ok(v) => v,
+            Err(err) => return Ok(tool_error(format!("invalid input: {err}"))),
+        };
+        if parsed.team_name.trim().is_empty() {
+            return Ok(tool_error("'team_name' must not be empty"));
+        }
+
+        let removed = {
+            let mut registry = TEAM_REGISTRY.lock().unwrap();
+            registry.remove(&parsed.team_name)
+        };
+
+        match removed {
+            Some(agents) => Ok(json_result(json!({
+                "status": "deleted",
+                "team_name": parsed.team_name,
+                "agents_removed": agents.len(),
+            }))),
+            None => Ok(tool_error(format!("team '{}' not found", parsed.team_name))),
+        }
+    }
+}
+
 // ── Tool 8: PdfExtractTool ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
