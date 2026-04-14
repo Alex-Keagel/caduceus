@@ -1016,13 +1016,18 @@ impl AgentHarness {
         let warning = state.token_budget.warning_level();
         if warning != WarningLevel::None {
             if let Some(ref em) = self.emitter {
-                let msg = match warning {
-                    WarningLevel::Warning70 => "Warning: 70% of context budget used",
-                    WarningLevel::Warning85 => "Warning: 85% of context budget used",
-                    WarningLevel::Critical95 => "Critical: 95% of context budget used",
+                let level = match warning {
+                    WarningLevel::Warning70 => "warning_70",
+                    WarningLevel::Warning85 => "warning_85",
+                    WarningLevel::Critical95 => "critical_95",
                     WarningLevel::None => unreachable!(),
                 };
-                em.emit_error(msg).await;
+                em.emit_context_warning(
+                    level,
+                    state.token_budget.used_input + state.token_budget.used_output,
+                    state.token_budget.context_limit,
+                )
+                .await;
             }
         }
 
@@ -1109,6 +1114,23 @@ impl AgentHarness {
             state.token_budget.used_input += response.input_tokens;
             state.token_budget.used_output += response.output_tokens;
             state.turn_count += 1;
+
+            // Check if context is getting full — auto-compact old messages
+            let used_total = state.token_budget.used_input + state.token_budget.used_output;
+            let usage_pct = if state.token_budget.context_limit > 0 {
+                (used_total as f64 / state.token_budget.context_limit as f64) * 100.0
+            } else {
+                0.0
+            };
+            if usage_pct > 85.0 && history.len() > 10 {
+                let before = history.len() as u32;
+                history.truncate_oldest(history.len() / 2);
+                let after = history.len() as u32;
+                if let Some(ref em) = self.emitter {
+                    em.emit_context_compacted(before - after, before, after)
+                        .await;
+                }
+            }
 
             // Emit text content in chunks for smooth streaming UX
             if !response.content.is_empty() {
@@ -1382,19 +1404,25 @@ impl AgentHarness {
 }
 
 /// Execute tool calls from an LLM response via the ToolRegistry.
+/// Uses parallel execution with concurrency limiting.
 /// Returns a vec of (tool_call_id, result_content, is_error).
 pub async fn execute_tool_calls(
     registry: &ToolRegistry,
     tool_calls: &[(String, String, serde_json::Value)],
 ) -> Vec<(String, String, bool)> {
-    let mut results = Vec::new();
-    for (id, name, input) in tool_calls {
-        match registry.execute(name, input.clone()).await {
-            Ok(result) => results.push((id.clone(), result.content, result.is_error)),
-            Err(e) => results.push((id.clone(), e.to_string(), true)),
-        }
-    }
-    results
+    let tools: Vec<(String, serde_json::Value)> = tool_calls
+        .iter()
+        .map(|(_id, name, input)| (name.clone(), input.clone()))
+        .collect();
+    let parallel_results = registry.execute_parallel(tools).await;
+    tool_calls
+        .iter()
+        .zip(parallel_results)
+        .map(|((id, _name, _input), result)| match result {
+            Ok(r) => (id.clone(), r.content, r.is_error),
+            Err(e) => (id.clone(), e.to_string(), true),
+        })
+        .collect()
 }
 
 // ── #234: Agent Execution Tree Visualizer ─────────────────────────────────────
