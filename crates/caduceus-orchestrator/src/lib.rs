@@ -513,7 +513,15 @@ impl ContextAssembler {
     }
 
     fn message_tokens(msg: &caduceus_providers::Message) -> u32 {
-        Self::estimate_tokens(&msg.role) + Self::estimate_tokens(&msg.content)
+        let mut tokens = Self::estimate_tokens(&msg.role) + Self::estimate_tokens(&msg.content);
+        // Tool call args and results can be large — count them
+        for tc in &msg.tool_calls {
+            tokens += Self::estimate_tokens(&tc.input.to_string());
+        }
+        if let Some(ref tr) = msg.tool_result {
+            tokens += Self::estimate_tokens(&tr.content);
+        }
+        tokens
     }
 
     /// Build the final message list that fits within the token budget.
@@ -977,6 +985,7 @@ impl AgentHarness {
 
         let system_prompt = self.effective_system_prompt();
         let assembler = ContextAssembler::new(self.max_context_tokens, &system_prompt);
+        // Build tool specs once — reused across iterations (only messages change)
         let tool_specs = self.tools.specs();
 
         // Token budget warning
