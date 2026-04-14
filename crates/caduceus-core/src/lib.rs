@@ -1428,6 +1428,92 @@ impl Default for CursorTracker {
     }
 }
 
+// ── Config migration ───────────────────────────────────────────────────────────
+
+/// Describes a single config migration step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigMigration {
+    pub version: u32,
+    pub description: String,
+}
+
+/// Runs config migrations against `.caduceus/version`.
+pub struct ConfigMigrator {
+    migrations: Vec<ConfigMigration>,
+}
+
+impl ConfigMigrator {
+    pub fn new() -> Self {
+        Self {
+            migrations: vec![ConfigMigration {
+                version: 1,
+                description: "Initial config version".to_string(),
+            }],
+        }
+    }
+
+    /// The latest config version this binary understands.
+    pub fn current_version() -> u32 {
+        1
+    }
+
+    /// Read the persisted version from `<config_path>/version`.
+    fn read_version(config_path: &Path) -> u32 {
+        let version_file = config_path.join("version");
+        if !version_file.exists() {
+            return 0;
+        }
+        std::fs::read_to_string(&version_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    }
+
+    /// Write the version to `<config_path>/version`.
+    fn write_version(config_path: &Path, version: u32) -> Result<()> {
+        std::fs::create_dir_all(config_path)
+            .map_err(|e| CaduceusError::Config(format!("failed to create config dir: {e}")))?;
+        std::fs::write(config_path.join("version"), version.to_string())
+            .map_err(|e| CaduceusError::Config(format!("failed to write version file: {e}")))?;
+        Ok(())
+    }
+
+    /// Returns `true` if the on-disk version is behind `current_version()`.
+    pub fn needs_migration(config_path: &Path) -> bool {
+        Self::read_version(config_path) < Self::current_version()
+    }
+
+    /// Run all outstanding migrations and return the new version.
+    pub fn migrate(config_path: &Path) -> Result<u32> {
+        let migrator = Self::new();
+        let current = Self::read_version(config_path);
+        let target = Self::current_version();
+
+        if current >= target {
+            return Ok(current);
+        }
+
+        for migration in &migrator.migrations {
+            if migration.version > current && migration.version <= target {
+                tracing::info!(
+                    version = migration.version,
+                    description = %migration.description,
+                    "applying config migration"
+                );
+            }
+        }
+
+        Self::write_version(config_path, target)?;
+        Ok(target)
+    }
+}
+
+impl Default for ConfigMigrator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
