@@ -1396,6 +1396,28 @@ impl AgentHarness {
         if let Some(ref em) = self.emitter {
             em.emit_phase_changed(SessionPhase::Idle).await;
         }
+
+        // Auto-extract memories from the conversation
+        if !final_text.is_empty() {
+            let memories = extract_memories(user_input, &final_text);
+            if !memories.is_empty() {
+                let memory_path = state.project_root.join(".caduceus/memory.md");
+                if let Ok(mut existing) = std::fs::read_to_string(&memory_path) {
+                    for mem in &memories {
+                        if !existing.contains(mem) {
+                            existing.push_str(&format!("\n{mem}"));
+                        }
+                    }
+                    let _ = std::fs::write(&memory_path, existing);
+                } else {
+                    let content = format!("# Caduceus Memory\n\n{}", memories.join("\n"));
+                    let _ = std::fs::create_dir_all(state.project_root.join(".caduceus"));
+                    let _ = std::fs::write(&memory_path, content);
+                }
+                tracing::info!("Auto-extracted {} memories", memories.len());
+            }
+        }
+
         Ok(final_text)
     }
 
@@ -1519,6 +1541,90 @@ impl AgentHarness {
 /// Execute tool calls from an LLM response via the ToolRegistry.
 /// Uses parallel execution with concurrency limiting.
 /// Returns a vec of (tool_call_id, result_content, is_error).
+/// Extract learnable memories from a user-assistant exchange.
+///
+/// Looks for:
+/// - User preferences ("I prefer", "always use", "never do")
+/// - Corrections ("actually", "no, I meant")
+/// - Project conventions mentioned explicitly
+/// - Tool preferences ("use grep not find", "prefer async")
+pub fn extract_memories(user_input: &str, assistant_response: &str) -> Vec<String> {
+    let mut memories = Vec::new();
+    let combined = format!("{user_input}\n{assistant_response}").to_lowercase();
+
+    // Preference patterns in user input
+    let user_lower = user_input.to_lowercase();
+    let preference_signals = [
+        "i prefer",
+        "always use",
+        "never use",
+        "don't use",
+        "i like",
+        "i want",
+        "please always",
+        "from now on",
+        "remember that",
+        "keep in mind",
+        "my preference is",
+        "use this approach",
+    ];
+    for signal in &preference_signals {
+        if user_lower.contains(signal) {
+            // Extract the sentence containing the signal
+            for sentence in user_input.split(['.', '!', '\n']) {
+                if sentence.to_lowercase().contains(signal) {
+                    let trimmed = sentence.trim();
+                    if trimmed.len() > 10 && trimmed.len() < 200 {
+                        memories.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Correction patterns (user correcting the agent)
+    let correction_signals = [
+        "actually",
+        "no, ",
+        "not that",
+        "i meant",
+        "wrong,",
+        "incorrect",
+    ];
+    for signal in &correction_signals {
+        if user_lower.contains(signal) && user_input.len() > 20 {
+            // The whole user message is likely a correction — store as learning
+            let trimmed = user_input.trim();
+            if trimmed.len() < 200 {
+                memories.push(format!("Correction: {trimmed}"));
+            }
+            break;
+        }
+    }
+
+    // Convention patterns in assistant response
+    let convention_signals = [
+        "project convention",
+        "coding standard",
+        "team uses",
+        "configured to use",
+    ];
+    for signal in &convention_signals {
+        if combined.contains(signal) {
+            for sentence in assistant_response.split(['.', '\n']) {
+                if sentence.to_lowercase().contains(signal) {
+                    let trimmed = sentence.trim();
+                    if trimmed.len() > 10 && trimmed.len() < 200 {
+                        memories.push(format!("Convention: {trimmed}"));
+                    }
+                }
+            }
+        }
+    }
+
+    memories
+}
+
 pub async fn execute_tool_calls(
     registry: &ToolRegistry,
     tool_calls: &[(String, String, serde_json::Value)],
