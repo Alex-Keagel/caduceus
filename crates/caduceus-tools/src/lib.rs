@@ -2483,6 +2483,150 @@ impl Tool for TeamDeleteTool {
     }
 }
 
+// ── Tool 18: WorktreeEnterTool ───────────────────────────────────────────────
+
+pub struct WorktreeEnterTool;
+
+impl Default for WorktreeEnterTool {
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl WorktreeEnterTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WorktreeEnterInput {
+    branch: String,
+    path: String,
+}
+
+#[async_trait]
+impl Tool for WorktreeEnterTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "worktree_enter".into(),
+            description: "Create a git worktree for isolated work on a branch.".into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["branch", "path"],
+                "properties": {
+                    "branch": {"type": "string"},
+                    "path": {"type": "string"}
+                },
+                "additionalProperties": false
+            }),
+            required_capability: Some("bash".into()),
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let parsed: WorktreeEnterInput = match serde_json::from_value(input) {
+            Ok(v) => v,
+            Err(err) => return Ok(tool_error(format!("invalid input: {err}"))),
+        };
+        if parsed.branch.trim().is_empty() {
+            return Ok(tool_error("'branch' must not be empty"));
+        }
+        if parsed.path.trim().is_empty() {
+            return Ok(tool_error("'path' must not be empty"));
+        }
+
+        let output = match tokio::process::Command::new("git")
+            .args(["worktree", "add", &parsed.path, &parsed.branch])
+            .output()
+            .await
+        {
+            Ok(o) => o,
+            Err(err) => return Ok(tool_error(format!("failed to run git: {err}"))),
+        };
+
+        if output.status.success() {
+            Ok(json_result(json!({
+                "status": "created",
+                "branch": parsed.branch,
+                "path": parsed.path,
+            })))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Ok(tool_error(format!("git worktree add failed: {stderr}")))
+        }
+    }
+}
+
+// ── Tool 19: WorktreeExitTool ────────────────────────────────────────────────
+
+pub struct WorktreeExitTool;
+
+impl Default for WorktreeExitTool {
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl WorktreeExitTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WorktreeExitInput {
+    path: String,
+}
+
+#[async_trait]
+impl Tool for WorktreeExitTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "worktree_exit".into(),
+            description: "Remove a git worktree.".into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string"}
+                },
+                "additionalProperties": false
+            }),
+            required_capability: Some("bash".into()),
+        }
+    }
+
+    async fn call(&self, input: Value) -> Result<ToolResult> {
+        let parsed: WorktreeExitInput = match serde_json::from_value(input) {
+            Ok(v) => v,
+            Err(err) => return Ok(tool_error(format!("invalid input: {err}"))),
+        };
+        if parsed.path.trim().is_empty() {
+            return Ok(tool_error("'path' must not be empty"));
+        }
+
+        let output = match tokio::process::Command::new("git")
+            .args(["worktree", "remove", &parsed.path])
+            .output()
+            .await
+        {
+            Ok(o) => o,
+            Err(err) => return Ok(tool_error(format!("failed to run git: {err}"))),
+        };
+
+        if output.status.success() {
+            Ok(json_result(json!({
+                "status": "removed",
+                "path": parsed.path,
+            })))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Ok(tool_error(format!("git worktree remove failed: {stderr}")))
+        }
+    }
+}
+
 // ── Tool 8: PdfExtractTool ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
