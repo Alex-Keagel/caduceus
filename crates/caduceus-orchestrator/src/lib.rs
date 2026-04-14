@@ -1170,6 +1170,13 @@ impl AgentHarness {
                             },
                         )
                         .await;
+                        // Mark turn completed in tree
+                        em.emit_tree_update(
+                            format!("turn-{}", iteration),
+                            "completed",
+                            Some(format!("{}B response", final_text.len())),
+                        )
+                        .await;
                     }
                     break;
                 }
@@ -1203,6 +1210,14 @@ impl AgentHarness {
                             em.emit_tool_call_start(
                                 caduceus_core::ToolCallId(tool_use.id.clone()),
                                 &tool_use.name,
+                            )
+                            .await;
+                            // Tree node for each tool call
+                            em.emit_tree_node(
+                                format!("tool-{}", tool_use.id),
+                                Some(format!("turn-{}", iteration)),
+                                format!("🔧 {}", tool_use.name),
+                                "running",
                             )
                             .await;
                         }
@@ -1309,6 +1324,17 @@ impl AgentHarness {
                                 caduceus_core::ToolCallId(id.clone()),
                                 &result_content,
                                 is_error,
+                            )
+                            .await;
+                            // Update tree node with result status
+                            em.emit_tree_update(
+                                format!("tool-{}", id),
+                                if is_error { "failed" } else { "completed" },
+                                Some(if is_error {
+                                    result_content.chars().take(100).collect()
+                                } else {
+                                    format!("{}B output", result_content.len())
+                                }),
                             )
                             .await;
                         }
