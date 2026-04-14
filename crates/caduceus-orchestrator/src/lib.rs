@@ -1097,9 +1097,32 @@ impl AgentHarness {
                 response_format: None,
             };
 
-            // Call LLM (non-streaming to get tool_calls)
+            // Call LLM — always use chat() for tool loops. Streaming happens
+            // via event emission (text_delta events) regardless.
             let response = match self.provider.chat(request).await {
-                Ok(r) => r,
+                Ok(r) => {
+                    // Emit text deltas for smooth UI streaming
+                    if !r.content.is_empty() {
+                        if let Some(ref em) = self.emitter {
+                            let content = &r.content;
+                            let mut pos = 0;
+                            while pos < content.len() {
+                                let end = (pos + 100).min(content.len());
+                                let chunk_end = if end < content.len() {
+                                    content[pos..end]
+                                        .rfind(|c: char| c.is_whitespace())
+                                        .map(|i| pos + i + 1)
+                                        .unwrap_or(end)
+                                } else {
+                                    end
+                                };
+                                em.emit_text_delta(&content[pos..chunk_end]).await;
+                                pos = chunk_end;
+                            }
+                        }
+                    }
+                    r
+                }
                 Err(e) => {
                     state.phase = SessionPhase::Idle;
                     if let Some(ref em) = self.emitter {
@@ -1132,28 +1155,8 @@ impl AgentHarness {
                 }
             }
 
-            // Emit text content in chunks for smooth streaming UX
-            if !response.content.is_empty() {
-                if let Some(ref em) = self.emitter {
-                    // Split into ~100-char chunks with word boundaries for smooth display
-                    let content = &response.content;
-                    let mut pos = 0;
-                    while pos < content.len() {
-                        let end = (pos + 100).min(content.len());
-                        // Find word boundary
-                        let chunk_end = if end < content.len() {
-                            content[pos..end]
-                                .rfind(|c: char| c.is_whitespace())
-                                .map(|i| pos + i + 1)
-                                .unwrap_or(end)
-                        } else {
-                            end
-                        };
-                        em.emit_text_delta(&content[pos..chunk_end]).await;
-                        pos = chunk_end;
-                    }
-                }
-            }
+            // Text was already streamed token-by-token via try_stream_or_chat.
+            // No need for manual chunking.
 
             // Emit reasoning events if the response contains thinking/reasoning
             // Providers that support extended thinking embed it in the content
@@ -1396,10 +1399,120 @@ impl AgentHarness {
         Ok(final_text)
     }
 
+    /// Try streaming first for real-time text delivery, fall back to chat().
+    /// Streaming gives us token-by-token text, but tool calls still need the
+    /// full response. So we stream text deltas then use chat() for tool loops.
+    async fn try_stream_or_chat(
+        &self,
+        request: &ChatRequest,
+    ) -> Result<caduceus_providers::ChatResponse> {
+        use futures::StreamExt;
+
+        // Try streaming for real-time text delivery
+        match self.provider.stream(request.clone()).await {
+            Ok(mut stream) => {
+                let mut content = String::new();
+                let mut input_tokens = 0u32;
+                let mut output_tokens = 0u32;
+                let mut cache_read = 0u32;
+                let mut cache_create = 0u32;
+
+                while let Some(chunk_result) = stream.next().await {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            if !chunk.delta.is_empty() {
+                                content.push_str(&chunk.delta);
+                                if let Some(ref em) = self.emitter {
+                                    em.emit_text_delta(&chunk.delta).await;
+                                }
+                            }
+                            if let Some(t) = chunk.input_tokens {
+                                input_tokens = t;
+                            }
+                            if let Some(t) = chunk.output_tokens {
+                                output_tokens = t;
+                            }
+                            if let Some(t) = chunk.cache_read_tokens {
+                                cache_read = t;
+                            }
+                            if let Some(t) = chunk.cache_creation_tokens {
+                                cache_create = t;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Stream error: {e}");
+                        }
+                    }
+                }
+
+                // Streaming delivers text only — no tool calls.
+                // If no content came through, the response is empty (not an error).
+                Ok(caduceus_providers::ChatResponse {
+                    content,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens: cache_read,
+                    cache_creation_tokens: cache_create,
+                })
+            }
+            Err(_) => {
+                // Streaming not supported — fall back to non-streaming
+                // Also emit text in manual chunks for UI smoothness
+                let response = self.provider.chat(request.clone()).await?;
+                if !response.content.is_empty() {
+                    if let Some(ref em) = self.emitter {
+                        let content = &response.content;
+                        let mut pos = 0;
+                        while pos < content.len() {
+                            let end = (pos + 100).min(content.len());
+                            let chunk_end = if end < content.len() {
+                                content[pos..end]
+                                    .rfind(|c: char| c.is_whitespace())
+                                    .map(|i| pos + i + 1)
+                                    .unwrap_or(end)
+                            } else {
+                                end
+                            };
+                            em.emit_text_delta(&content[pos..chunk_end]).await;
+                            pos = chunk_end;
+                        }
+                    }
+                }
+                Ok(response)
+            }
+        }
+    }
+
     /// Run one agent turn (simple, no tool loop). Kept for backward compat.
     pub async fn run_turn(&self, state: &mut SessionState, user_input: &str) -> Result<String> {
         let mut history = ConversationHistory::new();
         self.run(state, &mut history, user_input).await
+    }
+
+    /// Stream a single turn — uses SSE streaming for real-time token delivery.
+    /// Returns the complete accumulated text. Text deltas are emitted via the
+    /// event emitter as they arrive.
+    pub async fn stream_turn(&self, state: &mut SessionState, user_input: &str) -> Result<String> {
+        let system_prompt = self.effective_system_prompt();
+        let request = ChatRequest {
+            model: self.effective_model(state),
+            messages: vec![caduceus_providers::Message::user(user_input)],
+            system: Some(system_prompt),
+            max_tokens: self.effective_max_tokens(),
+            temperature: self.effective_temperature(),
+            thinking_mode: false,
+            tool_choice: None,
+            tools: vec![],
+            response_format: None,
+        };
+
+        let response = self.try_stream_or_chat(&request).await?;
+        state.turn_count += 1;
+        state.token_budget.used_input += response.input_tokens;
+        state.token_budget.used_output += response.output_tokens;
+        Ok(response.content)
     }
 }
 
