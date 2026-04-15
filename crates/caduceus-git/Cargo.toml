@@ -14,7 +14,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
-git2 = "0.19"
+git2 = "0.20"
 uuid = { workspace = true }
 
 [dev-dependencies]
