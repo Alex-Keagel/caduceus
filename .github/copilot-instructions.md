@@ -4,11 +4,15 @@
 
 Caduceus is a 14-crate Rust engine powering the Caduceus IDE (a Zed fork).
 
+The engine is **IDE-agnostic** — it has no dependency on Zed/gpui. The AgentTools
+are Zed-specific adapters that live in the IDE repo, implementing Zed's `AgentTool`
+trait and delegating to the engine via the bridge.
+
 | Layer | Location | Purpose |
 |-------|----------|---------|
-| **Engine** | `~/Dev/caduceus/crates/` | 14 crates — core logic, tools, orchestration |
+| **Engine** | `~/Dev/caduceus/crates/` | 14 crates — core logic, tools, orchestration (IDE-agnostic) |
 | **Bridge** | `~/Dev/zed/crates/caduceus_bridge/` | Wires engine to IDE via direct Rust calls |
-| **AgentTools** | `~/Dev/zed/crates/agent/src/tools/caduceus_*.rs` | LLM-callable tools |
+| **AgentTools** | `~/Dev/zed/crates/agent/src/tools/caduceus_*.rs` | Zed-specific adapters (implement `AgentTool` trait) |
 | **UI** | `~/Dev/zed/crates/agent_ui/src/` | User-facing panels, buttons, indicators |
 
 ## Engine ↔ IDE Parity (MANDATORY)
