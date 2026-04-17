@@ -1214,10 +1214,23 @@ impl EmbeddingBackend for OpenAiEmbedder {
 
 // ── Semantic index — in-memory vector store ──────────────────────────────────
 
+/// Trait for code chunking strategies. Implement this to provide
+/// custom chunking (e.g., tree-sitter-based instead of regex-based).
+pub trait Chunker: Send + Sync {
+    /// Parse a source file into semantic code chunks.
+    fn chunk_file(&self, path: &str, content: &str) -> Vec<CodeChunk>;
+}
+
+impl Chunker for CodeChunker {
+    fn chunk_file(&self, path: &str, content: &str) -> Vec<CodeChunk> {
+        self.chunk_file(path, content)
+    }
+}
+
 pub struct SemanticIndex {
     entries: Vec<(CodeChunk, Vec<f32>)>,
     embedder: Box<dyn EmbeddingBackend>,
-    chunker: CodeChunker,
+    chunker: Box<dyn Chunker>,
 }
 
 impl SemanticIndex {
@@ -1225,12 +1238,12 @@ impl SemanticIndex {
         Self {
             entries: Vec::new(),
             embedder,
-            chunker: CodeChunker::default(),
+            chunker: Box::new(CodeChunker::default()),
         }
     }
 
-    pub fn with_chunker(mut self, chunker: CodeChunker) -> Self {
-        self.chunker = chunker;
+    pub fn with_chunker(mut self, chunker: impl Chunker + 'static) -> Self {
+        self.chunker = Box::new(chunker);
         self
     }
 
@@ -1324,6 +1337,75 @@ impl SemanticIndex {
     pub fn chunk_count(&self) -> usize {
         self.entries.len()
     }
+
+    /// Save the index to a file for persistence across restarts.
+    pub fn save_to_file(&self, path: &Path) -> caduceus_core::Result<()> {
+        let data: Vec<SerializedEntry> = self.entries.iter().map(|(chunk, emb)| {
+            SerializedEntry {
+                chunk: chunk.clone(),
+                embedding: emb.clone(),
+            }
+        }).collect();
+        let json = serde_json::to_vec(&data)?;
+        let dir = path.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// Load a previously saved index from file.
+    pub fn load_from_file(&mut self, path: &Path) -> caduceus_core::Result<usize> {
+        if !path.exists() {
+            return Ok(0);
+        }
+        let data = std::fs::read(path)?;
+        let entries: Vec<SerializedEntry> = serde_json::from_slice(&data)?;
+        let count = entries.len();
+        self.entries = entries.into_iter().map(|e| (e.chunk, e.embedding)).collect();
+        Ok(count)
+    }
+
+    /// Check if a file needs re-indexing based on content hash.
+    pub fn file_needs_reindex(&self, path: &str, content_hash: &str) -> bool {
+        !self.entries.iter().any(|(chunk, _)| {
+            chunk.file_path == path && chunk.content_hash == content_hash
+        })
+    }
+
+    /// Incremental index: only re-embed files whose content has changed.
+    pub async fn index_directory_incremental(&mut self, dir: &Path) -> caduceus_core::Result<usize> {
+        let files = collect_source_files(dir);
+        let mut total = 0;
+
+        for file_path in &files {
+            match std::fs::read_to_string(file_path) {
+                Ok(content) => {
+                    let path_str = file_path.to_string_lossy().to_string();
+                    let hash = compute_content_hash(&content);
+
+                    if !self.file_needs_reindex(&path_str, &hash) {
+                        continue; // File unchanged, skip
+                    }
+
+                    // Remove old entries for this file
+                    self.entries.retain(|(c, _)| c.file_path != path_str);
+                    total += self.index_content(&path_str, &content).await?;
+                }
+                Err(e) => {
+                    tracing::warn!("Skipping {}: {e}", file_path.display());
+                }
+            }
+        }
+
+        Ok(total)
+    }
+}
+
+/// Serialization format for persisted index entries.
+#[derive(Debug, Serialize, Deserialize)]
+struct SerializedEntry {
+    chunk: CodeChunk,
+    embedding: Vec<f32>,
 }
 
 // ── #117: Cross-Project Index Federation ─────────────────────────────────────
