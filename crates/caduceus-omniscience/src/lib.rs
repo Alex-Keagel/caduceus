@@ -1175,15 +1175,27 @@ impl CodeHashEmbedder {
 /// Split camelCase and snake_case identifiers into parts
 fn split_identifier(s: &str) -> Vec<String> {
     let mut parts = Vec::new();
-    // Split on underscores first
     for part in s.split('_') {
         if part.is_empty() { continue; }
-        // Split camelCase
+        // Split camelCase, keeping acronym runs together (HTTPServer → HTTP, Server)
         let mut current = String::new();
-        for ch in part.chars() {
+        let chars: Vec<char> = part.chars().collect();
+        for i in 0..chars.len() {
+            let ch = chars[i];
             if ch.is_uppercase() && !current.is_empty() {
-                parts.push(current.to_lowercase());
-                current = String::new();
+                let next_is_lower = chars.get(i + 1).map_or(false, |c| c.is_lowercase());
+                let prev_is_upper = current.chars().last().map_or(false, |c| c.is_uppercase());
+                // Split at acronym→word boundary (e.g., P in HTTPServer)
+                if next_is_lower && prev_is_upper && current.len() > 1 {
+                    let last = current.pop().unwrap();
+                    if !current.is_empty() {
+                        parts.push(current.to_lowercase());
+                    }
+                    current = last.to_string();
+                } else if !prev_is_upper {
+                    parts.push(current.to_lowercase());
+                    current = String::new();
+                }
             }
             current.push(ch);
         }
@@ -1191,8 +1203,11 @@ fn split_identifier(s: &str) -> Vec<String> {
             parts.push(current.to_lowercase());
         }
     }
-    // Also keep the original identifier for exact matching
-    parts.push(s.to_lowercase());
+    // Keep original for exact matching, but deduplicate
+    let original = s.to_lowercase();
+    if !parts.contains(&original) {
+        parts.push(original);
+    }
     parts
 }
 
@@ -1430,7 +1445,7 @@ impl SemanticIndex {
         query: &str,
         top_k: usize,
     ) -> caduceus_core::Result<Vec<SearchResult>> {
-        if self.entries.is_empty() {
+        if self.entries.is_empty() || query.trim().is_empty() {
             return Ok(Vec::new());
         }
 
