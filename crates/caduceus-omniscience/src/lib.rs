@@ -1552,6 +1552,11 @@ impl SemanticIndex {
         self.entries.len()
     }
 
+    /// Get all indexed chunks (for graph building, etc.)
+    pub fn chunks(&self) -> Vec<&CodeChunk> {
+        self.entries.iter().map(|(c, _)| c).collect()
+    }
+
     /// Save the index to a file for persistence across restarts.
     pub fn save_to_file(&self, path: &Path) -> caduceus_core::Result<()> {
         let data: Vec<SerializedEntry> = self.entries.iter().map(|(chunk, emb)| {
@@ -2046,7 +2051,7 @@ pub enum GraphNodeType {
     Struct,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum GraphEdgeType {
     Calls,
     InheritsFrom,
@@ -2182,6 +2187,92 @@ impl CodePropertyGraph {
             }))
             .collect();
         serde_json::json!({ "elements": elements })
+    }
+
+    /// Auto-populate the graph from parsed code chunks.
+    /// Creates nodes for all symbols and edges for imports/references.
+    pub fn build_from_chunks(&mut self, chunks: &[CodeChunk]) {
+        // Clear existing data for rebuild
+        self.nodes.clear();
+        self.edges.clear();
+
+        let mut symbol_map: HashMap<String, String> = HashMap::new(); // name → node_id
+
+        // Phase 1: Create nodes for all symbols
+        for chunk in chunks {
+            let node_id = format!("{}:{}", chunk.file_path, chunk.symbol_name);
+            let node_type = match chunk.symbol_type {
+                SymbolType::Function | SymbolType::Method => GraphNodeType::Function,
+                SymbolType::Class => GraphNodeType::Class,
+                SymbolType::Struct => GraphNodeType::Struct,
+                SymbolType::Enum => GraphNodeType::Struct, // closest match
+                SymbolType::Trait => GraphNodeType::Trait,
+                SymbolType::Interface => GraphNodeType::Interface,
+                SymbolType::Import => GraphNodeType::Import,
+                SymbolType::Module => GraphNodeType::Module,
+                SymbolType::Other => GraphNodeType::Variable,
+            };
+
+            self.add_node(GraphNode {
+                id: node_id.clone(),
+                label: chunk.symbol_name.clone(),
+                node_type,
+                file: chunk.file_path.clone(),
+                line: chunk.start_line,
+                metadata: HashMap::new(),
+            });
+
+            symbol_map.insert(chunk.symbol_name.to_lowercase(), node_id);
+        }
+
+        // Phase 2: Extract edges by scanning chunk content for references
+        for chunk in chunks {
+            let source_id = format!("{}:{}", chunk.file_path, chunk.symbol_name);
+
+            // Import edges
+            if chunk.symbol_type == SymbolType::Import {
+                // Extract the imported symbol name from content
+                let imported: Vec<&str> = chunk.content.split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .filter(|s| s.len() > 1)
+                    .collect();
+                for name in imported {
+                    if let Some(target_id) = symbol_map.get(&name.to_lowercase()) {
+                        if *target_id != source_id {
+                            self.add_edge(GraphEdge {
+                                source: source_id.clone(),
+                                target: target_id.clone(),
+                                edge_type: GraphEdgeType::Imports,
+                                weight: 1.0,
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Call/reference edges — scan content for known symbol names
+            if matches!(chunk.symbol_type, SymbolType::Function | SymbolType::Method) {
+                let tokens: Vec<&str> = chunk.content.split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .filter(|s| s.len() > 2)
+                    .collect();
+                for token in tokens {
+                    if let Some(target_id) = symbol_map.get(&token.to_lowercase()) {
+                        if *target_id != source_id {
+                            self.add_edge(GraphEdge {
+                                source: source_id.clone(),
+                                target: target_id.clone(),
+                                edge_type: GraphEdgeType::Calls,
+                                weight: 1.0,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Deduplicate edges
+        self.edges.sort_by(|a, b| (&a.source, &a.target, &a.edge_type).cmp(&(&b.source, &b.target, &b.edge_type)));
+        self.edges.dedup_by(|a, b| a.source == b.source && a.target == b.target && a.edge_type == b.edge_type);
     }
 
     pub fn stats(&self) -> GraphStats {
