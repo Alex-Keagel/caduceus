@@ -323,6 +323,8 @@ pub struct TeamResult {
 pub struct Coordinator {
     agents: Vec<AgentConfig>,
     context: SharedContext,
+    /// Available tool specs that sub-tasks can use (filtered per agent config)
+    available_tools: Vec<caduceus_core::ToolSpec>,
 }
 
 impl Coordinator {
@@ -330,11 +332,18 @@ impl Coordinator {
         Self {
             agents,
             context: SharedContext::new(),
+            available_tools: Vec::new(),
         }
     }
 
     pub fn with_context(mut self, ctx: SharedContext) -> Self {
         self.context = ctx;
+        self
+    }
+
+    /// Set available tools that sub-task agents can use
+    pub fn with_tools(mut self, tools: Vec<caduceus_core::ToolSpec>) -> Self {
+        self.available_tools = tools;
         self
     }
 
@@ -394,9 +403,10 @@ impl Coordinator {
                     let prov = provider.clone();
                     let model = model.clone();
                     let agents = self.agents.clone();
+                    let all_tools = self.available_tools.clone();
 
                     let handle =
-                        tokio::spawn(async move { run_task(task, ctx, prov, model, agents).await });
+                        tokio::spawn(async move { run_task(task, ctx, prov, model, agents, all_tools).await });
                     handles.push((task_id.clone(), handle));
                 }
             }
@@ -490,6 +500,7 @@ async fn run_task(
     provider: Arc<dyn LlmAdapter>,
     model: ModelId,
     agents: Vec<AgentConfig>,
+    available_tools: Vec<caduceus_core::ToolSpec>,
 ) -> Result<(String, TokenUsage), String> {
     let agent_cfg = task
         .assignee
@@ -524,6 +535,24 @@ async fn run_task(
     let mut total_usage = TokenUsage::default();
     let mut final_response = String::new();
 
+    // Filter tools based on agent config
+    let task_tools: Vec<caduceus_core::ToolSpec> = if let Some(cfg) = agent_cfg {
+        if cfg.tools.is_empty() {
+            vec![] // No tools — text-only agent
+        } else {
+            available_tools.iter()
+                .filter(|spec| cfg.tools.iter().any(|t| spec.name == *t))
+                .cloned()
+                .collect()
+        }
+    } else {
+        // Default: read-only tools
+        available_tools.iter()
+            .filter(|spec| ["grep", "read_file", "list_directory", "find_path"].contains(&spec.name.as_str()))
+            .cloned()
+            .collect()
+    };
+
     for turn in 0..max_turns {
         let req = ChatRequest {
             model: used_model.clone(),
@@ -533,7 +562,7 @@ async fn run_task(
             temperature: None,
             thinking_mode: false,
             tool_choice: None,
-            tools: vec![], // Sub-task tools managed by parent; future: filter from registry
+            tools: task_tools.clone(),
             response_format: None,
         };
 
