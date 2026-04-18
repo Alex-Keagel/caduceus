@@ -1131,6 +1131,112 @@ impl EmbeddingBackend for DummyEmbedder {
     }
 }
 
+/// Code-aware local embedder using token hashing with n-gram features.
+/// Produces meaningful embeddings for code without any external API.
+/// Same identifiers/keywords → similar vectors, different code → different vectors.
+/// Much better than DummyEmbedder for semantic search.
+pub struct CodeHashEmbedder {
+    dims: usize,
+}
+
+impl CodeHashEmbedder {
+    pub fn new(dims: usize) -> Self {
+        Self { dims }
+    }
+
+    /// Extract code-relevant tokens: identifiers, keywords, operators
+    fn tokenize(text: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+
+        for ch in text.chars() {
+            if ch.is_alphanumeric() || ch == '_' {
+                current.push(ch);
+            } else {
+                if !current.is_empty() {
+                    // Split camelCase and snake_case
+                    let parts = split_identifier(&current);
+                    tokens.extend(parts);
+                    current.clear();
+                }
+                // Operators as tokens
+                if "{}()[]<>:;.,=!+-*/%&|^~?@#".contains(ch) {
+                    tokens.push(ch.to_string());
+                }
+            }
+        }
+        if !current.is_empty() {
+            tokens.extend(split_identifier(&current));
+        }
+        tokens
+    }
+}
+
+/// Split camelCase and snake_case identifiers into parts
+fn split_identifier(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    // Split on underscores first
+    for part in s.split('_') {
+        if part.is_empty() { continue; }
+        // Split camelCase
+        let mut current = String::new();
+        for ch in part.chars() {
+            if ch.is_uppercase() && !current.is_empty() {
+                parts.push(current.to_lowercase());
+                current = String::new();
+            }
+            current.push(ch);
+        }
+        if !current.is_empty() {
+            parts.push(current.to_lowercase());
+        }
+    }
+    // Also keep the original identifier for exact matching
+    parts.push(s.to_lowercase());
+    parts
+}
+
+#[async_trait]
+impl EmbeddingBackend for CodeHashEmbedder {
+    async fn embed(&self, texts: Vec<String>) -> caduceus_core::Result<Vec<Vec<f32>>> {
+        Ok(texts
+            .iter()
+            .map(|text| {
+                let tokens = Self::tokenize(text);
+                let mut vec = vec![0.0f32; self.dims];
+
+                // Unigram features
+                for token in &tokens {
+                    let mut h = DefaultHasher::new();
+                    token.hash(&mut h);
+                    let idx = (h.finish() as usize) % self.dims;
+                    vec[idx] += 1.0;
+                }
+
+                // Bigram features (captures "fn main", "pub struct", etc.)
+                for window in tokens.windows(2) {
+                    let bigram = format!("{} {}", window[0], window[1]);
+                    let mut h = DefaultHasher::new();
+                    bigram.hash(&mut h);
+                    let idx = (h.finish() as usize) % self.dims;
+                    vec[idx] += 0.5; // half weight for bigrams
+                }
+
+                // Normalize
+                let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > f32::EPSILON {
+                    vec.iter_mut().for_each(|x| *x /= norm);
+                }
+                vec
+            })
+            .collect())
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dims
+    }
+}
+
 /// Calls OpenAI `/v1/embeddings` (text-embedding-3-small, 1536 dims).
 pub struct OpenAiEmbedder {
     api_key: String,
@@ -1212,6 +1318,57 @@ impl EmbeddingBackend for OpenAiEmbedder {
     }
 }
 
+// ── Local embedding via fastembed (ONNX) ─────────────────────────────────────
+
+/// Local code embedding using fastembed with Jina Code model.
+/// Runs entirely on-device via ONNX Runtime — no API key needed.
+/// Uses `jinaai/jina-embeddings-v2-base-code` (768-dim, code-optimized).
+#[cfg(feature = "local-embeddings")]
+pub struct FastEmbedBackend {
+    model: std::sync::Mutex<fastembed::TextEmbedding>,
+    dims: usize,
+}
+
+#[cfg(feature = "local-embeddings")]
+impl FastEmbedBackend {
+    /// Create with Jina Code model (best code-specific model available via fastembed).
+    pub fn new_code() -> caduceus_core::Result<Self> {
+        use fastembed::{TextEmbedding, InitOptions, EmbeddingModel};
+        let model = TextEmbedding::try_new(
+            InitOptions::new(EmbeddingModel::JinaEmbeddingsV2BaseCode)
+                .with_show_download_progress(true),
+        ).map_err(|e| caduceus_core::CaduceusError::Internal(format!("FastEmbed init failed: {e}")))?;
+        Ok(Self { model: std::sync::Mutex::new(model), dims: 768 })
+    }
+
+    /// Create with a smaller general model for lower resource usage.
+    pub fn new_small() -> caduceus_core::Result<Self> {
+        use fastembed::{TextEmbedding, InitOptions, EmbeddingModel};
+        let model = TextEmbedding::try_new(
+            InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+                .with_show_download_progress(true),
+        ).map_err(|e| caduceus_core::CaduceusError::Internal(format!("FastEmbed init failed: {e}")))?;
+        Ok(Self { model: std::sync::Mutex::new(model), dims: 384 })
+    }
+}
+
+#[cfg(feature = "local-embeddings")]
+#[async_trait]
+impl EmbeddingBackend for FastEmbedBackend {
+    async fn embed(&self, texts: Vec<String>) -> caduceus_core::Result<Vec<Vec<f32>>> {
+        let model = self.model.lock()
+            .map_err(|e| caduceus_core::CaduceusError::Internal(format!("Lock error: {e}")))?;
+        let str_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let embeddings = model.embed(str_refs, None)
+            .map_err(|e| caduceus_core::CaduceusError::Internal(format!("Embed error: {e}")))?;
+        Ok(embeddings)
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dims
+    }
+}
+
 // ── Semantic index — in-memory vector store ──────────────────────────────────
 
 /// Trait for code chunking strategies. Implement this to provide
@@ -1277,29 +1434,71 @@ impl SemanticIndex {
             return Ok(Vec::new());
         }
 
+        // Semantic search via embeddings
         let query_vecs = self.embedder.embed(vec![query.to_string()]).await?;
         let query_vec = match query_vecs.first() {
             Some(v) => v,
             None => return Ok(Vec::new()),
         };
 
-        let mut scored: Vec<SearchResult> = self
-            .entries
-            .iter()
-            .map(|(chunk, emb)| SearchResult {
-                chunk: chunk.clone(),
-                score: cosine_similarity(query_vec, emb),
+        let semantic_scores: Vec<(usize, f32)> = self.entries.iter().enumerate()
+            .map(|(i, (_, emb))| (i, cosine_similarity(query_vec, emb)))
+            .collect();
+
+        // Keyword search (BM25-like) — exact token matching
+        let query_tokens: Vec<String> = query.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|s| s.len() > 1)
+            .map(|s| s.to_string())
+            .collect();
+
+        let keyword_scores: Vec<(usize, f32)> = self.entries.iter().enumerate()
+            .map(|(i, (chunk, _))| {
+                let content_lower = chunk.content.to_lowercase();
+                let name_lower = chunk.symbol_name.to_lowercase();
+                let mut score = 0.0f32;
+                for token in &query_tokens {
+                    // Symbol name match (high weight)
+                    if name_lower.contains(token.as_str()) {
+                        score += 3.0;
+                    }
+                    // Content match
+                    let matches = content_lower.matches(token.as_str()).count();
+                    score += (matches as f32).min(5.0) * 0.5;
+                }
+                (i, score)
             })
             .collect();
 
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scored.truncate(top_k);
+        // Reciprocal Rank Fusion (RRF) — combine both rankings
+        let k = 60.0f32;
+        let mut semantic_ranked: Vec<(usize, f32)> = semantic_scores.clone();
+        semantic_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        Ok(scored)
+        let mut keyword_ranked: Vec<(usize, f32)> = keyword_scores.clone();
+        keyword_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut fused_scores = vec![0.0f32; self.entries.len()];
+        for (rank, (idx, _)) in semantic_ranked.iter().enumerate() {
+            fused_scores[*idx] += 1.0 / (k + rank as f32);
+        }
+        for (rank, (idx, score)) in keyword_ranked.iter().enumerate() {
+            if *score > 0.0 { // only count keyword matches
+                fused_scores[*idx] += 1.0 / (k + rank as f32);
+            }
+        }
+
+        let mut results: Vec<SearchResult> = self.entries.iter().enumerate()
+            .map(|(i, (chunk, _))| SearchResult {
+                chunk: chunk.clone(),
+                score: fused_scores[i],
+            })
+            .collect();
+
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(top_k);
+
+        Ok(results)
     }
 
     /// Remove existing chunks for `path`, re-read from disk, chunk, embed.

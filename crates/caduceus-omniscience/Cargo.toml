@@ -14,3 +14,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+fastembed = { version = "5", default-features = false, features = ["hf-hub-native-tls"], optional = true }
+
+[features]
+default = []
+local-embeddings = ["fastembed"]
