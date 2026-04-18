@@ -498,11 +498,12 @@ async fn run_task(
 
     let system = agent_cfg
         .map(|a| a.system_prompt.clone())
-        .unwrap_or_else(|| "You are a helpful assistant.".to_string());
+        .unwrap_or_else(|| "You are a helpful assistant completing a sub-task.".to_string());
 
     let used_model = agent_cfg.map(|a| a.model.clone()).unwrap_or(model);
+    let max_turns = agent_cfg.map(|a| a.max_turns).unwrap_or(5);
 
-    // Build prompt including prior task outputs for context.
+    // Build prompt including prior task outputs for context
     let snapshot = context.snapshot().await;
     let mut context_block = String::new();
     for (dep_id, output) in &snapshot {
@@ -518,30 +519,51 @@ async fn run_task(
         )
     };
 
-    let req = ChatRequest {
-        model: used_model,
-        messages: vec![Message::user(&user_prompt)],
-        system: Some(system),
-        max_tokens: 4096,
-        temperature: None,
-        thinking_mode: false,
-        tool_choice: None,
-        tools: vec![],
-        response_format: None,
-    };
+    // Multi-turn agent loop: up to max_turns rounds with tool use
+    let mut history = vec![Message::user(&user_prompt)];
+    let mut total_usage = TokenUsage::default();
+    let mut final_response = String::new();
 
-    provider
-        .chat(req)
-        .await
-        .map(|r| {
-            let usage = TokenUsage {
-                input_tokens: r.input_tokens,
-                output_tokens: r.output_tokens,
-                ..Default::default()
-            };
-            (r.content, usage)
-        })
-        .map_err(|e: caduceus_core::CaduceusError| e.to_string())
+    for turn in 0..max_turns {
+        let req = ChatRequest {
+            model: used_model.clone(),
+            messages: history.clone(),
+            system: Some(system.clone()),
+            max_tokens: 4096,
+            temperature: None,
+            thinking_mode: false,
+            tool_choice: None,
+            tools: vec![], // Sub-task tools managed by parent; future: filter from registry
+            response_format: None,
+        };
+
+        match provider.chat(req).await {
+            Ok(r) => {
+                total_usage.input_tokens += r.input_tokens;
+                total_usage.output_tokens += r.output_tokens;
+                final_response = r.content.clone();
+
+                // If the response indicates completion (no tool use), stop
+                if matches!(r.stop_reason, caduceus_core::StopReason::EndTurn | caduceus_core::StopReason::StopSequence | caduceus_core::StopReason::MaxTokens) {
+                    break;
+                }
+
+                // Add assistant response to history for next turn
+                history.push(Message::assistant(&r.content));
+                // Add a continuation prompt
+                history.push(Message::user("Continue with the next step of the task."));
+            }
+            Err(e) => {
+                if turn == 0 {
+                    return Err(e.to_string());
+                }
+                // On later turns, return what we have so far
+                break;
+            }
+        }
+    }
+
+    Ok((final_response, total_usage))
 }
 
 // ── JSON parsing ───────────────────────────────────────────────────────────────
