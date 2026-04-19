@@ -10,6 +10,7 @@
 pub mod client;
 pub mod error;
 pub mod manager;
+pub mod permissions;
 pub mod registry;
 pub mod types;
 

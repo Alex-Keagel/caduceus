@@ -6,6 +6,7 @@ pub mod context;
 pub mod headless;
 pub mod instructions;
 pub mod kanban;
+pub mod memories;
 pub mod mentions;
 pub mod modes;
 pub mod workers;
@@ -459,13 +460,35 @@ impl ConversationHistory {
     }
 
     /// Drop the oldest non-system messages until we are at or below `max_messages`.
+    ///
+    /// Pair-aware: an assistant message carrying `tool_calls = [t1..tN]` and
+    /// the immediately following `tool` messages whose `tool_use_id` matches
+    /// one of those calls form a single atomic unit and are dropped together.
+    /// This prevents orphaned tool_use / tool_result pairs that providers
+    /// (especially Anthropic) reject with HTTP 400.
     pub fn truncate_oldest(&mut self, max_messages: usize) {
-        while self.messages.len() > max_messages {
-            if let Some(pos) = self.messages.iter().position(|m| m.role != "system") {
-                self.messages.remove(pos);
-            } else {
+        if self.messages.len() <= max_messages {
+            return;
+        }
+        let units = pair_aware_units(&self.messages);
+        // Walk units oldest-first; for each non-system unit, drop it while
+        // we are still over budget.
+        let mut to_drop: Vec<(usize, usize)> = Vec::new();
+        let mut remaining = self.messages.len();
+        for (start, end) in units {
+            if remaining <= max_messages {
                 break;
             }
+            // Skip system-only units (single system message).
+            if end - start == 1 && self.messages[start].role == "system" {
+                continue;
+            }
+            to_drop.push((start, end));
+            remaining -= end - start;
+        }
+        // Apply removals back-to-front so earlier indices stay valid.
+        for (start, end) in to_drop.into_iter().rev() {
+            self.messages.drain(start..end);
         }
     }
 
@@ -485,6 +508,52 @@ impl ConversationHistory {
 }
 
 // ── Context assembler ──────────────────────────────────────────────────────────
+
+/// Computes atomic message units that must never be split across a budget
+/// or truncation boundary. Specifically, an assistant message bearing
+/// `tool_calls` and the following `tool` messages whose `tool_use_id`
+/// matches one of those calls form a single unit. All other messages —
+/// including malformed orphan `tool` messages — are size-1 units.
+///
+/// Returned ranges are `(start, end_exclusive)` over the input slice and
+/// fully partition it (sum of `end - start` over all units equals
+/// `messages.len()`). Orphan tool messages (no preceding assistant with
+/// matching id) are emitted as size-1 units so the caller can decide how
+/// to handle them rather than silently swallowing them into an unrelated
+/// neighboring unit.
+fn pair_aware_units(messages: &[caduceus_providers::Message]) -> Vec<(usize, usize)> {
+    use std::collections::HashSet;
+    let mut units = Vec::new();
+    let mut i = 0;
+    while i < messages.len() {
+        let msg = &messages[i];
+        if msg.role == "assistant" && !msg.tool_calls.is_empty() {
+            let expected_ids: HashSet<&str> = msg
+                .tool_calls
+                .iter()
+                .map(|tc| tc.id.as_str())
+                .collect();
+            let mut j = i + 1;
+            while j < messages.len() && messages[j].role == "tool" {
+                let id = messages[j]
+                    .tool_result
+                    .as_ref()
+                    .and_then(|r| r.tool_use_id.as_deref());
+                if id.is_some_and(|id| expected_ids.contains(id)) {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            units.push((i, j));
+            i = j;
+        } else {
+            units.push((i, i + 1));
+            i += 1;
+        }
+    }
+    units
+}
 
 /// Assembles the full message list for an LLM request within a token budget.
 /// Uses a simple char-based heuristic (1 token ~ 4 chars) to estimate token usage.
@@ -525,8 +594,14 @@ impl ContextAssembler {
     }
 
     /// Build the final message list that fits within the token budget.
-    /// Strategy: always include system prompt + project context, then fit as many
-    /// conversation messages as possible starting from the most recent.
+    ///
+    /// Strategy: always include system prompt + project context, then walk
+    /// pair-aware *units* (assistant+tool_calls+tool_results = 1 unit) from
+    /// most recent backward, including each whole unit only if its full
+    /// token cost still fits the budget. This guarantees no orphaned
+    /// tool_use without its tool_result and no orphaned tool_result without
+    /// its assistant tool_use — a malformed pair would otherwise cause
+    /// providers (especially Anthropic) to reject the request with HTTP 400.
     pub fn assemble(&self, history: &ConversationHistory) -> Vec<caduceus_providers::Message> {
         let mut result = Vec::new();
 
@@ -544,27 +619,44 @@ impl ContextAssembler {
         // Reserve 25% of budget for output
         let available = self.max_context_tokens.saturating_mul(3) / 4;
 
-        // Collect conversation messages newest-first, stop when budget exceeded
-        let mut to_include = Vec::new();
-        for msg in history.messages().iter().rev() {
-            let cost = Self::message_tokens(msg);
-            if budget_used + cost > available {
+        let messages = history.messages();
+        let units = pair_aware_units(messages);
+
+        // Walk units newest-first, stop when next unit doesn't fit.
+        let mut included_units: Vec<(usize, usize)> = Vec::new();
+        for &(start, end) in units.iter().rev() {
+            let unit_cost: u32 = messages[start..end]
+                .iter()
+                .map(Self::message_tokens)
+                .sum();
+            if budget_used + unit_cost > available {
+                // Stop on first non-fitting unit so chronological order is
+                // preserved (we never want a gap in the middle of history).
                 break;
             }
-            budget_used += cost;
-            to_include.push(msg.clone());
+            budget_used += unit_cost;
+            included_units.push((start, end));
         }
 
-        // Reverse to restore chronological order
-        to_include.reverse();
-
-        // Safety: never start with a "tool" role message (orphaned tool result).
-        // Drop leading tool messages — they need their preceding assistant+tool_calls.
-        while to_include.first().is_some_and(|m| m.role == "tool") {
-            to_include.remove(0);
+        // Restore chronological order and flatten unit ranges into messages.
+        included_units.reverse();
+        for (start, end) in included_units {
+            for msg in &messages[start..end] {
+                result.push(msg.clone());
+            }
         }
 
-        result.extend(to_include);
+        // Defensive: if the very first included message is an orphan
+        // tool-role (only possible if the history itself was malformed and
+        // started with one), drop it. pair_aware_units emits orphans as
+        // size-1 units so this fallback only ever triggers on bad input.
+        while result
+            .get(1)
+            .is_some_and(|m| m.role == "tool")
+        {
+            result.remove(1);
+        }
+
         result
     }
 }
@@ -2069,6 +2161,244 @@ mod tests {
         assert_eq!(assembled.len(), 1);
         assert!(assembled[0].content.contains("project_context"));
         assert!(assembled[0].content.contains("Rust project"));
+    }
+
+    // ── P0-9: tool_use ↔ tool_result must stay co-located ───────────────────
+
+    fn assistant_with_tool_call(text: &str, tool_id: &str, tool_name: &str) -> caduceus_providers::Message {
+        let mut m = caduceus_providers::Message::assistant(text);
+        m.tool_calls.push(caduceus_core::ToolUse {
+            id: tool_id.into(),
+            name: tool_name.into(),
+            input: serde_json::json!({}),
+        });
+        m
+    }
+
+    fn tool_result_message(tool_id: &str, content: &str) -> caduceus_providers::Message {
+        caduceus_providers::Message {
+            role: "tool".into(),
+            content: content.into(),
+            content_blocks: None,
+            tool_calls: Vec::new(),
+            tool_result: Some(
+                caduceus_core::ToolResult::success(content).with_tool_use_id(tool_id),
+            ),
+        }
+    }
+
+    #[test]
+    fn pair_aware_units_groups_assistant_with_following_tool_results() {
+        let messages = vec![
+            caduceus_providers::Message::user("hi"),
+            assistant_with_tool_call("calling", "t1", "read"),
+            tool_result_message("t1", "ok"),
+            caduceus_providers::Message::assistant("done"),
+        ];
+        let units = pair_aware_units(&messages);
+        assert_eq!(units, vec![(0, 1), (1, 3), (3, 4)]);
+    }
+
+    #[test]
+    fn pair_aware_units_handles_multi_tool_call() {
+        let mut a = caduceus_providers::Message::assistant("multi");
+        a.tool_calls.push(caduceus_core::ToolUse {
+            id: "tA".into(),
+            name: "read".into(),
+            input: serde_json::json!({}),
+        });
+        a.tool_calls.push(caduceus_core::ToolUse {
+            id: "tB".into(),
+            name: "list".into(),
+            input: serde_json::json!({}),
+        });
+        let messages = vec![
+            caduceus_providers::Message::user("go"),
+            a,
+            tool_result_message("tA", "okA"),
+            tool_result_message("tB", "okB"),
+            caduceus_providers::Message::assistant("done"),
+        ];
+        let units = pair_aware_units(&messages);
+        assert_eq!(units, vec![(0, 1), (1, 4), (4, 5)]);
+    }
+
+    #[test]
+    fn pair_aware_units_orphan_tool_is_size_one() {
+        let messages = vec![
+            tool_result_message("ghost", "??"),
+            caduceus_providers::Message::user("hi"),
+        ];
+        let units = pair_aware_units(&messages);
+        assert_eq!(units, vec![(0, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn pair_aware_units_unmatched_tool_id_breaks_unit() {
+        let messages = vec![
+            assistant_with_tool_call("call", "t1", "read"),
+            tool_result_message("other", "??"),
+        ];
+        let units = pair_aware_units(&messages);
+        assert_eq!(units, vec![(0, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn truncate_oldest_keeps_tool_pair_atomic() {
+        // Bug: oldest-first message-by-message truncation can leave an
+        // orphaned tool_result when it drops the assistant+tool_calls but
+        // not the matching tool message. With pair-aware units, the pair
+        // is dropped together. With a 4-msg history and max=2, the buggy
+        // code produced [tool_result, assistant_final] (orphan). The fix
+        // drops user (1) then the whole pair (2), leaving [assistant_final].
+        let mut history = ConversationHistory::new();
+        history.append(caduceus_providers::Message::user("u1"));
+        history.append(assistant_with_tool_call("call", "t1", "read"));
+        history.append(tool_result_message("t1", "ok"));
+        history.append(caduceus_providers::Message::assistant("final"));
+        history.truncate_oldest(2);
+        let msgs = history.messages();
+        // Critical invariant: NO orphan tool_result anywhere.
+        for (i, m) in msgs.iter().enumerate() {
+            if m.role == "tool" {
+                let tool_id = m
+                    .tool_result
+                    .as_ref()
+                    .and_then(|r| r.tool_use_id.as_deref())
+                    .unwrap_or("");
+                let prev_assistant_has_id = i > 0
+                    && msgs[i - 1].role == "assistant"
+                    && msgs[i - 1]
+                        .tool_calls
+                        .iter()
+                        .any(|tc| tc.id == tool_id);
+                assert!(
+                    prev_assistant_has_id,
+                    "orphan tool_result at index {i} (id={tool_id}) — pair was split"
+                );
+            }
+        }
+        // Final assistant must always survive truncation.
+        assert!(
+            msgs.iter().any(|m| m.role == "assistant"
+                && m.tool_calls.is_empty()
+                && m.content == "final"),
+            "final assistant message was dropped"
+        );
+    }
+
+    #[test]
+    fn truncate_oldest_keeps_pair_when_budget_allows() {
+        // Same history, max=3 → only oldest single-msg unit (user) drops,
+        // pair stays. Tests that pair-aware logic doesn't over-drop.
+        let mut history = ConversationHistory::new();
+        history.append(caduceus_providers::Message::user("u1"));
+        history.append(assistant_with_tool_call("call", "t1", "read"));
+        history.append(tool_result_message("t1", "ok"));
+        history.append(caduceus_providers::Message::assistant("final"));
+        history.truncate_oldest(3);
+        let msgs = history.messages();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, "assistant");
+        assert!(!msgs[0].tool_calls.is_empty());
+        assert_eq!(msgs[1].role, "tool");
+        assert_eq!(msgs[2].role, "assistant");
+        assert!(msgs[2].tool_calls.is_empty());
+    }
+
+    #[test]
+    fn truncate_oldest_preserves_system_messages() {
+        let mut history = ConversationHistory::new();
+        history.append(caduceus_providers::Message::system("sys"));
+        history.append(caduceus_providers::Message::user("u1"));
+        history.append(caduceus_providers::Message::user("u2"));
+        history.append(caduceus_providers::Message::user("u3"));
+        history.truncate_oldest(2);
+        let msgs = history.messages();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].content, "u3");
+    }
+
+    #[test]
+    fn assemble_keeps_tool_pair_atomic_at_budget_boundary() {
+        let assembler = ContextAssembler::new(80, "S");
+        let mut history = ConversationHistory::new();
+        history.append(assistant_with_tool_call(
+            "calling read tool with args here",
+            "t1",
+            "read_file_contents_now",
+        ));
+        history.append(tool_result_message("t1", "tiny"));
+        history.append(caduceus_providers::Message::assistant("ok"));
+        let assembled = assembler.assemble(&history);
+        assert_eq!(assembled[0].role, "system");
+        let has_pair_assistant = assembled
+            .iter()
+            .any(|m| m.role == "assistant" && !m.tool_calls.is_empty());
+        let has_tool_result = assembled.iter().any(|m| m.role == "tool");
+        assert_eq!(
+            has_pair_assistant, has_tool_result,
+            "tool pair was split: assistant_with_call={has_pair_assistant} tool_result={has_tool_result}"
+        );
+    }
+
+    #[test]
+    fn assemble_never_starts_history_with_orphan_tool_result() {
+        let assembler = ContextAssembler::new(60, "S");
+        let mut history = ConversationHistory::new();
+        history.append(assistant_with_tool_call(
+            "this assistant message has lots of text to push budget over",
+            "t1",
+            "some_tool",
+        ));
+        history.append(tool_result_message("t1", "result"));
+        let assembled = assembler.assemble(&history);
+        if assembled.len() > 1 {
+            assert_ne!(
+                assembled[1].role, "tool",
+                "assemble emitted orphan tool_result as first non-system message"
+            );
+        }
+    }
+
+    #[test]
+    fn assemble_includes_both_messages_of_pair_when_both_fit() {
+        let assembler = ContextAssembler::new(10000, "S");
+        let mut history = ConversationHistory::new();
+        history.append(assistant_with_tool_call("call", "t1", "read"));
+        history.append(tool_result_message("t1", "ok"));
+        let assembled = assembler.assemble(&history);
+        assert_eq!(assembled.len(), 3);
+        assert_eq!(assembled[1].role, "assistant");
+        assert!(!assembled[1].tool_calls.is_empty());
+        assert_eq!(assembled[2].role, "tool");
+    }
+
+    #[test]
+    fn assemble_multi_tool_call_unit_stays_atomic() {
+        let assembler = ContextAssembler::new(10000, "S");
+        let mut history = ConversationHistory::new();
+        let mut a = caduceus_providers::Message::assistant("multi");
+        a.tool_calls.push(caduceus_core::ToolUse {
+            id: "tA".into(),
+            name: "read".into(),
+            input: serde_json::json!({}),
+        });
+        a.tool_calls.push(caduceus_core::ToolUse {
+            id: "tB".into(),
+            name: "list".into(),
+            input: serde_json::json!({}),
+        });
+        history.append(a);
+        history.append(tool_result_message("tA", "okA"));
+        history.append(tool_result_message("tB", "okB"));
+        let assembled = assembler.assemble(&history);
+        assert_eq!(assembled.len(), 4);
+        assert_eq!(assembled[1].role, "assistant");
+        assert_eq!(assembled[1].tool_calls.len(), 2);
+        assert_eq!(assembled[2].role, "tool");
+        assert_eq!(assembled[3].role, "tool");
     }
 
     #[tokio::test]

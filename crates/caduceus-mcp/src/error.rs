@@ -23,6 +23,9 @@ pub enum McpError {
     #[error("Empty result from MCP server")]
     EmptyResult,
 
+    #[error("MCP permission denied: {0}")]
+    PermissionDenied(String),
+
     #[error("Configuration error: {0}")]
     Config(String),
 

@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use caduceus_core::{CaduceusError, Result, ToolResult, ToolSpec};
 use caduceus_runtime::{BashSandbox, ExecRequest, FileOps};
+
+pub mod lsp;
+
 use futures::FutureExt;
 use glob::glob;
 use regex::RegexBuilder;

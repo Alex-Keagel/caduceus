@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 
 // ── Core types ─────────────────────────────────────────────────────────────────
@@ -49,7 +50,13 @@ impl std::fmt::Display for BackgroundStatus {
 
 struct AgentHandle {
     cancel_token: CancellationToken,
-    pause_token: CancellationToken,
+    /// `true` = paused, `false` = running. The background loop polls this
+    /// each tick and sleeps while paused. Atomic bool (not a
+    /// CancellationToken) because pause/resume must be reversible —
+    /// CancellationToken is one-shot and cannot be un-cancelled, which
+    /// silently broke `resume()` (status flipped back to Running but the
+    /// loop kept sleeping forever).
+    pause_signal: Arc<AtomicBool>,
     _join_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -106,10 +113,10 @@ impl BackgroundAgentManager {
         };
 
         let cancel_token = CancellationToken::new();
-        let pause_token = CancellationToken::new();
+        let pause_signal = Arc::new(AtomicBool::new(false));
 
         let cancel_clone = cancel_token.clone();
-        let pause_clone = pause_token.clone();
+        let pause_clone = pause_signal.clone();
         let agents_ref = self.agents.clone();
         let agent_id = id.clone();
         let persist = self.persist_path.clone();
@@ -129,9 +136,11 @@ impl BackgroundAgentManager {
                     return;
                 }
 
-                if pause_clone.is_cancelled() {
-                    // Cooperative pause — just sleep and re-check
-                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                if pause_clone.load(Ordering::Acquire) {
+                    // Cooperative pause — sleep and re-check. Resume()
+                    // will flip the flag back to false and the loop
+                    // resumes work on the next iteration.
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                     continue;
                 }
 
@@ -158,7 +167,7 @@ impl BackgroundAgentManager {
 
         let handle = AgentHandle {
             cancel_token,
-            pause_token,
+            pause_signal,
             _join_handle: Some(join_handle),
         };
 
@@ -174,12 +183,20 @@ impl BackgroundAgentManager {
     }
 
     /// Pause a running agent (cooperative).
+    ///
+    /// Sets the pause signal; the background loop will sleep on its next
+    /// iteration and resume work when `resume()` clears the signal. Idempotent.
     pub async fn pause(&self, id: &str) -> Result<(), BackgroundError> {
         let handles = self.handles.read().await;
         let handle = handles
             .get(id)
             .ok_or_else(|| BackgroundError::NotFound(id.to_string()))?;
-        handle.pause_token.cancel();
+        handle.pause_signal.store(true, Ordering::Release);
+        // Drop the handles read lock before taking the agents write lock to
+        // keep lock-acquisition order consistent across all methods (handles
+        // first if needed, then agents) and avoid holding two locks longer
+        // than necessary.
+        drop(handles);
 
         let mut agents = self.agents.write().await;
         if let Some(a) = agents.get_mut(id) {
@@ -191,12 +208,14 @@ impl BackgroundAgentManager {
         Ok(())
     }
 
-    /// Resume a paused agent by replacing the pause token.
+    /// Resume a paused agent.
+    ///
+    /// Atomically clears the pause signal so the background loop's next
+    /// poll observes `false` and resumes work. Returns `InvalidState` if
+    /// the agent is not currently paused.
     pub async fn resume(&self, id: &str) -> Result<(), BackgroundError> {
-        // We can't un-cancel a CancellationToken, so we note that the status
-        // change is enough — the task loop already re-checks the token.
-        // For a real implementation we would use a tokio::sync::Notify or
-        // replace the token. Here we rely on the pause loop sleeping.
+        // Validate state under the agents write lock first so the status
+        // transition and pause-signal clear are observed together.
         let mut agents = self.agents.write().await;
         let agent = agents
             .get_mut(id)
@@ -206,12 +225,17 @@ impl BackgroundAgentManager {
                 "Agent {id} is not paused"
             )));
         }
-        // We set status back; the pause_token is still cancelled, but the
-        // background loop treats "Paused" status via a cooperative sleep.
-        // A production version would use a watch channel or notify.
         agent.status = BackgroundStatus::Running;
         if let Some(ref path) = self.persist_path {
             let _ = Self::save_to_db(path, &agents);
+        }
+        // Clear the pause signal AFTER status is updated and persisted, so
+        // an observer that sees status=Running is guaranteed to see the
+        // loop unblocked on its next poll.
+        drop(agents);
+        let handles = self.handles.read().await;
+        if let Some(h) = handles.get(id) {
+            h.pause_signal.store(false, Ordering::Release);
         }
         Ok(())
     }
@@ -238,6 +262,10 @@ impl BackgroundAgentManager {
             .get(id)
             .ok_or_else(|| BackgroundError::NotFound(id.to_string()))?;
         handle.cancel_token.cancel();
+        // Release handles before taking agents write lock — keeps lock
+        // order consistent with pause()/resume() and avoids holding two
+        // locks simultaneously.
+        drop(handles);
 
         let mut agents = self.agents.write().await;
         if let Some(a) = agents.get_mut(id) {
@@ -554,5 +582,137 @@ mod tests {
         let id = mgr.start("not paused".to_string()).await.unwrap();
         let err = mgr.resume(&id).await.unwrap_err();
         assert!(matches!(err, BackgroundError::InvalidState(_)));
+    }
+
+    // ── P0-3: pause/resume must actually un-block the loop ──────────────────
+
+    #[tokio::test]
+    async fn resume_actually_unblocks_loop() {
+        // Regression: previously `pause_token` was a one-shot
+        // CancellationToken; resume() flipped status back to Running but
+        // the loop kept observing pause_token.is_cancelled() == true and
+        // slept forever. Verify the agent can complete after pause+resume.
+        let mgr = BackgroundAgentManager::in_memory();
+        let id = mgr.start("complete after resume".to_string()).await.unwrap();
+
+        // Pause briefly, then resume; agent should still be able to complete.
+        mgr.pause(&id).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(120)).await;
+        let paused = mgr.status(&id).await.unwrap();
+        assert_eq!(paused.status, BackgroundStatus::Paused);
+
+        mgr.resume(&id).await.unwrap();
+
+        // Loop tick = 100ms, completes after 50 ticks ≈ 5s. Poll up to 8s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            let s = mgr.status(&id).await.unwrap();
+            if matches!(s.status, BackgroundStatus::Completed(_)) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "agent did not reach Completed after resume; current status = {:?}",
+                s.status
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_actually_blocks_progress() {
+        // Confirm pause stops forward progress: a paused agent must NOT
+        // reach Completed even if we wait longer than the unpaused
+        // completion time would take.
+        let mgr = BackgroundAgentManager::in_memory();
+        let id = mgr.start("pause blocks".to_string()).await.unwrap();
+        // Let it run a bit, then pause.
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        mgr.pause(&id).await.unwrap();
+
+        // Wait significantly less than completion time post-pause.
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        let s = mgr.status(&id).await.unwrap();
+        assert_eq!(
+            s.status,
+            BackgroundStatus::Paused,
+            "agent was not actually paused — status = {:?}",
+            s.status
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_is_idempotent() {
+        // Calling pause twice on a running agent must not break resume.
+        let mgr = BackgroundAgentManager::in_memory();
+        let id = mgr.start("double pause".to_string()).await.unwrap();
+        mgr.pause(&id).await.unwrap();
+        mgr.pause(&id).await.unwrap();
+        let s = mgr.status(&id).await.unwrap();
+        assert_eq!(s.status, BackgroundStatus::Paused);
+        mgr.resume(&id).await.unwrap();
+        let s = mgr.status(&id).await.unwrap();
+        assert_eq!(s.status, BackgroundStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn pause_then_cancel_completes_with_cancelled() {
+        // Cancellation must take priority over pause — a paused agent
+        // that is then cancelled must reach Cancelled (not stay Paused).
+        let mgr = BackgroundAgentManager::in_memory();
+        let id = mgr.start("pause then cancel".to_string()).await.unwrap();
+        mgr.pause(&id).await.unwrap();
+        // Even though paused, cancel should propagate; loop wakes from
+        // its 50ms pause sleep and observes cancel_token.
+        mgr.cancel(&id).await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let s = mgr.status(&id).await.unwrap();
+            if s.status == BackgroundStatus::Cancelled {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "agent did not reach Cancelled after pause+cancel; status = {:?}",
+                s.status
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_pause_resume_no_deadlock() {
+        // Stress: spawn multiple agents and rapidly pause/resume them in
+        // parallel. Validates that lock-acquisition order is consistent
+        // (handles-read released before agents-write taken) — previously
+        // pause() held both locks simultaneously, contending with start().
+        let mgr = Arc::new(BackgroundAgentManager::in_memory());
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let id = mgr.start(format!("agent-{i}")).await.unwrap();
+            ids.push(id);
+        }
+
+        let mut tasks = Vec::new();
+        for id in ids {
+            let mgr = mgr.clone();
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..5 {
+                    let _ = mgr.pause(&id).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                    let _ = mgr.resume(&id).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                }
+            }));
+        }
+
+        // 3-second timeout; if any task deadlocks we fail.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            futures::future::join_all(tasks),
+        )
+        .await;
+        assert!(result.is_ok(), "concurrent pause/resume deadlocked");
     }
 }
