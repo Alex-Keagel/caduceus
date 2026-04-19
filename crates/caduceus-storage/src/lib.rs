@@ -3780,6 +3780,33 @@ pub struct MaintenanceReport {
     pub log_entries_added: usize,
 }
 
+/// Audit finding #10: callers used to count `report.pages_created`/etc by
+/// inspecting `action.action_type` only — but `execute_action` silently
+/// skips writes when a page already exists (CreatePage), is missing
+/// (DeletePage), etc. Returning a typed outcome lets callers count what
+/// actually happened on disk, not what was attempted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaintenanceOutcome {
+    /// CreatePage actually wrote a new page.
+    Created,
+    /// CreatePage was a no-op because the page already existed.
+    CreateSkippedExisting,
+    /// UpdatePage modified an existing page.
+    Updated,
+    /// UpdatePage created a missing page (rather than updating it).
+    UpdatedAsCreate,
+    /// DeletePage removed an existing page.
+    Deleted,
+    /// DeletePage was a no-op because the page didn't exist.
+    DeleteSkippedMissing,
+    /// UpdateIndex regenerated the index.
+    IndexUpdated,
+    /// UpdateLog flushed the log.
+    LogFlushed,
+    /// RunLint produced this many findings.
+    LintRan { findings: usize },
+}
+
 impl WikiMaintenanceAgent {
     pub fn new() -> Self {
         Self {
@@ -3877,22 +3904,26 @@ impl WikiMaintenanceAgent {
         wiki: &WikiEngine,
         index: &mut WikiIndex,
         log: &mut WikiLog,
-    ) -> std::result::Result<(), CaduceusError> {
-        match action.action_type {
+    ) -> std::result::Result<MaintenanceOutcome, CaduceusError> {
+        let outcome = match action.action_type {
             MaintenanceActionType::CreatePage => {
-                if !wiki.page_exists(&action.page_slug) {
+                let outcome = if !wiki.page_exists(&action.page_slug) {
                     let content = format!("# {}\n\n{}\n", action.page_slug, action.description);
                     wiki.write_page(&action.page_slug, &content)?;
-                }
+                    MaintenanceOutcome::Created
+                } else {
+                    MaintenanceOutcome::CreateSkippedExisting
+                };
                 log.append(LogEntry {
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     operation: WikiOperation::Create,
                     description: action.description.clone(),
                     pages_touched: vec![action.page_slug.clone()],
                 });
+                outcome
             }
             MaintenanceActionType::UpdatePage => {
-                if wiki.page_exists(&action.page_slug) {
+                let outcome = if wiki.page_exists(&action.page_slug) {
                     let existing = wiki.read_page(&action.page_slug)?;
                     let note = if action.description.contains("Archive")
                         || action.description.contains("deleted")
@@ -3902,27 +3933,34 @@ impl WikiMaintenanceAgent {
                         format!("\n\n> **Updated**: {}\n", action.description)
                     };
                     wiki.write_page(&action.page_slug, &format!("{existing}{note}"))?;
+                    MaintenanceOutcome::Updated
                 } else {
                     let content = format!("# {}\n\n{}\n", action.page_slug, action.description);
                     wiki.write_page(&action.page_slug, &content)?;
-                }
+                    MaintenanceOutcome::UpdatedAsCreate
+                };
                 log.append(LogEntry {
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     operation: WikiOperation::Update,
                     description: action.description.clone(),
                     pages_touched: vec![action.page_slug.clone()],
                 });
+                outcome
             }
             MaintenanceActionType::DeletePage => {
-                if wiki.page_exists(&action.page_slug) {
+                let outcome = if wiki.page_exists(&action.page_slug) {
                     wiki.delete_page(&action.page_slug)?;
-                }
+                    MaintenanceOutcome::Deleted
+                } else {
+                    MaintenanceOutcome::DeleteSkippedMissing
+                };
                 log.append(LogEntry {
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     operation: WikiOperation::Delete,
                     description: action.description.clone(),
                     pages_touched: vec![action.page_slug.clone()],
                 });
+                outcome
             }
             MaintenanceActionType::UpdateIndex => {
                 let pages = wiki.list_pages()?;
@@ -3948,24 +3986,28 @@ impl WikiMaintenanceAgent {
                 let index_path = wiki.wiki_dir().join("index.md");
                 fs::write(&index_path, index_md)
                     .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+                MaintenanceOutcome::IndexUpdated
             }
             MaintenanceActionType::UpdateLog => {
                 let log_md = log.to_markdown();
                 let log_path = wiki.wiki_dir().join("log.md");
                 fs::write(&log_path, log_md).map_err(|e| CaduceusError::Storage(e.to_string()))?;
+                MaintenanceOutcome::LogFlushed
             }
             MaintenanceActionType::RunLint => {
                 let pages = wiki.list_pages()?;
                 let findings = WikiLinter::lint(&pages, index);
+                let count = findings.len();
                 log.append(LogEntry {
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     operation: WikiOperation::Lint,
-                    description: format!("Lint found {} finding(s)", findings.len()),
+                    description: format!("Lint found {} finding(s)", count),
                     pages_touched: vec![],
                 });
+                MaintenanceOutcome::LintRan { findings: count }
             }
-        }
-        Ok(())
+        };
+        Ok(outcome)
     }
 
     /// Run a complete maintenance cycle against `project_root`.
@@ -3996,17 +4038,18 @@ impl WikiMaintenanceAgent {
         };
 
         for action in &actions {
-            self.execute_action(action, &wiki, &mut index, &mut log)?;
-            match action.action_type {
-                MaintenanceActionType::CreatePage => report.pages_created += 1,
-                MaintenanceActionType::UpdatePage => report.pages_updated += 1,
-                MaintenanceActionType::DeletePage => report.pages_deleted += 1,
-                MaintenanceActionType::UpdateIndex => report.index_updated = true,
-                MaintenanceActionType::RunLint => {
-                    let pages = wiki.list_pages()?;
-                    report.lint_findings = WikiLinter::lint(&pages, &index).len();
+            let outcome = self.execute_action(action, &wiki, &mut index, &mut log)?;
+            match outcome {
+                MaintenanceOutcome::Created => report.pages_created += 1,
+                MaintenanceOutcome::Updated | MaintenanceOutcome::UpdatedAsCreate => {
+                    report.pages_updated += 1
                 }
-                MaintenanceActionType::UpdateLog => {}
+                MaintenanceOutcome::Deleted => report.pages_deleted += 1,
+                MaintenanceOutcome::IndexUpdated => report.index_updated = true,
+                MaintenanceOutcome::LintRan { findings } => report.lint_findings = findings,
+                MaintenanceOutcome::CreateSkippedExisting
+                | MaintenanceOutcome::DeleteSkippedMissing
+                | MaintenanceOutcome::LogFlushed => {}
             }
         }
 
@@ -4089,18 +4132,20 @@ impl WikiAutoTrigger {
         };
 
         for action in &actions {
-            self.agent
+            let outcome = self
+                .agent
                 .execute_action(action, &wiki, &mut index, &mut log)?;
-            match action.action_type {
-                MaintenanceActionType::CreatePage => report.pages_created += 1,
-                MaintenanceActionType::UpdatePage => report.pages_updated += 1,
-                MaintenanceActionType::DeletePage => report.pages_deleted += 1,
-                MaintenanceActionType::UpdateIndex => report.index_updated = true,
-                MaintenanceActionType::RunLint => {
-                    let pages = wiki.list_pages()?;
-                    report.lint_findings = WikiLinter::lint(&pages, &index).len();
+            match outcome {
+                MaintenanceOutcome::Created => report.pages_created += 1,
+                MaintenanceOutcome::Updated | MaintenanceOutcome::UpdatedAsCreate => {
+                    report.pages_updated += 1
                 }
-                MaintenanceActionType::UpdateLog => {}
+                MaintenanceOutcome::Deleted => report.pages_deleted += 1,
+                MaintenanceOutcome::IndexUpdated => report.index_updated = true,
+                MaintenanceOutcome::LintRan { findings } => report.lint_findings = findings,
+                MaintenanceOutcome::CreateSkippedExisting
+                | MaintenanceOutcome::DeleteSkippedMissing
+                | MaintenanceOutcome::LogFlushed => {}
             }
         }
 
@@ -5037,6 +5082,62 @@ mod feature_tests_256_258 {
 
         assert!(report.pages_created > 0);
         assert!(report.index_updated);
+    }
+
+    /// Audit finding #10: previously, `report.pages_created` was incremented
+    /// for every CreatePage action regardless of whether `execute_action`
+    /// actually wrote anything. With a pre-seeded wiki, the agent would
+    /// re-plan CreatePage actions for already-existing pages and the report
+    /// would over-count. After the fix, the count reflects real writes.
+    #[test]
+    fn maintenance_agent_create_skips_existing_and_reports_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        // Pre-seed: page already on disk.
+        engine
+            .write_page("seeded", "# Seeded\n\nalready here")
+            .unwrap();
+
+        let agent = WikiMaintenanceAgent::new();
+        let mut index = WikiIndex::new();
+        let mut log = WikiLog::new();
+
+        let action = MaintenanceAction {
+            action_type: MaintenanceActionType::CreatePage,
+            page_slug: "seeded".to_string(),
+            description: "would-be create".to_string(),
+        };
+
+        let outcome = agent
+            .execute_action(&action, &engine, &mut index, &mut log)
+            .unwrap();
+        assert_eq!(outcome, MaintenanceOutcome::CreateSkippedExisting);
+
+        // Original content untouched (no overwrite).
+        let content = engine.read_page("seeded").unwrap();
+        assert!(content.contains("already here"));
+    }
+
+    #[test]
+    fn maintenance_agent_delete_missing_reports_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        let agent = WikiMaintenanceAgent::new();
+        let mut index = WikiIndex::new();
+        let mut log = WikiLog::new();
+
+        let action = MaintenanceAction {
+            action_type: MaintenanceActionType::DeletePage,
+            page_slug: "ghost".to_string(),
+            description: "nope".to_string(),
+        };
+
+        let outcome = agent
+            .execute_action(&action, &engine, &mut index, &mut log)
+            .unwrap();
+        assert_eq!(outcome, MaintenanceOutcome::DeleteSkippedMissing);
     }
 
     // ── #258 WikiAutoTrigger ──────────────────────────────────────────────────
