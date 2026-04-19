@@ -1711,11 +1711,18 @@ pub struct BusMessage {
 
 #[derive(Debug, Default)]
 pub struct MessageBus {
-    channels: HashMap<String, Vec<BusMessage>>,
+    channels: HashMap<String, VecDeque<BusMessage>>,
     subscribers: HashMap<String, Vec<String>>,
 }
 
 impl MessageBus {
+    /// Audit finding (round 2): channels grow without bound; long-running
+    /// sessions accumulate every BusMessage forever. Cap per-channel
+    /// retention to a sliding window of the most recent N messages so
+    /// memory stays bounded while `read_since(timestamp)` semantics
+    /// (which only care about the recent tail) still work.
+    const MAX_MESSAGES_PER_CHANNEL: usize = 1024;
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -1727,11 +1734,41 @@ impl MessageBus {
         }
     }
 
+    /// Audit finding (round 2): no unsubscribe path meant subscriber lists
+    /// leaked when agents shut down. Returns true iff the agent was actually
+    /// removed from the channel's subscriber list.
+    pub fn unsubscribe(&mut self, agent: &str, channel: &str) -> bool {
+        let Some(subscribers) = self.subscribers.get_mut(channel) else {
+            return false;
+        };
+        let before = subscribers.len();
+        subscribers.retain(|name| name != agent);
+        let removed = subscribers.len() != before;
+        if subscribers.is_empty() {
+            self.subscribers.remove(channel);
+        }
+        removed
+    }
+
+    /// Drop all subscriptions for an agent across every channel; useful when
+    /// an agent crashes or is being torn down.
+    pub fn unsubscribe_agent(&mut self, agent: &str) {
+        self.subscribers.retain(|_, agents| {
+            agents.retain(|name| name != agent);
+            !agents.is_empty()
+        });
+    }
+
     pub fn publish(&mut self, message: BusMessage) {
-        self.channels
+        let queue = self
+            .channels
             .entry(message.channel.clone())
-            .or_default()
-            .push(message);
+            .or_default();
+        queue.push_back(message);
+        // Sliding-window eviction: drop oldest until under cap.
+        while queue.len() > Self::MAX_MESSAGES_PER_CHANNEL {
+            queue.pop_front();
+        }
     }
 
     pub fn read(&self, agent: &str, channel: &str) -> Vec<&BusMessage> {
@@ -2882,6 +2919,68 @@ Here is the task plan:
         assert_eq!(recent[0].content, "finished");
         // Unsubscribed agent must get nothing from read_since.
         assert!(bus.read_since("bob", "team", 0).is_empty());
+    }
+
+    /// Audit finding (round 2): MessageBus.channels was an unbounded Vec.
+    /// Now it's a sliding window of MAX_MESSAGES_PER_CHANNEL most-recent
+    /// messages — long-running sessions can't OOM the bus.
+    #[test]
+    fn message_bus_caps_per_channel_messages() {
+        let mut bus = MessageBus::new();
+        bus.subscribe("alice", "fire-hose");
+        let cap = MessageBus::MAX_MESSAGES_PER_CHANNEL;
+        for i in 0..(cap as u64 + 50) {
+            bus.publish(BusMessage {
+                from: "src".to_string(),
+                content: format!("m{i}"),
+                timestamp: i,
+                channel: "fire-hose".to_string(),
+            });
+        }
+        let visible = bus.read("alice", "fire-hose");
+        assert_eq!(visible.len(), cap, "should be sliding-window capped");
+        // Oldest should have been evicted; newest preserved.
+        assert_eq!(visible.last().unwrap().content, format!("m{}", cap as u64 + 49));
+        assert_ne!(visible.first().unwrap().content, "m0");
+    }
+
+    /// Audit finding (round 2): subscribers map had no eviction path —
+    /// a crashed/torn-down agent leaked its subscription forever.
+    #[test]
+    fn message_bus_unsubscribe_drops_agent_and_collapses_empty_channels() {
+        let mut bus = MessageBus::new();
+        bus.subscribe("alice", "team");
+        bus.subscribe("bob", "team");
+        bus.subscribe("alice", "private");
+
+        assert!(bus.unsubscribe("alice", "team"));
+        assert!(!bus.unsubscribe("alice", "team"), "second remove is no-op");
+
+        bus.publish(BusMessage {
+            from: "x".to_string(),
+            content: "hi".to_string(),
+            timestamp: 1,
+            channel: "team".to_string(),
+        });
+        // Alice no longer subscribed to "team", so she gets nothing.
+        assert!(bus.read("alice", "team").is_empty());
+        // Bob still subscribed.
+        assert_eq!(bus.read("bob", "team").len(), 1);
+
+        // Alice still subscribed to "private".
+        bus.publish(BusMessage {
+            from: "x".to_string(),
+            content: "p".to_string(),
+            timestamp: 2,
+            channel: "private".to_string(),
+        });
+        assert_eq!(bus.read("alice", "private").len(), 1);
+
+        // unsubscribe_agent removes alice from every channel.
+        bus.unsubscribe_agent("alice");
+        assert!(bus.read("alice", "private").is_empty());
+        // Empty channel collapsed entirely.
+        assert!(!bus.subscribers.contains_key("private"));
     }
 
     #[test]
