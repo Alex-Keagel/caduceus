@@ -67,8 +67,12 @@ impl MarketplaceRegistry {
 
     // ── Skills ─────────────────────────────────────────────────────────────────
 
-    pub fn register_skill(&mut self, entry: SkillEntry) {
-        self.skills.insert(entry.name.clone(), entry);
+    pub fn register_skill(&mut self, entry: SkillEntry) -> bool {
+        // Audit finding #12: returns true when this is a brand-new entry,
+        // false when it overwrites an existing one with the same name.
+        // Callers (e.g. load_skills_from_dir) use this to count distinct
+        // skills loaded rather than .md files parsed.
+        self.skills.insert(entry.name.clone(), entry).is_none()
     }
 
     pub fn list_skills(&self) -> Vec<&SkillEntry> {
@@ -89,8 +93,10 @@ impl MarketplaceRegistry {
 
     // ── Agents ─────────────────────────────────────────────────────────────────
 
-    pub fn register_agent(&mut self, entry: AgentEntry) {
-        self.agents.insert(entry.name.clone(), entry);
+    pub fn register_agent(&mut self, entry: AgentEntry) -> bool {
+        // Audit finding #12: see register_skill — true on insert, false on
+        // overwrite, so loaders can report distinct-entry counts.
+        self.agents.insert(entry.name.clone(), entry).is_none()
     }
 
     pub fn list_agents(&self) -> Vec<&AgentEntry> {
@@ -123,8 +129,9 @@ impl MarketplaceRegistry {
             let path = entry.path();
             if path.is_file() && path.extension().is_some_and(|e| e == "md") {
                 if let Ok(skill) = parse_skill_frontmatter(path) {
-                    self.register_skill(skill);
-                    count += 1;
+                    if self.register_skill(skill) {
+                        count += 1;
+                    }
                 }
             }
         }
@@ -142,8 +149,9 @@ impl MarketplaceRegistry {
             let path = entry.path();
             if path.is_file() && path.extension().is_some_and(|e| e == "md") {
                 if let Ok(agent) = parse_agent_frontmatter(path) {
-                    self.register_agent(agent);
-                    count += 1;
+                    if self.register_agent(agent) {
+                        count += 1;
+                    }
                 }
             }
         }

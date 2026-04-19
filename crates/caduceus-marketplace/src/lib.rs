@@ -679,6 +679,48 @@ mod tests {
         assert_eq!(results[0].name, "debugger");
     }
 
+    /// Audit finding #12: register_skill/register_agent must report
+    /// whether the entry was newly inserted (true) or overwrote an
+    /// existing entry with the same name (false). load_*_from_dir
+    /// uses this to count distinct skills loaded, not .md files
+    /// parsed. Without this fix, two .md files declaring the same
+    /// skill name would inflate the load count by 2 even though
+    /// only one entry sits in the HashMap.
+    #[test]
+    fn register_skill_returns_true_only_on_first_insert() {
+        let mut registry = MarketplaceRegistry::new();
+        let skill = || SkillEntry {
+            name: "dup-name".to_string(),
+            version: "1.0".to_string(),
+            description: "first".to_string(),
+            categories: vec![],
+            triggers: vec![],
+            tools: vec![],
+        };
+        assert!(registry.register_skill(skill()), "first insert is new");
+        assert!(
+            !registry.register_skill(skill()),
+            "second insert with same name is an overwrite"
+        );
+        assert_eq!(registry.list_skills().len(), 1);
+    }
+
+    #[test]
+    fn register_agent_returns_true_only_on_first_insert() {
+        let mut registry = MarketplaceRegistry::new();
+        let agent = || AgentEntry {
+            name: "dup-agent".to_string(),
+            version: "1.0".to_string(),
+            description: "first".to_string(),
+            specialty: "x".to_string(),
+            tools: vec![],
+            triggers: vec![],
+        };
+        assert!(registry.register_agent(agent()));
+        assert!(!registry.register_agent(agent()));
+        assert_eq!(registry.list_agents().len(), 1);
+    }
+
     // ── catalog.rs ─────────────────────────────────────────────────────────────
 
     #[test]

@@ -1507,10 +1507,15 @@ impl AgentHarness {
             let memories = extract_memories(user_input, &final_text);
             if !memories.is_empty() {
                 let memory_path = state.project_root.join(".caduceus/memory.md");
+                // Audit finding #11: previously logged `memories.len()` even
+                // though the dedup loop below silently drops entries already
+                // present in memory.md. Track the real append count.
+                let mut appended = 0usize;
                 if let Ok(mut existing) = std::fs::read_to_string(&memory_path) {
                     for mem in &memories {
                         if !existing.contains(mem) {
                             existing.push_str(&format!("\n{mem}"));
+                            appended += 1;
                         }
                     }
                     let _ = std::fs::write(&memory_path, existing);
@@ -1518,8 +1523,20 @@ impl AgentHarness {
                     let content = format!("# Caduceus Memory\n\n{}", memories.join("\n"));
                     let _ = std::fs::create_dir_all(state.project_root.join(".caduceus"));
                     let _ = std::fs::write(&memory_path, content);
+                    appended = memories.len();
                 }
-                tracing::info!("Auto-extracted {} memories", memories.len());
+                if appended > 0 {
+                    tracing::info!(
+                        "Auto-extracted {appended} new memories ({} candidates, {} duplicates skipped)",
+                        memories.len(),
+                        memories.len().saturating_sub(appended),
+                    );
+                } else {
+                    tracing::debug!(
+                        "Auto-extracted 0 new memories ({} candidates were all duplicates)",
+                        memories.len(),
+                    );
+                }
             }
         }
 
