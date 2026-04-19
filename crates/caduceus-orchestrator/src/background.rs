@@ -426,6 +426,28 @@ impl BackgroundAgentManager {
     }
 }
 
+impl Drop for BackgroundAgentManager {
+    /// Audit finding round-2 (#21): JoinHandles for background agents were
+    /// leaked when the manager itself was dropped. We now cooperatively
+    /// cancel via the per-agent CancellationToken AND abort the handle so
+    /// long-sleeping loops also stop without waiting out their tick.
+    fn drop(&mut self) {
+        if let Ok(mut handles) = self.handles.try_write() {
+            for (_, handle) in handles.drain() {
+                handle.cancel_token.cancel();
+                if let Some(jh) = handle._join_handle {
+                    jh.abort();
+                }
+            }
+        }
+        // If the lock is contended at drop time (concurrent caller mid-write),
+        // the handles will still be dropped through Arc release; their
+        // JoinHandle Drop detaches but our cancel_token cancels are missed.
+        // Acceptable trade-off: in practice the manager is owned by app
+        // state and Drop runs once at shutdown when no callers remain.
+    }
+}
+
 // ── Slash-command helpers ──────────────────────────────────────────────────────
 
 /// Parse `/background` sub-commands and return a user-facing response string.

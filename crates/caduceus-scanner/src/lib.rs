@@ -103,8 +103,12 @@ impl ProjectScanner {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
         {
-            ctx.total_files += 1;
+            // Audit finding round-2 (#14): total_files used to increment
+            // unconditionally while total_size_bytes only incremented on
+            // metadata Ok, producing inconsistent stats. Now both counters
+            // advance only for files we successfully stat'd.
             if let Ok(meta) = entry.metadata() {
+                ctx.total_files += 1;
                 ctx.total_size_bytes += meta.len();
             }
             if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
