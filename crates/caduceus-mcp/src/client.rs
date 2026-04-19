@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument};
 
 // ── JSON-RPC 2.0 ───────────────────────────────────────────────────────────────
 
@@ -80,6 +80,14 @@ impl Transport {
 struct StdioTransport {
     stdin: tokio::process::ChildStdin,
     stdout_lines: Arc<Mutex<tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>>>,
+    /// Out-of-order responses are stashed here keyed by their JSON-RPC id,
+    /// so a future caller waiting on that id can pick it up instead of
+    /// having to log+drop it. Without this, even a single pipelined request
+    /// (or a slow server that interleaves an extra response) could orphan
+    /// a caller forever (audit finding #2). The map is bounded by callers'
+    /// in-flight ids, so it never grows unboundedly under the per-server
+    /// Mutex serialization in McpServerManager.
+    pending: Arc<Mutex<std::collections::HashMap<u64, JsonRpcResponse>>>,
 }
 
 const STDIO_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -96,6 +104,12 @@ impl StdioTransport {
             .await
             .map_err(McpError::Io)?;
         self.stdin.flush().await.map_err(McpError::Io)?;
+
+        // Fast path: another caller may already have read our response off
+        // the wire and parked it in `pending` while waiting for theirs.
+        if let Some(resp) = self.pending.lock().await.remove(&req.id) {
+            return Ok(resp);
+        }
 
         let mut guard = self.stdout_lines.lock().await;
         let deadline = tokio::time::Instant::now() + STDIO_RPC_TIMEOUT;
@@ -117,11 +131,25 @@ impl StdioTransport {
             }
 
             let resp: JsonRpcResponse = serde_json::from_str(&line)?;
-            if resp.id == Some(req.id) {
-                return Ok(resp);
+            match resp.id {
+                Some(id) if id == req.id => return Ok(resp),
+                Some(other_id) => {
+                    // A response for some other in-flight request. Park it
+                    // so that caller can claim it on its own send().
+                    debug!(
+                        got_id = other_id,
+                        want_id = req.id,
+                        "stashing out-of-order JSON-RPC response for later caller"
+                    );
+                    self.pending.lock().await.insert(other_id, resp);
+                    continue;
+                }
+                None => {
+                    // Notification (no id) — protocol-permitted, just skip.
+                    debug!("skipping JSON-RPC notification (no id)");
+                    continue;
+                }
             }
-            // Notification or out-of-order — skip
-            warn!(got_id = ?resp.id, want_id = req.id, "out-of-order JSON-RPC response, skipping");
         }
     }
 }
@@ -199,6 +227,7 @@ impl McpClient {
                 self.transport = Some(Transport::Stdio(StdioTransport {
                     stdin,
                     stdout_lines: lines,
+                    pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 }));
                 self._child = Some(child);
 
