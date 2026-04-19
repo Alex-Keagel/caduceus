@@ -159,6 +159,21 @@ impl PermissionedMcpManager {
         }
     }
 
+    /// Remove a server from both the underlying manager AND drop its policy
+    /// entry. Audit finding round-3 (#r3-36): without this, the policies
+    /// HashMap grew unbounded with stale entries when callers used
+    /// `inner.remove_server()` directly.
+    pub async fn remove_server(&self, server_id: &str) -> Result<()> {
+        // Remove from inner first so the server is fully torn down (kills
+        // child process, drops transport) before we forget its policy.
+        // If teardown fails we still drop the policy — the policy without
+        // a backing server is a leak in the same direction we're fixing.
+        let inner_result = self.inner.remove_server(server_id).await;
+        let mut policies = self.policies.write().await;
+        policies.remove(server_id);
+        inner_result
+    }
+
     pub async fn policy_for(&self, server_id: &str) -> ServerPolicy {
         self.policies
             .read()
