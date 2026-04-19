@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -1399,28 +1399,42 @@ impl Chunker for CodeChunker {
     }
 }
 
+/// Internally synchronized semantic index.
+///
+/// All mutating operations take `&self` (not `&mut self`) — the index protects
+/// its own state via an internal `std::sync::RwLock`, and the embedder/chunker
+/// are stored behind `Arc` so they can be cloned out before any `.await` point.
+///
+/// **Concurrency contract**: no async operation holds the internal entries
+/// lock across an `.await` boundary. `search` snapshots the embedder Arc,
+/// awaits the query embedding without any lock, then takes a brief read lock
+/// to score; `index_content`/`reindex_file`/`replace_file_content` embed
+/// without any lock and only take the write lock for the final
+/// retain+append step. This means a long-running reindex no longer blocks
+/// concurrent searches and vice versa — the bridge can wrap this type in
+/// `Arc<SemanticIndex>` directly, with no outer `tokio::RwLock` needed.
 pub struct SemanticIndex {
-    entries: Vec<(CodeChunk, Vec<f32>)>,
-    embedder: Box<dyn EmbeddingBackend>,
-    chunker: Box<dyn Chunker>,
+    entries: std::sync::RwLock<Vec<(CodeChunk, Vec<f32>)>>,
+    embedder: Arc<dyn EmbeddingBackend>,
+    chunker: Arc<dyn Chunker>,
 }
 
 impl SemanticIndex {
     pub fn new(embedder: Box<dyn EmbeddingBackend>) -> Self {
         Self {
-            entries: Vec::new(),
-            embedder,
-            chunker: Box::new(CodeChunker::default()),
+            entries: std::sync::RwLock::new(Vec::new()),
+            embedder: Arc::from(embedder),
+            chunker: Arc::new(CodeChunker::default()),
         }
     }
 
     pub fn with_chunker(mut self, chunker: impl Chunker + 'static) -> Self {
-        self.chunker = Box::new(chunker);
+        self.chunker = Arc::new(chunker);
         self
     }
 
     /// Walk a directory, parse every source file, embed, and store.
-    pub async fn index_directory(&mut self, dir: &Path) -> caduceus_core::Result<usize> {
+    pub async fn index_directory(&self, dir: &Path) -> caduceus_core::Result<usize> {
         let files = collect_source_files(dir);
         let mut total = 0;
 
@@ -1445,19 +1459,28 @@ impl SemanticIndex {
         query: &str,
         top_k: usize,
     ) -> caduceus_core::Result<Vec<SearchResult>> {
-        if self.entries.is_empty() || query.trim().is_empty() {
+        if query.trim().is_empty() {
             return Ok(Vec::new());
         }
 
-        // Semantic search via embeddings
-        let query_vecs = self.embedder.embed(vec![query.to_string()]).await?;
-        let query_vec = match query_vecs.first() {
+        // Snapshot the embedder Arc — no entries lock held while awaiting.
+        let embedder = Arc::clone(&self.embedder);
+        let query_vecs = embedder.embed(vec![query.to_string()]).await?;
+        let query_vec = match query_vecs.into_iter().next() {
             Some(v) => v,
             None => return Ok(Vec::new()),
         };
 
-        let semantic_scores: Vec<(usize, f32)> = self.entries.iter().enumerate()
-            .map(|(i, (_, emb))| (i, cosine_similarity(query_vec, emb)))
+        // Now acquire a brief read lock to score against the current snapshot.
+        // poisoned-lock recovery: a panicked writer leaves the lock poisoned
+        // but the data is still readable, so unwrap into the inner guard.
+        let entries = self.entries.read().unwrap_or_else(|e| e.into_inner());
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let semantic_scores: Vec<(usize, f32)> = entries.iter().enumerate()
+            .map(|(i, (_, emb))| (i, cosine_similarity(&query_vec, emb)))
             .collect();
 
         // Keyword search (BM25-like) — exact token matching
@@ -1467,7 +1490,7 @@ impl SemanticIndex {
             .map(|s| s.to_string())
             .collect();
 
-        let keyword_scores: Vec<(usize, f32)> = self.entries.iter().enumerate()
+        let keyword_scores: Vec<(usize, f32)> = entries.iter().enumerate()
             .map(|(i, (chunk, _))| {
                 let content_lower = chunk.content.to_lowercase();
                 let name_lower = chunk.symbol_name.to_lowercase();
@@ -1493,7 +1516,7 @@ impl SemanticIndex {
         let mut keyword_ranked: Vec<(usize, f32)> = keyword_scores.clone();
         keyword_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let mut fused_scores = vec![0.0f32; self.entries.len()];
+        let mut fused_scores = vec![0.0f32; entries.len()];
         for (rank, (idx, _)) in semantic_ranked.iter().enumerate() {
             fused_scores[*idx] += 1.0 / (k + rank as f32);
         }
@@ -1503,12 +1526,13 @@ impl SemanticIndex {
             }
         }
 
-        let mut results: Vec<SearchResult> = self.entries.iter().enumerate()
+        let mut results: Vec<SearchResult> = entries.iter().enumerate()
             .map(|(i, (chunk, _))| SearchResult {
                 chunk: chunk.clone(),
                 score: fused_scores[i],
             })
             .collect();
+        drop(entries);
 
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(top_k);
@@ -1516,18 +1540,19 @@ impl SemanticIndex {
         Ok(results)
     }
 
-    /// Remove existing chunks for `path`, re-read from disk, chunk, embed.
-    pub async fn reindex_file(&mut self, path: &Path) -> caduceus_core::Result<usize> {
+    /// Remove existing chunks for `path`, re-read from disk, chunk, embed,
+    /// and atomically replace. The embed step happens with no locks held.
+    pub async fn reindex_file(&self, path: &Path) -> caduceus_core::Result<usize> {
         let path_str = path.to_string_lossy().to_string();
-        self.entries.retain(|(c, _)| c.file_path != path_str);
-
         let content = std::fs::read_to_string(path)?;
-        self.index_content(&path_str, &content).await
+        self.replace_file_content(&path_str, &content).await
     }
 
-    /// Index already-loaded content (no disk I/O).
+    /// Index already-loaded content. **Append-only**: existing entries for
+    /// `path` are NOT removed (use `replace_file_content` for replace
+    /// semantics). The embed call happens with no entries lock held.
     pub async fn index_content(
-        &mut self,
+        &self,
         path: &str,
         content: &str,
     ) -> caduceus_core::Result<usize> {
@@ -1539,32 +1564,75 @@ impl SemanticIndex {
         }
 
         let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
-        let embeddings = self.embedder.embed(texts).await?;
+        let embedder = Arc::clone(&self.embedder);
+        let embeddings = embedder.embed(texts).await?;
 
+        let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
         for (chunk, emb) in chunks.into_iter().zip(embeddings) {
-            self.entries.push((chunk, emb));
+            entries.push((chunk, emb));
+        }
+
+        Ok(count)
+    }
+
+    /// Atomically replace all entries for `path` with freshly chunked +
+    /// embedded ones. Embed runs with no locks held; the write lock is only
+    /// taken for the final retain+append, so the caller never observes a
+    /// state where the file's old chunks are gone but new ones not yet added.
+    pub async fn replace_file_content(
+        &self,
+        path: &str,
+        content: &str,
+    ) -> caduceus_core::Result<usize> {
+        let chunks = self.chunker.chunk_file(path, content);
+        let count = chunks.len();
+
+        if chunks.is_empty() {
+            // Still need to evict any stale entries for this path.
+            let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
+            entries.retain(|(c, _)| c.file_path != path);
+            return Ok(0);
+        }
+
+        let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+        let embedder = Arc::clone(&self.embedder);
+        let embeddings = embedder.embed(texts).await?;
+
+        let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
+        entries.retain(|(c, _)| c.file_path != path);
+        for (chunk, emb) in chunks.into_iter().zip(embeddings) {
+            entries.push((chunk, emb));
         }
 
         Ok(count)
     }
 
     pub fn chunk_count(&self) -> usize {
-        self.entries.len()
+        self.entries.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Get all indexed chunks (for graph building, etc.)
-    pub fn chunks(&self) -> Vec<&CodeChunk> {
-        self.entries.iter().map(|(c, _)| c).collect()
+    /// Snapshot all indexed chunks (for graph building, persistence, etc.).
+    /// Returns owned clones so the caller can use them after the lock is
+    /// released — important for the bridge's "phase 2" graph-rebuild step.
+    pub fn chunks(&self) -> Vec<CodeChunk> {
+        self.entries
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(c, _)| c.clone())
+            .collect()
     }
 
     /// Save the index to a file for persistence across restarts.
     pub fn save_to_file(&self, path: &Path) -> caduceus_core::Result<()> {
-        let data: Vec<SerializedEntry> = self.entries.iter().map(|(chunk, emb)| {
+        let entries = self.entries.read().unwrap_or_else(|e| e.into_inner());
+        let data: Vec<SerializedEntry> = entries.iter().map(|(chunk, emb)| {
             SerializedEntry {
                 chunk: chunk.clone(),
                 embedding: emb.clone(),
             }
         }).collect();
+        drop(entries);
         let json = serde_json::to_vec(&data)?;
         let dir = path.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(dir)?;
@@ -1573,26 +1641,30 @@ impl SemanticIndex {
     }
 
     /// Load a previously saved index from file.
-    pub fn load_from_file(&mut self, path: &Path) -> caduceus_core::Result<usize> {
+    pub fn load_from_file(&self, path: &Path) -> caduceus_core::Result<usize> {
         if !path.exists() {
             return Ok(0);
         }
         let data = std::fs::read(path)?;
         let entries: Vec<SerializedEntry> = serde_json::from_slice(&data)?;
         let count = entries.len();
-        self.entries = entries.into_iter().map(|e| (e.chunk, e.embedding)).collect();
+        let mut guard = self.entries.write().unwrap_or_else(|e| e.into_inner());
+        *guard = entries.into_iter().map(|e| (e.chunk, e.embedding)).collect();
         Ok(count)
     }
 
     /// Check if a file needs re-indexing based on content hash.
     pub fn file_needs_reindex(&self, path: &str, content_hash: &str) -> bool {
-        !self.entries.iter().any(|(chunk, _)| {
-            chunk.file_path == path && chunk.content_hash == content_hash
-        })
+        !self
+            .entries
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|(chunk, _)| chunk.file_path == path && chunk.content_hash == content_hash)
     }
 
     /// Incremental index: only re-embed files whose content has changed.
-    pub async fn index_directory_incremental(&mut self, dir: &Path) -> caduceus_core::Result<usize> {
+    pub async fn index_directory_incremental(&self, dir: &Path) -> caduceus_core::Result<usize> {
         let files = collect_source_files(dir);
         let mut total = 0;
 
@@ -1606,9 +1678,10 @@ impl SemanticIndex {
                         continue; // File unchanged, skip
                     }
 
-                    // Remove old entries for this file
-                    self.entries.retain(|(c, _)| c.file_path != path_str);
-                    total += self.index_content(&path_str, &content).await?;
+                    // Atomic retain+append so concurrent searches never see a
+                    // window where the file's chunks have been evicted but
+                    // new ones are not yet inserted.
+                    total += self.replace_file_content(&path_str, &content).await?;
                 }
                 Err(e) => {
                     tracing::warn!("Skipping {}: {e}", file_path.display());
@@ -2719,7 +2792,7 @@ const handler = async (req: Request) => {
         ).unwrap();
 
         let embedder = Box::new(DummyEmbedder::new(32));
-        let mut index = SemanticIndex::new(embedder);
+        let index = SemanticIndex::new(embedder);
         let count = index.index_directory(&test_dir).await.unwrap();
 
         assert!(count >= 4, "expected >=4 chunks, got {count}");
@@ -2742,7 +2815,7 @@ const handler = async (req: Request) => {
         std::fs::write(&file, "pub fn alpha() {}\n").unwrap();
 
         let embedder = Box::new(DummyEmbedder::new(32));
-        let mut index = SemanticIndex::new(embedder);
+        let index = SemanticIndex::new(embedder);
 
         index.reindex_file(&file).await.unwrap();
         assert_eq!(index.chunk_count(), 1);
@@ -2763,7 +2836,7 @@ const handler = async (req: Request) => {
         std::fs::create_dir_all(&test_dir).unwrap();
 
         let embedder = Box::new(DummyEmbedder::new(32));
-        let mut index = SemanticIndex::new(embedder);
+        let index = SemanticIndex::new(embedder);
         let count = index.index_directory(&test_dir).await.unwrap();
 
         assert_eq!(count, 0);
