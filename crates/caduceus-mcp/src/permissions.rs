@@ -172,10 +172,23 @@ impl PermissionedMcpManager {
     /// filtering. Use this to populate the agent's tool catalogue —
     /// LLMs should never see tools they cannot actually call.
     pub async fn approved_tools(&self) -> Vec<(String, McpToolDef)> {
-        let policies = self.policies.read().await;
+        // Snapshot policies into an owned map so we don't hold the policies
+        // read lock across the inner manager's async calls (which can take
+        // their own locks and do real I/O). Without this, any caller that
+        // updates a policy via `update_policy` would queue behind every
+        // in-flight `approved_tools` until the inner I/O finished
+        // (audit finding #4).
+        let policies_snapshot: HashMap<String, ServerPolicy> = {
+            let policies = self.policies.read().await;
+            policies.clone()
+        };
+        let grouped = self.tools_grouped_by_server().await;
         let mut out = Vec::new();
-        for (server_id, tools) in self.tools_grouped_by_server().await {
-            let policy = policies.get(&server_id).cloned().unwrap_or_default();
+        for (server_id, tools) in grouped {
+            let policy = policies_snapshot
+                .get(&server_id)
+                .cloned()
+                .unwrap_or_default();
             if policy.approval != ServerApproval::Approved {
                 continue;
             }
