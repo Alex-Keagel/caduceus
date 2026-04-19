@@ -151,14 +151,17 @@ impl BackgroundAgentManager {
                 // For the stub, complete after a configurable number of ticks.
                 // Real implementation would drive an AgentHarness here.
                 if ticks >= 50 {
-                    let mut map = agents_ref.write().await;
-                    if let Some(a) = map.get_mut(&agent_id) {
-                        a.status = BackgroundStatus::Completed(format!(
-                            "Task completed after {ticks} ticks"
-                        ));
-                    }
-                    if let Some(ref path) = persist {
-                        let _ = Self::save_to_db(path, &map);
+                    let snapshot = {
+                        let mut map = agents_ref.write().await;
+                        if let Some(a) = map.get_mut(&agent_id) {
+                            a.status = BackgroundStatus::Completed(format!(
+                                "Task completed after {ticks} ticks"
+                            ));
+                        }
+                        persist.as_ref().map(|_| map.clone())
+                    };
+                    if let (Some(ref path), Some(snapshot)) = (&persist, snapshot) {
+                        let _ = Self::save_to_db(path, &snapshot);
                     }
                     return;
                 }
@@ -174,9 +177,13 @@ impl BackgroundAgentManager {
         self.agents.write().await.insert(id.clone(), agent);
         self.handles.write().await.insert(id.clone(), handle);
 
+        // Audit finding round-2 (#31): persistence used to happen while the
+        // agents read lock was held, blocking pause/resume/cancel/list on
+        // the (potentially-slow) sqlite write. Snapshot then drop, then
+        // persist outside the critical section.
         if let Some(ref path) = self.persist_path {
-            let map = self.agents.read().await;
-            let _ = Self::save_to_db(path, &map);
+            let snapshot = self.agents.read().await.clone();
+            let _ = Self::save_to_db(path, &snapshot);
         }
 
         Ok(id)
@@ -198,12 +205,17 @@ impl BackgroundAgentManager {
         // than necessary.
         drop(handles);
 
-        let mut agents = self.agents.write().await;
-        if let Some(a) = agents.get_mut(id) {
-            a.status = BackgroundStatus::Paused;
-        }
-        if let Some(ref path) = self.persist_path {
-            let _ = Self::save_to_db(path, &agents);
+        let snapshot_path = {
+            let mut agents = self.agents.write().await;
+            if let Some(a) = agents.get_mut(id) {
+                a.status = BackgroundStatus::Paused;
+            }
+            self.persist_path
+                .as_ref()
+                .map(|p| (p.clone(), agents.clone()))
+        };
+        if let Some((path, snapshot)) = snapshot_path {
+            let _ = Self::save_to_db(&path, &snapshot);
         }
         Ok(())
     }
@@ -215,24 +227,29 @@ impl BackgroundAgentManager {
     /// the agent is not currently paused.
     pub async fn resume(&self, id: &str) -> Result<(), BackgroundError> {
         // Validate state under the agents write lock first so the status
-        // transition and pause-signal clear are observed together.
-        let mut agents = self.agents.write().await;
-        let agent = agents
-            .get_mut(id)
-            .ok_or_else(|| BackgroundError::NotFound(id.to_string()))?;
-        if agent.status != BackgroundStatus::Paused {
-            return Err(BackgroundError::InvalidState(format!(
-                "Agent {id} is not paused"
-            )));
-        }
-        agent.status = BackgroundStatus::Running;
-        if let Some(ref path) = self.persist_path {
-            let _ = Self::save_to_db(path, &agents);
+        // transition is atomic. Snapshot for persistence, drop the lock,
+        // then persist outside the critical section (audit #31).
+        let snapshot_path = {
+            let mut agents = self.agents.write().await;
+            let agent = agents
+                .get_mut(id)
+                .ok_or_else(|| BackgroundError::NotFound(id.to_string()))?;
+            if agent.status != BackgroundStatus::Paused {
+                return Err(BackgroundError::InvalidState(format!(
+                    "Agent {id} is not paused"
+                )));
+            }
+            agent.status = BackgroundStatus::Running;
+            self.persist_path
+                .as_ref()
+                .map(|p| (p.clone(), agents.clone()))
+        };
+        if let Some((path, snapshot)) = snapshot_path {
+            let _ = Self::save_to_db(&path, &snapshot);
         }
         // Clear the pause signal AFTER status is updated and persisted, so
         // an observer that sees status=Running is guaranteed to see the
         // loop unblocked on its next poll.
-        drop(agents);
         let handles = self.handles.read().await;
         if let Some(h) = handles.get(id) {
             h.pause_signal.store(false, Ordering::Release);
@@ -267,12 +284,17 @@ impl BackgroundAgentManager {
         // locks simultaneously.
         drop(handles);
 
-        let mut agents = self.agents.write().await;
-        if let Some(a) = agents.get_mut(id) {
-            a.status = BackgroundStatus::Cancelled;
-        }
-        if let Some(ref path) = self.persist_path {
-            let _ = Self::save_to_db(path, &agents);
+        let snapshot_path = {
+            let mut agents = self.agents.write().await;
+            if let Some(a) = agents.get_mut(id) {
+                a.status = BackgroundStatus::Cancelled;
+            }
+            self.persist_path
+                .as_ref()
+                .map(|p| (p.clone(), agents.clone()))
+        };
+        if let Some((path, snapshot)) = snapshot_path {
+            let _ = Self::save_to_db(&path, &snapshot);
         }
         Ok(())
     }
