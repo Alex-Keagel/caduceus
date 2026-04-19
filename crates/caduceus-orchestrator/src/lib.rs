@@ -3,6 +3,7 @@ pub mod background;
 pub mod bugbot;
 pub mod compaction;
 pub mod context;
+mod pairing;
 pub mod headless;
 pub mod instructions;
 pub mod kanban;
@@ -470,7 +471,7 @@ impl ConversationHistory {
         if self.messages.len() <= max_messages {
             return;
         }
-        let units = pair_aware_units(&self.messages);
+        let units = crate::pairing::pair_aware_units(&self.messages);
         // Walk units oldest-first; for each non-system unit, drop it while
         // we are still over budget.
         let mut to_drop: Vec<(usize, usize)> = Vec::new();
@@ -508,52 +509,6 @@ impl ConversationHistory {
 }
 
 // ── Context assembler ──────────────────────────────────────────────────────────
-
-/// Computes atomic message units that must never be split across a budget
-/// or truncation boundary. Specifically, an assistant message bearing
-/// `tool_calls` and the following `tool` messages whose `tool_use_id`
-/// matches one of those calls form a single unit. All other messages —
-/// including malformed orphan `tool` messages — are size-1 units.
-///
-/// Returned ranges are `(start, end_exclusive)` over the input slice and
-/// fully partition it (sum of `end - start` over all units equals
-/// `messages.len()`). Orphan tool messages (no preceding assistant with
-/// matching id) are emitted as size-1 units so the caller can decide how
-/// to handle them rather than silently swallowing them into an unrelated
-/// neighboring unit.
-fn pair_aware_units(messages: &[caduceus_providers::Message]) -> Vec<(usize, usize)> {
-    use std::collections::HashSet;
-    let mut units = Vec::new();
-    let mut i = 0;
-    while i < messages.len() {
-        let msg = &messages[i];
-        if msg.role == "assistant" && !msg.tool_calls.is_empty() {
-            let expected_ids: HashSet<&str> = msg
-                .tool_calls
-                .iter()
-                .map(|tc| tc.id.as_str())
-                .collect();
-            let mut j = i + 1;
-            while j < messages.len() && messages[j].role == "tool" {
-                let id = messages[j]
-                    .tool_result
-                    .as_ref()
-                    .and_then(|r| r.tool_use_id.as_deref());
-                if id.is_some_and(|id| expected_ids.contains(id)) {
-                    j += 1;
-                } else {
-                    break;
-                }
-            }
-            units.push((i, j));
-            i = j;
-        } else {
-            units.push((i, i + 1));
-            i += 1;
-        }
-    }
-    units
-}
 
 /// Assembles the full message list for an LLM request within a token budget.
 /// Uses a simple char-based heuristic (1 token ~ 4 chars) to estimate token usage.
@@ -620,7 +575,7 @@ impl ContextAssembler {
         let available = self.max_context_tokens.saturating_mul(3) / 4;
 
         let messages = history.messages();
-        let units = pair_aware_units(messages);
+        let units = crate::pairing::pair_aware_units(messages);
 
         // Walk units newest-first, stop when next unit doesn't fit.
         let mut included_units: Vec<(usize, usize)> = Vec::new();
@@ -2195,7 +2150,7 @@ mod tests {
             tool_result_message("t1", "ok"),
             caduceus_providers::Message::assistant("done"),
         ];
-        let units = pair_aware_units(&messages);
+        let units = crate::pairing::pair_aware_units(&messages);
         assert_eq!(units, vec![(0, 1), (1, 3), (3, 4)]);
     }
 
@@ -2219,7 +2174,7 @@ mod tests {
             tool_result_message("tB", "okB"),
             caduceus_providers::Message::assistant("done"),
         ];
-        let units = pair_aware_units(&messages);
+        let units = crate::pairing::pair_aware_units(&messages);
         assert_eq!(units, vec![(0, 1), (1, 4), (4, 5)]);
     }
 
@@ -2229,7 +2184,7 @@ mod tests {
             tool_result_message("ghost", "??"),
             caduceus_providers::Message::user("hi"),
         ];
-        let units = pair_aware_units(&messages);
+        let units = crate::pairing::pair_aware_units(&messages);
         assert_eq!(units, vec![(0, 1), (1, 2)]);
     }
 
@@ -2239,7 +2194,7 @@ mod tests {
             assistant_with_tool_call("call", "t1", "read"),
             tool_result_message("other", "??"),
         ];
-        let units = pair_aware_units(&messages);
+        let units = crate::pairing::pair_aware_units(&messages);
         assert_eq!(units, vec![(0, 1), (1, 2)]);
     }
 

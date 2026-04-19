@@ -5,11 +5,31 @@ use std::collections::HashSet;
 // ── #191: Atomic Message Groups ───────────────────────────────────────────────
 
 /// Lightweight message representation used throughout the compaction pipeline.
+///
+/// `tool_call_ids` (assistant messages requesting tool calls) and `tool_use_id`
+/// (tool result messages) carry the structured pairing metadata required to
+/// keep an `assistant{tool_calls}` message and its matching `role:tool` results
+/// together as one atomic eviction unit. Without them, content-sniffing alone
+/// (looking for `<tool_call>` / `"tool_use"` substrings) splits the request
+/// from the response when providers serialize tool calls in a structured field
+/// instead of embedding them in `content`. Splitting them produces orphan tool
+/// results that Anthropic and OpenAI both reject.
 #[derive(Debug, Clone)]
 pub struct CompactMessage {
     pub role: String,
     pub content: String,
     pub token_estimate: usize,
+    /// Non-empty for assistant messages that request tool calls. Each entry is
+    /// the `id` of one tool call. Private to enforce the invariant that this
+    /// metadata can only be set via the dedicated constructors
+    /// (`assistant_with_tool_calls`, `tool_result`) or the canonical
+    /// `From<&caduceus_providers::Message>` impl — preventing callers from
+    /// silently de-atomizing a message by direct field assignment.
+    tool_call_ids: Vec<String>,
+    /// `Some` for `role:tool` result messages. Carries the `id` of the
+    /// `assistant.tool_calls[*]` entry this result responds to. Private for
+    /// the same invariant-enforcement reason as `tool_call_ids`.
+    tool_use_id: Option<String>,
 }
 
 impl CompactMessage {
@@ -20,7 +40,119 @@ impl CompactMessage {
             role: role.into(),
             content,
             token_estimate,
+            tool_call_ids: Vec::new(),
+            tool_use_id: None,
         }
+    }
+
+    /// Build an `assistant` message that carries one or more structured tool
+    /// call ids. Use this whenever the upstream provider stores `tool_calls`
+    /// as a structured field rather than embedding markers in `content` — it
+    /// is the only way `build_message_groups` can pair the request with its
+    /// matching `role:tool` results.
+    ///
+    /// # Panics (debug only)
+    ///
+    /// Panics in debug builds if `tool_call_ids` is empty — that combination
+    /// silently degrades to a plain assistant message and is almost always a
+    /// bug at the call site. Use [`CompactMessage::new`] for plain assistant
+    /// content.
+    pub fn assistant_with_tool_calls<I, S>(content: impl Into<String>, tool_call_ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut msg = Self::new("assistant", content);
+        msg.tool_call_ids = tool_call_ids.into_iter().map(Into::into).collect();
+        debug_assert!(
+            !msg.tool_call_ids.is_empty(),
+            "assistant_with_tool_calls requires at least one tool_call_id; \
+             use CompactMessage::new(\"assistant\", ...) for plain assistant messages"
+        );
+        msg
+    }
+
+    /// Build a `role:tool` result message bound to a specific tool call id.
+    pub fn tool_result(content: impl Into<String>, tool_use_id: impl Into<String>) -> Self {
+        let mut msg = Self::new("tool", content);
+        msg.tool_use_id = Some(tool_use_id.into());
+        msg
+    }
+
+    fn is_assistant_tool_request(&self) -> bool {
+        self.role == "assistant" && !self.tool_call_ids.is_empty()
+    }
+
+    fn is_paired_tool_result(&self) -> bool {
+        self.role == "tool" && self.tool_use_id.is_some()
+    }
+
+    /// Read-only access to the structured tool call ids (assistant messages
+    /// that requested one or more tool invocations). Returns an empty slice
+    /// for plain assistant messages.
+    pub fn tool_call_ids(&self) -> &[String] {
+        &self.tool_call_ids
+    }
+
+    /// Read-only access to the structured tool result correlation id (tool
+    /// messages that respond to a specific assistant tool call). Returns
+    /// `None` for non-tool messages.
+    pub fn tool_use_id(&self) -> Option<&str> {
+        self.tool_use_id.as_deref()
+    }
+}
+
+/// Bridge from the canonical provider message type into the compaction
+/// representation. This is the **only** sanctioned path for converting real
+/// upstream history into `CompactMessage`s — going through it guarantees the
+/// structured pairing metadata (`tool_call_ids` for assistant requests,
+/// `tool_use_id` for tool results) is populated, so the atomic-group
+/// machinery in `build_message_groups` can keep tool-call pairs together.
+///
+/// Hand-rolling `CompactMessage::new("assistant", …)` when the source has
+/// `tool_calls` populated will silently bypass the pairing pipeline and
+/// reintroduce the orphan-tool-result bug fixed in `build_message_groups`.
+impl From<&caduceus_providers::Message> for CompactMessage {
+    fn from(msg: &caduceus_providers::Message) -> Self {
+        // Use `content_text()` so messages whose canonical text lives in
+        // `content_blocks` (rather than the legacy `content` field) are
+        // converted faithfully. Falling back to `msg.content` would drop
+        // image-adjacent text and any caller that built the message via
+        // `with_content_blocks`.
+        let mut out = Self::new(msg.role.clone(), msg.content_text());
+        if msg.role == "assistant" && !msg.tool_calls.is_empty() {
+            out.tool_call_ids = msg.tool_calls.iter().map(|tc| tc.id.clone()).collect();
+        }
+        if msg.role == "tool" {
+            out.tool_use_id = msg
+                .tool_result
+                .as_ref()
+                .and_then(|r| r.tool_use_id.clone());
+        }
+        out
+    }
+}
+
+impl From<caduceus_providers::Message> for CompactMessage {
+    fn from(msg: caduceus_providers::Message) -> Self {
+        (&msg).into()
+    }
+}
+
+impl crate::pairing::PairAwareMessage for CompactMessage {
+    fn tool_request_ids(&self) -> Option<Vec<&str>> {
+        if self.is_assistant_tool_request() {
+            Some(self.tool_call_ids.iter().map(String::as_str).collect())
+        } else {
+            None
+        }
+    }
+
+    fn tool_result_id(&self) -> Option<&str> {
+        if self.role != "tool" {
+            return None;
+        }
+        self.tool_use_id.as_deref()
     }
 }
 
@@ -42,6 +174,27 @@ pub struct MessageGroup {
     pub token_count: usize,
     /// When `true`, the group has been logically removed but not yet spliced out.
     pub excluded: bool,
+    /// When `true`, this group is an **atomic unit** whose messages must never
+    /// be separated — not by `build_message_groups`'s same-kind merge pass, and
+    /// not by any [`CompactionStrategy`] that splits, partially modifies,
+    /// summarises, or rewrites individual groups. Currently set for tool-call
+    /// pairs (`assistant` with `tool_call_ids` plus matching `role:tool`
+    /// results).
+    ///
+    /// **Strategy contract:**
+    /// - Strategies that *split or modify* a group's contents (e.g.
+    ///   `ToolCollapseStrategy`, `SummarizeStrategy`, `PatternCompactor`)
+    ///   **must** check [`MessageGroup::is_atomic`] and skip atomic groups —
+    ///   otherwise they produce orphan `role:tool` messages that providers
+    ///   reject with HTTP 400.
+    /// - Strategies that *drop entire groups* (e.g. `SlidingWindowStrategy`,
+    ///   `EmergencyTruncator`) **need not** check, because removing the
+    ///   complete transaction (assistant request + all matching results) is
+    ///   protocol-safe by construction.
+    ///
+    /// Field is private to prevent external code from breaking the invariant;
+    /// use [`MessageGroup::mark_atomic`] to set it.
+    atomic: bool,
 }
 
 impl MessageGroup {
@@ -51,6 +204,7 @@ impl MessageGroup {
             messages: Vec::new(),
             token_count: 0,
             excluded: false,
+            atomic: false,
         }
     }
 
@@ -66,25 +220,62 @@ impl MessageGroup {
     pub fn is_system(&self) -> bool {
         self.kind == MessageGroupKind::System
     }
+
+    /// `true` when this group must be treated as an inseparable unit by every
+    /// [`CompactionStrategy`].
+    pub fn is_atomic(&self) -> bool {
+        self.atomic
+    }
+
+    /// Mark this group as atomic. Strategies must not split, summarise, or
+    /// partially-evict atomic groups.
+    pub fn mark_atomic(&mut self) {
+        self.atomic = true;
+    }
 }
 
 /// Group a flat message list into atomic [`MessageGroup`] units.
 ///
-/// Consecutive messages of the same kind (except System) are coalesced into
-/// one group, which preserves the invariant that system messages are never
-/// merged with conversational content.
+/// Three guarantees:
+///
+/// 1. System messages are never merged with conversational content.
+/// 2. Consecutive messages of the same kind (except System) are coalesced into
+///    one group.
+/// 3. **Tool-pair atomicity:** an `assistant` message with non-empty
+///    `tool_call_ids` plus the immediately-following `role:tool` results whose
+///    `tool_use_id` matches one of those ids are bundled into ONE `ToolCall`
+///    group. Strategies in this module drop entire groups, so the request and
+///    its responses are evicted together or not at all — they cannot be split.
+///    Grouping stops on the first non-tool message OR a `role:tool` whose
+///    `tool_use_id` doesn't match (avoids hopping over orphan/foreign results).
 pub fn build_message_groups(messages: &[CompactMessage]) -> Vec<MessageGroup> {
+    let units = crate::pairing::pair_aware_units(messages);
     let mut groups: Vec<MessageGroup> = Vec::new();
 
-    for msg in messages {
-        let kind = classify_role(&msg.role, &msg.content);
+    for (start, end) in units {
+        let first = &messages[start];
 
-        // System messages are always their own group.
+        // ── Tool-pair atomic absorption ──────────────────────────────────────
+        if first.is_assistant_tool_request() {
+            let mut group = MessageGroup::new(MessageGroupKind::ToolCall);
+            group.mark_atomic();
+            for msg in &messages[start..end] {
+                group.add_message(msg.clone());
+            }
+            groups.push(group);
+            continue;
+        }
+
+        // Non-tool-call units are always size-1.
+        let msg = first;
+
+        // ── Default classification + same-kind merge ─────────────────────────
+        let kind = classify_message(msg);
         let can_merge = !matches!(kind, MessageGroupKind::System);
 
         if can_merge {
             if let Some(last) = groups.last_mut() {
-                if last.kind == kind {
+                if last.kind == kind && !last.is_atomic() {
                     last.add_message(msg.clone());
                     continue;
                 }
@@ -99,13 +290,52 @@ pub fn build_message_groups(messages: &[CompactMessage]) -> Vec<MessageGroup> {
     groups
 }
 
+/// Convenience entrypoint that converts upstream provider messages into
+/// `CompactMessage`s via the canonical `From` impl, then groups them.
+///
+/// Prefer this over hand-rolling `messages.iter().map(...).collect()` followed
+/// by `build_message_groups`: going through this function guarantees the
+/// `tool_call_ids` / `tool_use_id` pairing metadata is populated, so atomic
+/// tool-call groups are formed correctly. Bypassing this path is the same
+/// silent-bypass risk that motivated adding `From<&Message>` in the first
+/// place.
+pub fn build_message_groups_from_provider(
+    messages: &[caduceus_providers::Message],
+) -> Vec<MessageGroup> {
+    let compact: Vec<CompactMessage> = messages.iter().map(CompactMessage::from).collect();
+    build_message_groups(&compact)
+}
+
+fn classify_message(msg: &CompactMessage) -> MessageGroupKind {
+    // NOTE: assistant messages with `tool_call_ids` are handled by the
+    // atomic-absorption path in `build_message_groups` and never reach here;
+    // we still check `is_paired_tool_result` because a structured tool result
+    // (with `tool_use_id` set) that fails to absorb into a previous atomic
+    // group still classifies as ToolCall.
+    debug_assert!(
+        !msg.is_assistant_tool_request(),
+        "classify_message reached for an assistant tool request — \
+         build_message_groups should have absorbed it"
+    );
+    if msg.is_paired_tool_result() {
+        return MessageGroupKind::ToolCall;
+    }
+    classify_role(&msg.role, &msg.content)
+}
+
 fn classify_role(role: &str, content: &str) -> MessageGroupKind {
     match role {
         "system" => MessageGroupKind::System,
         "user" => MessageGroupKind::User,
         "tool" => MessageGroupKind::ToolCall,
         "assistant" => {
-            if content.contains("<tool_call>") || content.contains("\"tool_use\"") {
+            // Legacy backward-compat sniff for callers that haven't migrated
+            // to structured `tool_call_ids`. Restricted to the strict
+            // `<tool_call>` XML marker; the looser `"tool_use"` substring was
+            // removed because it false-positives on plain prose like
+            // `"the tool_use pattern requires…"`.
+            // TODO: deprecate once all producers populate `tool_call_ids`.
+            if content.trim_start().starts_with("<tool_call>") {
                 MessageGroupKind::ToolCall
             } else {
                 MessageGroupKind::AssistantText
@@ -213,9 +443,16 @@ impl CompactionStrategy for ToolCollapseStrategy {
         let mut i = 0;
 
         while i + 1 < groups.len() {
-            if groups[i].kind == MessageGroupKind::ToolCall
+            // Atomic groups (atomic tool-call pairs) are inseparable units; we
+            // must not collapse two adjacent atomic groups into one — that
+            // would silently drop a complete tool transaction. Emergency
+            // truncation handles age-based eviction; this strategy only
+            // collapses *legacy* non-atomic ToolCall groups.
+            let both_collapsible = groups[i].kind == MessageGroupKind::ToolCall
                 && groups[i + 1].kind == MessageGroupKind::ToolCall
-            {
+                && !groups[i].is_atomic()
+                && !groups[i + 1].is_atomic();
+            if both_collapsible {
                 let absorbed = groups.remove(i + 1);
                 removed_tokens += absorbed.token_count;
                 groups_affected += 1;
@@ -246,7 +483,11 @@ impl CompactionStrategy for SummarizeStrategy {
         let non_system_indices: Vec<usize> = groups
             .iter()
             .enumerate()
-            .filter(|(_, g)| !g.is_system())
+            // Atomic tool-call pairs encode a structured request/result
+            // transaction bound by `tool_call_ids` / `tool_use_id`.
+            // Summarising one half breaks the linkage and produces an HTTP
+            // 400 from the provider on the next turn.
+            .filter(|(_, g)| !g.is_system() && !g.is_atomic())
             .map(|(i, _)| i)
             .collect();
 
@@ -301,11 +542,7 @@ impl CompactionStrategy for SummarizeStrategy {
             summary_parts.join("\n")
         );
         let summary_tokens = estimate_compact_tokens(&summary_text);
-        let summary_msg = CompactMessage {
-            role: "system".to_string(),
-            content: summary_text,
-            token_estimate: summary_tokens,
-        };
+        let summary_msg = CompactMessage::new("system", summary_text);
         let mut summary_group = MessageGroup::new(MessageGroupKind::Summary);
         summary_group.add_message(summary_msg);
         groups.insert(insert_pos, summary_group);
@@ -319,6 +556,13 @@ impl CompactionStrategy for SummarizeStrategy {
 }
 
 /// Keeps only the `window_size` most recent non-system groups.
+///
+/// Unlike `ToolCollapseStrategy`, `SummarizeStrategy`, and `PatternCompactor`
+/// — which split or rewrite groups and therefore must skip atomic ones —
+/// this strategy drops groups *as a whole*. An atomic tool-call group goes
+/// out as a single transaction (the assistant request and every matching
+/// `role:tool` result together), so no orphan tool message can survive. No
+/// `is_atomic()` check is needed.
 pub struct SlidingWindowStrategy {
     pub window_size: usize,
 }
@@ -636,7 +880,12 @@ impl CompactionStrategy for PatternCompactor {
 
             let pattern_matches = groups[i].kind == MessageGroupKind::AssistantText
                 && groups[i + 1].kind == MessageGroupKind::ToolCall
-                && groups[i + 2].kind == MessageGroupKind::AssistantText;
+                && groups[i + 2].kind == MessageGroupKind::AssistantText
+                // Atomic tool-call pairs encode structured `tool_call_ids` /
+                // `tool_use_id` linkage. Marking them excluded would surface
+                // the assistant request without its results to the provider,
+                // producing HTTP 400. Skip atomic groups entirely.
+                && !groups[i + 1].is_atomic();
 
             // FIX 3: ensure all three groups in the pattern are outside the
             // retention window, not just the first one.
@@ -671,6 +920,15 @@ impl CompactionStrategy for PatternCompactor {
 
 /// Drops the oldest non-system groups until under the pipeline budget,
 /// always preserving at least `minimum_preserved` recent non-system groups.
+///
+/// **Atomic-group handling:** unlike the upstream three strategies, this pass
+/// intentionally does **not** skip atomic groups. Under emergency pressure
+/// the oldest groups must be removed regardless of kind; dropping a whole
+/// atomic group is still protocol-safe because both the assistant tool-call
+/// request and every matching `role:tool` result are evicted together — no
+/// orphan tool message survives. Skipping atomic groups here would stall
+/// the loop when the context is dominated by tool-call sequences and leave
+/// the request over budget.
 pub struct EmergencyTruncator {
     pub minimum_preserved: usize,
 }
@@ -1353,5 +1611,568 @@ mod tests {
         let t = CompactionTrigger::All(vec![CompactionTrigger::TokensExceed(100)]);
         assert!(!t.should_compact(&stats(100, 0, 0)));
         assert!(t.should_compact(&stats(101, 0, 0)));
+    }
+
+    // ── Tool-pair atomicity (regression for compaction.rs:76 split bug) ──────
+
+    #[test]
+    fn structured_tool_pair_groups_atomically() {
+        // assistant{tool_calls=[a]} + tool{use_id=a} must group together even
+        // though their roles differ.
+        let messages = vec![
+            CompactMessage::assistant_with_tool_calls("calling", ["a"]),
+            CompactMessage::tool_result("result-a", "a"),
+            CompactMessage::new("user", "thanks"),
+        ];
+        let groups = build_message_groups(&messages);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].kind, MessageGroupKind::ToolCall);
+        assert_eq!(groups[0].messages.len(), 2);
+        assert_eq!(groups[0].messages[0].role, "assistant");
+        assert_eq!(groups[0].messages[1].role, "tool");
+        assert_eq!(groups[1].kind, MessageGroupKind::User);
+    }
+
+    #[test]
+    fn parallel_tool_calls_all_results_stay_in_one_group() {
+        let messages = vec![
+            CompactMessage::assistant_with_tool_calls("fan-out", ["a", "b", "c"]),
+            CompactMessage::tool_result("ra", "a"),
+            CompactMessage::tool_result("rb", "b"),
+            CompactMessage::tool_result("rc", "c"),
+        ];
+        let groups = build_message_groups(&messages);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].messages.len(), 4);
+    }
+
+    #[test]
+    fn mismatched_tool_id_breaks_grouping_does_not_hop() {
+        // The "wrong" id must terminate absorption — we must not skip over it
+        // and pick up the matching `b` afterwards.
+        let messages = vec![
+            CompactMessage::assistant_with_tool_calls("calling", ["a", "b"]),
+            CompactMessage::tool_result("ra", "a"),
+            CompactMessage::tool_result("foreign", "wrong"),
+            CompactMessage::tool_result("rb", "b"),
+        ];
+        let groups = build_message_groups(&messages);
+        // First group: assistant + ra (stops at "wrong")
+        assert_eq!(groups[0].kind, MessageGroupKind::ToolCall);
+        assert_eq!(groups[0].messages.len(), 2);
+        // The mismatched + "rb" both have role:tool with use_id, so they
+        // classify as ToolCall and merge by same-kind.
+        assert_eq!(groups[1].kind, MessageGroupKind::ToolCall);
+        assert_eq!(groups[1].messages.len(), 2);
+    }
+
+    #[test]
+    fn tool_result_without_use_id_does_not_join_previous_group() {
+        // Defensive: an orphan tool result (parsed without an id) must not be
+        // absorbed into the previous assistant's atomic group.
+        let messages = vec![
+            CompactMessage::assistant_with_tool_calls("calling", ["a"]),
+            CompactMessage::new("tool", "orphan-no-id"),
+        ];
+        let groups = build_message_groups(&messages);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].messages.len(), 1);
+        assert_eq!(groups[0].messages[0].role, "assistant");
+        assert_eq!(groups[1].kind, MessageGroupKind::ToolCall);
+        assert_eq!(groups[1].messages.len(), 1);
+    }
+
+    #[test]
+    fn assistant_tool_call_without_results_is_safe_singleton() {
+        let messages = vec![CompactMessage::assistant_with_tool_calls("calling", ["a"])];
+        let groups = build_message_groups(&messages);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kind, MessageGroupKind::ToolCall);
+        assert_eq!(groups[0].messages.len(), 1);
+    }
+
+    #[test]
+    fn legacy_content_sniffing_still_classifies_tool_call() {
+        // Backward compat: an old-style message with `<tool_call>` marker but
+        // no structured tool_call_ids must still be classified as ToolCall.
+        let messages = vec![
+            CompactMessage::new("user", "do it"),
+            CompactMessage::new("assistant", "<tool_call>{\"name\":\"x\"}</tool_call>"),
+        ];
+        let groups = build_message_groups(&messages);
+        assert_eq!(groups[1].kind, MessageGroupKind::ToolCall);
+    }
+
+    #[test]
+    fn legacy_tool_use_substring_no_longer_false_positives() {
+        // After the iteration-2 tightening, prose that merely mentions
+        // "tool_use" must classify as AssistantText, not ToolCall.
+        let messages = vec![
+            CompactMessage::new("user", "explain"),
+            CompactMessage::new(
+                "assistant",
+                "The tool_use pattern requires structured payloads.",
+            ),
+        ];
+        let groups = build_message_groups(&messages);
+        assert_eq!(groups[1].kind, MessageGroupKind::AssistantText);
+    }
+
+    #[test]
+    fn structured_metadata_wins_over_content_sniffing() {
+        // An assistant whose content also contains a tool_use marker but with
+        // an explicitly empty tool_call_ids set is still classified by content
+        // (since structured fields are absent). Constructed via `new`, no ids.
+        let messages = vec![CompactMessage::new("assistant", "<tool_call>foo</tool_call>")];
+        let groups = build_message_groups(&messages);
+        assert_eq!(groups[0].kind, MessageGroupKind::ToolCall);
+    }
+
+    #[test]
+    fn sliding_window_does_not_orphan_tool_result() {
+        // 4 atomic units, window=2, so 2 oldest must drop. The pair must
+        // either be fully present or fully absent — never split.
+        let messages = vec![
+            CompactMessage::new("user", "u1"),
+            CompactMessage::assistant_with_tool_calls("call", ["a"]),
+            CompactMessage::tool_result("ra", "a"),
+            CompactMessage::new("user", "u2"),
+            CompactMessage::new("assistant", "reply"),
+            CompactMessage::new("user", "u3"),
+        ];
+        let mut groups = build_message_groups(&messages);
+        let strategy = SlidingWindowStrategy { window_size: 2 };
+        strategy.compact(&mut groups);
+
+        // Every surviving tool result must have its assistant request in the
+        // same group.
+        for g in &groups {
+            let asst_ids: HashSet<&str> = g
+                .messages
+                .iter()
+                .filter(|m| m.role == "assistant")
+                .flat_map(|m| m.tool_call_ids.iter().map(String::as_str))
+                .collect();
+            for m in &g.messages {
+                if let Some(id) = m.tool_use_id.as_deref() {
+                    assert!(
+                        asst_ids.contains(id),
+                        "orphan tool_result with use_id={id} survived sliding window"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emergency_truncator_does_not_orphan_tool_result() {
+        let messages = vec![
+            CompactMessage::new("user", "u1"),
+            CompactMessage::assistant_with_tool_calls("call", ["a"]),
+            CompactMessage::tool_result("ra", "a"),
+            CompactMessage::new("user", "u2"),
+            CompactMessage::new("assistant", "reply"),
+            CompactMessage::new("user", "u3"),
+        ];
+        let mut groups = build_message_groups(&messages);
+        let strategy = EmergencyTruncator {
+            minimum_preserved: 2,
+        };
+        strategy.compact(&mut groups);
+
+        for g in &groups {
+            let asst_ids: HashSet<&str> = g
+                .messages
+                .iter()
+                .filter(|m| m.role == "assistant")
+                .flat_map(|m| m.tool_call_ids.iter().map(String::as_str))
+                .collect();
+            for m in &g.messages {
+                if let Some(id) = m.tool_use_id.as_deref() {
+                    assert!(
+                        asst_ids.contains(id),
+                        "orphan tool_result with use_id={id} survived emergency truncate"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tool_collapse_preserves_both_atomic_pairs() {
+        // Iteration-2 fix: ToolCollapseStrategy must NOT drop atomic
+        // pairs. Two adjacent transactions both survive — emergency
+        // truncation handles age-based eviction, not pair collapse.
+        let messages = vec![
+            CompactMessage::assistant_with_tool_calls("call1", ["a"]),
+            CompactMessage::tool_result("ra", "a"),
+            CompactMessage::assistant_with_tool_calls("call2", ["b"]),
+            CompactMessage::tool_result("rb", "b"),
+        ];
+        let mut groups = build_message_groups(&messages);
+        assert_eq!(groups.len(), 2);
+        assert!(groups[0].is_atomic());
+        assert!(groups[1].is_atomic());
+        let strategy = ToolCollapseStrategy;
+        let result = strategy.compact(&mut groups);
+        assert_eq!(result.groups_affected, 0, "must not collapse atomic pairs");
+        assert_eq!(groups.len(), 2);
+        assert!(groups[0].messages.iter().any(|m| m.role == "assistant"));
+        assert!(groups[1].messages.iter().any(|m| m.role == "assistant"));
+    }
+
+    #[test]
+    fn tool_collapse_still_drops_legacy_non_atomic_tool_groups() {
+        // Backward compat: legacy non-atomic ToolCall groups (built without
+        // structured tool_call_ids) still collapse as before.
+        let messages = vec![
+            CompactMessage::new("assistant", "<tool_call>a</tool_call>"),
+            CompactMessage::new("assistant", "<tool_call>b</tool_call>"),
+        ];
+        // Force two adjacent non-atomic ToolCall groups.
+        let mut groups: Vec<MessageGroup> = messages
+            .into_iter()
+            .map(|m| {
+                let mut g = MessageGroup::new(MessageGroupKind::ToolCall);
+                g.add_message(m);
+                g
+            })
+            .collect();
+        let strategy = ToolCollapseStrategy;
+        strategy.compact(&mut groups);
+        assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn parallel_tool_results_absorbed_regardless_of_order() {
+        // The assistant requests THREE tool calls in one message; results
+        // arrive out of order. All three results plus the request must end
+        // up in a single atomic group.
+        let messages = vec![
+            CompactMessage::new("user", "do three things"),
+            CompactMessage::assistant_with_tool_calls("a1", ["c1", "c2", "c3"]),
+            CompactMessage::tool_result("third", "c3"),
+            CompactMessage::tool_result("first", "c1"),
+            CompactMessage::tool_result("second", "c2"),
+            CompactMessage::new("user", "thanks"),
+        ];
+        let groups = build_message_groups(&messages);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[1].kind, MessageGroupKind::ToolCall);
+        assert!(groups[1].is_atomic());
+        assert_eq!(groups[1].messages.len(), 4);
+        // Final user message must be its own group, not absorbed.
+        assert_eq!(groups[2].kind, MessageGroupKind::User);
+    }
+
+    #[test]
+    fn multi_turn_tool_conversation_groups_correctly() {
+        let messages = vec![
+            CompactMessage::new("user", "u1"),
+            CompactMessage::assistant_with_tool_calls("a1", ["c1"]),
+            CompactMessage::tool_result("r1", "c1"),
+            CompactMessage::new("user", "u2"),
+            CompactMessage::assistant_with_tool_calls("a2", ["c2"]),
+            CompactMessage::tool_result("r2", "c2"),
+            CompactMessage::new("user", "u3"),
+        ];
+        let groups = build_message_groups(&messages);
+        assert_eq!(groups.len(), 5);
+        assert_eq!(groups[0].kind, MessageGroupKind::User);
+        assert_eq!(groups[1].kind, MessageGroupKind::ToolCall);
+        assert!(groups[1].is_atomic());
+        assert_eq!(groups[2].kind, MessageGroupKind::User);
+        assert_eq!(groups[3].kind, MessageGroupKind::ToolCall);
+        assert!(groups[3].is_atomic());
+        assert_eq!(groups[4].kind, MessageGroupKind::User);
+    }
+
+    #[test]
+    fn summarize_strategy_skips_atomic_groups() {
+        let mut messages = vec![
+            CompactMessage::new("user", "u1"),
+            CompactMessage::assistant_with_tool_calls("a1", ["c1"]),
+            CompactMessage::tool_result("r1", "c1"),
+            CompactMessage::new("user", "u2"),
+            CompactMessage::new("assistant", "a2"),
+        ];
+        messages[3].content = "u2 ".repeat(2000);
+        messages[4].content = "a2 ".repeat(2000);
+        let mut groups = build_message_groups(&messages);
+        let original_atomic_msgs: Vec<Vec<(String, String)>> = groups
+            .iter()
+            .filter(|g| g.is_atomic())
+            .map(|g| {
+                g.messages
+                    .iter()
+                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .collect()
+            })
+            .collect();
+        let strategy = SummarizeStrategy { keep_recent: 1 };
+        strategy.compact(&mut groups);
+        let surviving_atomic_msgs: Vec<Vec<(String, String)>> = groups
+            .iter()
+            .filter(|g| g.is_atomic())
+            .map(|g| {
+                g.messages
+                    .iter()
+                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            surviving_atomic_msgs, original_atomic_msgs,
+            "atomic groups must survive summarization byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn pattern_compactor_skips_atomic_middle_group() {
+        let messages = vec![
+            CompactMessage::new("assistant", "before"),
+            CompactMessage::assistant_with_tool_calls("a1", ["c1"]),
+            CompactMessage::tool_result("r1", "c1"),
+            CompactMessage::new("assistant", "after"),
+        ];
+        let mut groups = build_message_groups(&messages);
+        let before_count = groups.len();
+        let compactor = PatternCompactor { retention_window: 0 };
+        compactor.compact(&mut groups);
+        assert_eq!(groups.len(), before_count);
+        assert!(groups.iter().any(|g| g.is_atomic()));
+    }
+
+    #[test]
+    fn from_provider_message_populates_tool_call_ids_for_assistant() {
+        use caduceus_core::ToolUse;
+        let pmsg = caduceus_providers::Message {
+            role: "assistant".into(),
+            content: "calling tools".into(),
+            content_blocks: None,
+            tool_calls: vec![
+                ToolUse {
+                    id: "call_1".into(),
+                    name: "fs_read".into(),
+                    input: serde_json::json!({}),
+                },
+                ToolUse {
+                    id: "call_2".into(),
+                    name: "fs_write".into(),
+                    input: serde_json::json!({}),
+                },
+            ],
+            tool_result: None,
+        };
+        let cm: CompactMessage = (&pmsg).into();
+        assert_eq!(cm.role, "assistant");
+        assert_eq!(cm.tool_call_ids, vec!["call_1", "call_2"]);
+        assert!(cm.tool_use_id.is_none());
+    }
+
+    #[test]
+    fn from_provider_message_populates_tool_use_id_for_tool_result() {
+        use caduceus_core::ToolResult;
+        let pmsg = caduceus_providers::Message {
+            role: "tool".into(),
+            content: "ok".into(),
+            content_blocks: None,
+            tool_calls: vec![],
+            tool_result: Some(ToolResult::success("ok").with_tool_use_id("call_1")),
+        };
+        let cm: CompactMessage = (&pmsg).into();
+        assert_eq!(cm.role, "tool");
+        assert_eq!(cm.tool_use_id.as_deref(), Some("call_1"));
+        assert!(cm.tool_call_ids.is_empty());
+    }
+
+    #[test]
+    fn from_provider_messages_round_trip_through_grouping() {
+        use caduceus_core::{ToolResult, ToolUse};
+        let provider_msgs = vec![
+            caduceus_providers::Message::user("do it"),
+            caduceus_providers::Message {
+                role: "assistant".into(),
+                content: "calling".into(),
+                content_blocks: None,
+                tool_calls: vec![ToolUse {
+                    id: "c1".into(),
+                    name: "fs_read".into(),
+                    input: serde_json::json!({}),
+                }],
+                tool_result: None,
+            },
+            caduceus_providers::Message {
+                role: "tool".into(),
+                content: "result".into(),
+                content_blocks: None,
+                tool_calls: vec![],
+                tool_result: Some(ToolResult::success("result").with_tool_use_id("c1")),
+            },
+        ];
+        let compact: Vec<CompactMessage> = provider_msgs.iter().map(Into::into).collect();
+        let groups = build_message_groups(&compact);
+        assert_eq!(groups.len(), 2, "user + atomic tool-call group");
+        assert_eq!(groups[1].kind, MessageGroupKind::ToolCall);
+        assert!(groups[1].is_atomic());
+        assert_eq!(groups[1].messages.len(), 2);
+    }
+
+    #[test]
+    fn build_message_groups_from_provider_preserves_atomic_pairs() {
+        use caduceus_core::{ToolResult, ToolUse};
+        let provider_msgs = vec![
+            caduceus_providers::Message::user("u"),
+            caduceus_providers::Message {
+                role: "assistant".into(),
+                content: "calling".into(),
+                content_blocks: None,
+                tool_calls: vec![ToolUse {
+                    id: "c1".into(),
+                    name: "fs_read".into(),
+                    input: serde_json::json!({}),
+                }],
+                tool_result: None,
+            },
+            caduceus_providers::Message {
+                role: "tool".into(),
+                content: "r".into(),
+                content_blocks: None,
+                tool_calls: vec![],
+                tool_result: Some(ToolResult::success("r").with_tool_use_id("c1")),
+            },
+        ];
+        let groups = build_message_groups_from_provider(&provider_msgs);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[1].kind, MessageGroupKind::ToolCall);
+        assert!(groups[1].is_atomic());
+    }
+
+    #[test]
+    fn from_provider_message_uses_content_text_for_block_messages() {
+        use caduceus_providers::MessageContentBlock;
+        // Build a user message via with_content_blocks so `content` is
+        // synthesized from blocks; the From impl must read the canonical
+        // text via content_text(), not the legacy `content` field directly.
+        let pmsg = caduceus_providers::Message::user("ignored").with_content_blocks(vec![
+            MessageContentBlock::text("hello "),
+            MessageContentBlock::text("world"),
+        ]);
+        let cm: CompactMessage = (&pmsg).into();
+        assert_eq!(cm.content, "hello world");
+    }
+}
+
+#[cfg(test)]
+mod iter3_tests {
+    use super::*;
+
+    #[test]
+    fn summarize_is_noop_when_all_non_system_are_atomic() {
+        let messages = vec![
+            CompactMessage::new("system", "sys"),
+            CompactMessage::assistant_with_tool_calls("a1", ["c1"]),
+            CompactMessage::tool_result("r1", "c1"),
+            CompactMessage::assistant_with_tool_calls("a2", ["c2"]),
+            CompactMessage::tool_result("r2", "c2"),
+        ];
+        let mut groups = build_message_groups(&messages);
+        let atomic_count = groups.iter().filter(|g| g.is_atomic()).count();
+        assert_eq!(atomic_count, 2);
+        let strategy = SummarizeStrategy { keep_recent: 0 };
+        let result = strategy.compact(&mut groups);
+        assert_eq!(
+            result.groups_affected, 0,
+            "nothing to summarize when all non-system groups are atomic"
+        );
+    }
+
+    #[test]
+    fn sliding_window_drops_atomic_group_as_whole_unit() {
+        let messages = vec![
+            CompactMessage::assistant_with_tool_calls("a1", ["c1", "c2"]),
+            CompactMessage::tool_result("r1", "c1"),
+            CompactMessage::tool_result("r2", "c2"),
+            CompactMessage::new("user", "thanks"),
+        ];
+        let mut groups = build_message_groups(&messages);
+        assert_eq!(groups.len(), 2);
+        assert!(groups[0].is_atomic());
+        assert_eq!(groups[0].messages.len(), 3);
+        let strategy = SlidingWindowStrategy { window_size: 1 };
+        strategy.compact(&mut groups);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kind, MessageGroupKind::User);
+        // No orphan tool result anywhere — atomic group went out as a whole.
+        assert!(groups
+            .iter()
+            .all(|g| g.messages.iter().all(|m| m.role != "tool")));
+    }
+
+    #[test]
+    fn user_interrupting_tool_pair_prevents_absorption() {
+        let messages = vec![
+            CompactMessage::assistant_with_tool_calls("call", ["a"]),
+            CompactMessage::new("user", "wait"),
+            CompactMessage::tool_result("ra", "a"),
+        ];
+        let groups = build_message_groups(&messages);
+        // Assistant alone in its atomic group (no result absorbed because the
+        // user interrupted the immediately-following constraint).
+        assert_eq!(groups[0].kind, MessageGroupKind::ToolCall);
+        assert_eq!(groups[0].messages.len(), 1);
+        assert!(groups[0].is_atomic());
+        assert_eq!(groups[1].kind, MessageGroupKind::User);
+        // Orphan tool result is its own non-atomic ToolCall group.
+        assert_eq!(groups[2].kind, MessageGroupKind::ToolCall);
+        assert!(!groups[2].is_atomic());
+    }
+
+    #[test]
+    fn full_pipeline_preserves_or_drops_atomic_groups_whole() {
+        use caduceus_core::{ToolResult, ToolUse};
+        use std::collections::HashSet;
+        let provider_msgs = vec![
+            caduceus_providers::Message::user("u1"),
+            {
+                let mut m = caduceus_providers::Message::assistant("call");
+                m.tool_calls = vec![ToolUse {
+                    id: "c1".into(),
+                    name: "t".into(),
+                    input: serde_json::json!({}),
+                }];
+                m
+            },
+            caduceus_providers::Message {
+                role: "tool".into(),
+                content: "x".repeat(5000),
+                content_blocks: None,
+                tool_calls: vec![],
+                tool_result: Some(ToolResult::success("x".repeat(5000)).with_tool_use_id("c1")),
+            },
+            caduceus_providers::Message::user("u2"),
+            caduceus_providers::Message::assistant("done"),
+        ];
+        let mut groups = build_message_groups_from_provider(&provider_msgs);
+        assert!(groups.iter().any(|g| g.is_atomic()));
+        let pipeline = CompactionPipeline::default_pipeline(1);
+        pipeline.run(&mut groups);
+        // After aggressive compaction, prove no orphan tool_result survives.
+        for g in &groups {
+            let asst_ids: HashSet<&str> = g
+                .messages
+                .iter()
+                .filter(|m| m.role == "assistant")
+                .flat_map(|m| m.tool_call_ids().iter().map(String::as_str))
+                .collect();
+            for m in &g.messages {
+                if let Some(id) = m.tool_use_id() {
+                    assert!(
+                        asst_ids.contains(id),
+                        "orphan tool_result {id} after full pipeline compaction"
+                    );
+                }
+            }
+        }
     }
 }
