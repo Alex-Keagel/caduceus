@@ -206,6 +206,14 @@ pub enum StopReason {
     ToolUse,
     MaxTokens,
     StopSequence,
+    /// The provider/network failed before a normal stop signal could be
+    /// delivered. Carries no usage information; callers (e.g. emitters)
+    /// use this to bracket the turn so subscribers always see a
+    /// matching TurnComplete after Phase::Working — even on error.
+    /// Round-2 audit finding (#27): without this variant the orchestrator
+    /// could return Err without ever emitting TurnComplete, leaving UI
+    /// listeners hung waiting for a turn-end boundary.
+    Error,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

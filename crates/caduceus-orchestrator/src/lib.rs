@@ -1185,6 +1185,21 @@ impl AgentHarness {
                 Err(e) => {
                     state.phase = SessionPhase::Idle;
                     if let Some(ref em) = self.emitter {
+                        // Round-2 audit (#27): emit TurnComplete with
+                        // StopReason::Error so subscribers always see a
+                        // turn-end boundary, even on provider failure.
+                        // Order matters: TurnComplete -> Phase(Idle) -> Error
+                        // mirrors the happy-path event ordering.
+                        em.emit_turn_complete(
+                            StopReason::Error,
+                            TokenUsage {
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                cache_read_tokens: 0,
+                                cache_write_tokens: 0,
+                            },
+                        )
+                        .await;
                         em.emit_phase_changed(SessionPhase::Idle).await;
                         em.emit_error(&format!("Provider error: {e}")).await;
                     }
@@ -1271,7 +1286,6 @@ impl AgentHarness {
                         final_text = response.content;
                         break;
                     }
-
                     // Store assistant message with tool calls in history
                     let mut assistant_msg =
                         caduceus_providers::Message::assistant(&response.content);
@@ -1438,6 +1452,25 @@ impl AgentHarness {
                         };
                         history.append(tool_msg);
                     }
+                }
+                StopReason::Error => {
+                    // Audit (#27): Error variant exists for the provider-error
+                    // branch above (which already returns Err). Reaching here
+                    // would mean a provider returned StopReason::Error in a
+                    // success Result, which our mappers never do — but match
+                    // exhaustiveness requires a handler. Bail with the same
+                    // semantics: emit TurnComplete (already implicit via the
+                    // earlier emission path was skipped), bubble up.
+                    if let Some(ref em) = self.emitter {
+                        em.emit_turn_complete(
+                            StopReason::Error,
+                            TokenUsage::default(),
+                        )
+                        .await;
+                    }
+                    return Err(CaduceusError::Provider(
+                        "Provider reported StopReason::Error in successful response".into(),
+                    ));
                 }
             }
         }
@@ -3536,6 +3569,51 @@ mod tests {
         assert!(has_tool_start, "missing ToolCallStart event");
         assert!(has_tool_end, "missing ToolResultEnd event");
         assert!(has_turn_complete, "missing TurnComplete event");
+    }
+
+    /// Audit finding (round 2) #27: when the provider fails before producing
+    /// a stop_reason, the harness used to return Err without emitting
+    /// TurnComplete — leaving subscribers waiting on a turn-end boundary
+    /// that would never come. Now Error variant is emitted bracketing the
+    /// turn even on failure.
+    #[tokio::test]
+    async fn provider_error_emits_turn_complete_with_error_stop_reason() {
+        // Empty MockLlmAdapter -> .chat() returns Err on first call.
+        let adapter = Arc::new(MockLlmAdapter::new(vec![]));
+        let dir = tempfile::tempdir().unwrap();
+        let registry = caduceus_tools::ToolRegistry::new();
+        let _ = dir; // keep dir alive
+
+        let (emitter, mut rx) = AgentEventEmitter::channel(64);
+        let harness = AgentHarness::new(adapter, registry, 4096, "system").with_emitter(emitter);
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+
+        let result = harness.run(&mut state, &mut history, "anything").await;
+        assert!(result.is_err(), "empty mock should fail at first chat()");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let turn_complete = events.iter().find_map(|e| match e {
+            AgentEvent::TurnComplete { stop_reason, .. } => Some(stop_reason),
+            _ => None,
+        });
+        assert!(
+            turn_complete.is_some(),
+            "TurnComplete must be emitted on provider error path; got events: {:?}",
+            events
+                .iter()
+                .map(|e| format!("{:?}", std::mem::discriminant(e)))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(turn_complete.unwrap(), caduceus_core::StopReason::Error),
+            "TurnComplete on error path must use StopReason::Error, got {:?}",
+            turn_complete.unwrap()
+        );
     }
 
     #[tokio::test]
