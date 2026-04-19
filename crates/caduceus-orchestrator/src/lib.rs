@@ -902,6 +902,18 @@ impl AgentHarness {
         self
     }
 
+    /// Clear the cancellation flag so a previously-cancelled harness can
+    /// accept new runs. No-op if no token is set. Without this, calling
+    /// `run` again after the user cancelled an earlier turn would trip
+    /// `Cancelled` immediately because `&self` keeps the token across runs
+    /// (audit finding #9). Bridge / shell loop code should call this at
+    /// the start of each new user turn.
+    pub fn reset_cancellation(&self) {
+        if let Some(ref token) = self.cancellation_token {
+            token.reset();
+        }
+    }
+
     pub fn with_effort_level(mut self, level: EffortLevel) -> Self {
         self.effort_level = Some(level);
         self
@@ -2799,6 +2811,45 @@ mod tests {
         let result = harness.run(&mut state, &mut history, "hello").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Cancelled"));
+    }
+
+    /// Audit finding #9: a harness with a previously-cancelled token must
+    /// be reusable after `reset_cancellation`. Without the reset, the
+    /// second `run` would trip Cancelled immediately because the token is
+    /// stored on `&self` and persists across runs.
+    #[tokio::test]
+    async fn harness_reset_cancellation_unblocks_subsequent_runs() {
+        let token = CancellationToken::new();
+
+        let adapter = Arc::new(MockLlmAdapter::new(vec![
+            make_chat_response("first response"),
+            make_chat_response("second response"),
+        ]));
+        let harness = AgentHarness::new(
+            adapter,
+            caduceus_tools::ToolRegistry::new(),
+            4096,
+            "system",
+        )
+        .with_cancellation_token(token.clone());
+
+        // First run cancels mid-flight (simulate by cancelling before start).
+        token.cancel();
+        let mut state = make_session();
+        let mut history = ConversationHistory::new();
+        let r1 = harness.run(&mut state, &mut history, "hi").await;
+        assert!(r1.is_err(), "first run should be cancelled");
+
+        // Without reset, the second run would also fail. Reset, then run.
+        harness.reset_cancellation();
+        assert!(!token.is_cancelled(), "reset must clear the flag");
+
+        let mut history2 = ConversationHistory::new();
+        let r2 = harness.run(&mut state, &mut history2, "hi again").await;
+        assert!(
+            r2.is_ok(),
+            "reset_cancellation must unblock subsequent runs (audit #9): {r2:?}"
+        );
     }
 
     // ── P1: Effort level affects harness ───────────────────────────────────────

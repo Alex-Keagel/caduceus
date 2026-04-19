@@ -967,6 +967,16 @@ impl CancellationToken {
             Ok(())
         }
     }
+
+    /// Clear the cancelled flag so the token can be reused for a fresh run.
+    ///
+    /// Without this, a long-lived `AgentHarness` that gets cancelled once
+    /// would refuse every subsequent `run` (audit finding #9). Callers
+    /// reusing a harness across user requests should reset between runs;
+    /// `AgentHarness::reset_cancellation` automates the bookkeeping.
+    pub fn reset(&self) {
+        self.cancelled.store(false, Ordering::SeqCst);
+    }
 }
 
 impl Default for CancellationToken {
@@ -1702,6 +1712,20 @@ log_level = "debug"
         let clone = token.clone();
         token.cancel();
         assert!(clone.is_cancelled());
+    }
+
+    /// Audit finding #9: reset() must clear the flag on every clone of the
+    /// shared Arc, not just the local handle, so a harness reusing the
+    /// same token across runs actually un-cancels.
+    #[test]
+    fn cancellation_token_reset_clears_flag_on_all_clones() {
+        let token = CancellationToken::new();
+        let clone = token.clone();
+        token.cancel();
+        assert!(clone.is_cancelled());
+        clone.reset();
+        assert!(!token.is_cancelled(), "reset on clone must affect original");
+        assert!(token.check().is_ok());
     }
 
     // ── P1: Token Warning Levels tests ─────────────────────────────────────────
