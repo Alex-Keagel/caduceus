@@ -1645,6 +1645,20 @@ impl SemanticIndex {
         if !path.exists() {
             return Ok(0);
         }
+        // Audit finding round-3 (#r3-sec-3, #r3-sec-9): cap embedding-index
+        // file size to prevent OOM on a malicious or corrupted index.json.
+        // 500 MiB accommodates ~350k Jina-768 embeddings with metadata,
+        // well above any realistic project.
+        const MAX_INDEX_BYTES: u64 = 500 * 1024 * 1024;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > MAX_INDEX_BYTES {
+                return Err(caduceus_core::CaduceusError::Storage(format!(
+                    "embedding index file {} exceeds 500 MiB cap ({} bytes)",
+                    path.display(),
+                    meta.len()
+                )));
+            }
+        }
         let data = std::fs::read(path)?;
         let entries: Vec<SerializedEntry> = serde_json::from_slice(&data)?;
         let count = entries.len();

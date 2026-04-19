@@ -436,13 +436,22 @@ pub struct TokenBudget {
     pub reserved_output: u32,
 }
 
+impl TokenBudget {
+    /// Default reserved-output headroom. Single source of truth shared with
+    /// the storage migration in caduceus-storage (sessions.reserved_output
+    /// DEFAULT). Audit finding round-3 (#r3-st-5).
+    pub const DEFAULT_RESERVED_OUTPUT: u32 = 8_192;
+    /// Default context window assumed when a model isn't recognized.
+    pub const DEFAULT_CONTEXT_LIMIT: u32 = 200_000;
+}
+
 impl Default for TokenBudget {
     fn default() -> Self {
         Self {
-            context_limit: 200_000,
+            context_limit: Self::DEFAULT_CONTEXT_LIMIT,
             used_input: 0,
             used_output: 0,
-            reserved_output: 8_192,
+            reserved_output: Self::DEFAULT_RESERVED_OUTPUT,
         }
     }
 }

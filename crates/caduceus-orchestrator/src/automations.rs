@@ -86,15 +86,30 @@ pub struct AutomationRegistry {
 impl AutomationRegistry {
     /// Open (or create) a registry backed by a JSON file.
     pub fn new(caduceus_dir: impl AsRef<Path>) -> Self {
+        // Audit finding round-3 (#r3-sec-7): cap automations.json read to
+        // prevent OOM if the file is corrupted or maliciously huge. 5 MiB
+        // accommodates ~thousands of automations with comfortable headroom.
+        const MAX_REGISTRY_BYTES: u64 = 5 * 1024 * 1024;
         let persist_path = caduceus_dir.as_ref().join("automations.json");
         let automations = if persist_path.exists() {
-            match std::fs::read_to_string(&persist_path) {
-                Ok(json) => serde_json::from_str::<Vec<Automation>>(&json)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|a| (a.name.clone(), a))
-                    .collect(),
-                Err(_) => HashMap::new(),
+            let too_big = std::fs::metadata(&persist_path)
+                .map(|m| m.len() > MAX_REGISTRY_BYTES)
+                .unwrap_or(false);
+            if too_big {
+                tracing::warn!(
+                    path = %persist_path.display(),
+                    "automations.json exceeds 5 MiB cap, refusing to load"
+                );
+                HashMap::new()
+            } else {
+                match std::fs::read_to_string(&persist_path) {
+                    Ok(json) => serde_json::from_str::<Vec<Automation>>(&json)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|a| (a.name.clone(), a))
+                        .collect(),
+                    Err(_) => HashMap::new(),
+                }
             }
         } else {
             HashMap::new()
@@ -211,9 +226,20 @@ impl AutomationRunner {
     ) -> Result<AutomationResult, AutomationError> {
         let started_at = Utc::now();
         let prompt = Self::prepare_prompt(&automation.agent_config, trigger_event);
+        // Audit finding round-3 (#r3-sec-2): prompts may carry secrets/PII
+        // baked into the template via the trigger event payload. Log only
+        // metadata (length + non-cryptographic hash for log correlation),
+        // never the prompt body.
+        let prompt_fp = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            prompt.hash(&mut h);
+            format!("{:016x}", h.finish())
+        };
         tracing::info!(
             automation = %automation.name,
-            prompt = %prompt,
+            prompt_len = prompt.len(),
+            prompt_fp = %prompt_fp,
             "Running automation"
         );
 
