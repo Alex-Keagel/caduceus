@@ -2769,7 +2769,7 @@ impl AgentMemoryStore {
             .values()
             .filter(|m| m.category.to_lowercase() == cat)
             .collect();
-        result.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        result.sort_by_key(|b| std::cmp::Reverse(b.created_at));
         result
     }
 

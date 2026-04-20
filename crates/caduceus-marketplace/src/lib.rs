@@ -1596,7 +1596,7 @@ impl McpRegistryBrowser {
     /// Top `n` entries sorted by download count (descending).
     pub fn top_downloaded(&self, n: usize) -> Vec<&McpRegistryEntry> {
         let mut sorted: Vec<&McpRegistryEntry> = self.servers.iter().collect();
-        sorted.sort_by(|a, b| b.downloads.cmp(&a.downloads));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.downloads));
         sorted.into_iter().take(n).collect()
     }
 

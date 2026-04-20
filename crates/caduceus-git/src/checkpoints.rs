@@ -189,7 +189,7 @@ impl CheckpointManager {
                 checkpoints.push(checkpoint);
             }
         }
-        checkpoints.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        checkpoints.sort_by_key(|left| left.created_at);
         Ok(checkpoints)
     }
 
@@ -296,8 +296,7 @@ impl CheckpointManager {
     }
 
     fn sort_checkpoints(&mut self) {
-        self.checkpoints
-            .sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        self.checkpoints.sort_by_key(|left| left.created_at);
     }
 }
 

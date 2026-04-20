@@ -465,7 +465,7 @@ impl SecretScanner {
         let mut result = text.to_string();
         // Process findings in reverse order so byte offsets remain valid
         let mut findings = self.scan(text);
-        findings.sort_by(|a, b| b.start.cmp(&a.start));
+        findings.sort_by_key(|b| std::cmp::Reverse(b.start));
         for finding in findings {
             let replacement = format!("[REDACTED:{}]", finding.kind);
             result.replace_range(finding.start..finding.end, &replacement);
@@ -532,7 +532,7 @@ impl PolicyEngine {
     pub fn add_rule(&mut self, rule: PolicyRule) {
         self.rules.push(rule);
         self.rules
-            .sort_by(|left, right| right.priority.cmp(&left.priority));
+            .sort_by_key(|right| std::cmp::Reverse(right.priority));
     }
 
     pub fn evaluate(&self, ctx: &PolicyEvalContext) -> PolicyAction {
@@ -1143,7 +1143,7 @@ impl HookManager {
         phase_entry.hooks.push(entry);
         phase_entry
             .hooks
-            .sort_by(|left, right| right.priority.cmp(&left.priority));
+            .sort_by_key(|right| std::cmp::Reverse(right.priority));
     }
 
     pub fn run_hooks(&self, phase: &str, context: &serde_json::Value) -> Vec<HookResult> {

@@ -153,7 +153,7 @@ impl ProjectScanner {
                 });
             }
         }
-        langs.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+        langs.sort_by_key(|b| std::cmp::Reverse(b.file_count));
         langs
     }
 
