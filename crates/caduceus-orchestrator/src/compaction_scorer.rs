@@ -5,7 +5,9 @@
 //! per-strategy "skill" score using the classical Bradley–Terry
 //! pairwise-comparison model:
 //!
+//! ```text
 //!     P(A beats B) = exp(s_A) / (exp(s_A) + exp(s_B))
+//! ```
 //!
 //! "A beats B" means: in two events with comparable context size,
 //! strategy A had `downstream_re_ask = false` and B had `=
