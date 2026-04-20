@@ -76,7 +76,7 @@ impl Tool for McpToolBridge {
     }
 
     fn kind(&self) -> ToolKind {
-        self.kind.clone()
+        self.kind
     }
 
     fn resource_keys(&self, input: &Value) -> Vec<String> {

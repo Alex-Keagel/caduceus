@@ -1599,7 +1599,7 @@ mod tests {
         let set = loader.load().unwrap();
 
         // CADUCEUS.md and AGENTS.md have the same content — one should be deduped
-        let count = set.system_prompt.matches("Same content.").count();
+        let _count = set.system_prompt.matches("Same content.").count();
         // AGENTS.md is added without dedup check in current impl (different code path),
         // but project_instructions concatenates both. The key is that prompt_parts
         // uses add_content with dedup for CADUCEUS.md path only.
@@ -1816,7 +1816,7 @@ mod tests {
     #[test]
     fn semantic_score_case_insensitive() {
         let msg: Vec<&str> = "CREATE README".split_whitespace().collect();
-        let msg_lower: Vec<&str> = msg
+        let _msg_lower: Vec<&str> = msg
             .iter()
             .map(|w| {
                 // The function lowercases internally, but msg_words are expected lowercase

@@ -91,6 +91,7 @@ async fn e2e_anthropic_simple_chat() {
         tool_choice: None,
         tools: vec![],
         response_format: None,
+        logprobs: None,
     };
 
     let response = provider.chat(request).await.expect("Anthropic chat failed");
@@ -134,6 +135,7 @@ async fn e2e_anthropic_tool_call() {
         tool_choice: None,
         tools,
         response_format: None,
+        logprobs: None,
     };
 
     let response = provider
@@ -212,6 +214,7 @@ async fn e2e_openai_simple_chat() {
         tool_choice: None,
         tools: vec![],
         response_format: None,
+        logprobs: None,
     };
 
     let response = provider.chat(request).await.expect("OpenAI chat failed");
@@ -251,6 +254,7 @@ async fn e2e_openai_tool_call() {
         tool_choice: None,
         tools,
         response_format: None,
+        logprobs: None,
     };
 
     let response = provider
@@ -283,6 +287,7 @@ async fn e2e_copilot_simple_chat() {
         tool_choice: None,
         tools: vec![],
         response_format: None,
+        logprobs: None,
     };
 
     let response = provider.chat(request).await.expect("Copilot chat failed");

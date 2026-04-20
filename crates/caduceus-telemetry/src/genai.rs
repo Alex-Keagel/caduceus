@@ -395,7 +395,6 @@ fn finish_reason_label(stop: &caduceus_core::StopReason) -> &'static str {
         ToolUse => "tool_calls",
         StopSequence => "stop_sequence",
         BudgetExceeded => "budget_exceeded",
-        Cancelled => "cancelled",
         Error => "error",
     }
 }

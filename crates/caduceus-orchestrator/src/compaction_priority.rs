@@ -148,8 +148,7 @@ impl CompactionStrategy for PriorityScoreStrategy {
         // 1. Identify non-system groups; compute end-relative index
         //    and "is_first_user" flags.
         let total = groups.len();
-        let mut non_sys_indices: Vec<usize> =
-            (0..total).filter(|&i| !groups[i].is_system()).collect();
+        let non_sys_indices: Vec<usize> = (0..total).filter(|&i| !groups[i].is_system()).collect();
         if non_sys_indices.is_empty() {
             return CompactionResult {
                 removed_tokens: 0,
@@ -172,6 +171,7 @@ impl CompactionStrategy for PriorityScoreStrategy {
         struct Scored {
             orig_idx: usize,
             tokens: usize,
+            #[allow(dead_code)]
             score: f32,
             efficiency: f32,
             pinned: bool,

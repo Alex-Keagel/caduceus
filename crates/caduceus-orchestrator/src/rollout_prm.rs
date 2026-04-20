@@ -62,7 +62,7 @@ impl RolloutPrmVerifier {
         } else {
             step.tool_calls
                 .iter()
-                .map(|t| render_tool_call(t))
+                .map(render_tool_call)
                 .collect::<Vec<_>>()
                 .join("\n")
         };

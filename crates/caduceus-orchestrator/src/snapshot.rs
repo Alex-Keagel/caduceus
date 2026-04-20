@@ -169,8 +169,8 @@ mod tests {
         sess.turn_count = 3;
         let mut hist = ConversationHistory::new();
         for i in 0..3 {
-            hist.append(Message::user(&format!("turn {i} user")));
-            hist.append(Message::assistant(&format!("turn {i} reply")));
+            hist.append(Message::user(format!("turn {i} user")));
+            hist.append(Message::assistant(format!("turn {i} reply")));
         }
         let snap = Snapshot::capture(&sess, &hist).unwrap();
         let dir = tempdir().unwrap();

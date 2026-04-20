@@ -383,7 +383,6 @@ impl CronScheduler {
             for (_, h) in handles.drain() {
                 h.abort();
             }
-            return;
         }
         // If the lock is contended, we cannot block in Drop without deadlock,
         // so we just abort what we can without holding the lock — the JoinHandles

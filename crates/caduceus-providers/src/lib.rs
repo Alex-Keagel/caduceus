@@ -325,7 +325,7 @@ impl LogprobsSummary {
         let mut min = f32::INFINITY;
         let mut count: u32 = 0;
         for &p in probs {
-            if !p.is_finite() || p < 0.0 || p > 1.0 {
+            if !p.is_finite() || !(0.0..=1.0).contains(&p) {
                 continue;
             }
             sum += p as f64;
@@ -3641,7 +3641,7 @@ mod tests {
     #[test]
     fn openai_chat_parses_logprobs_summary() {
         // logprob = ln(p), so ln(0.9) ≈ -0.10536, ln(0.7) ≈ -0.35667
-        let body = serde_json::json!({
+        let _body = serde_json::json!({
             "choices": [{
                 "message": {"content": "hi"},
                 "finish_reason": "stop",

@@ -22,10 +22,11 @@ use std::collections::HashMap;
 ///
 /// The loop itself is unchanged — verification wraps the loop's final
 /// textual answer. Side-effecting tool calls are NOT replayed N times.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VerificationStrategy {
     /// Default. Fall through with whatever the loop produced.
+    #[default]
     Off,
     /// Self-consistency vote: re-sample the final answer `samples` times
     /// from the same prompt + transcript, return the plurality answer.
@@ -70,12 +71,6 @@ impl VerificationStrategy {
                 (*samples).max(2)
             }
         }
-    }
-}
-
-impl Default for VerificationStrategy {
-    fn default() -> Self {
-        VerificationStrategy::Off
     }
 }
 

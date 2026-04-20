@@ -1914,7 +1914,7 @@ mod tests {
         assert_eq!(rm["resource"]["attributes"][0]["key"], "service.name");
         let metrics = &rm["scopeMetrics"][0]["metrics"];
         assert!(metrics.is_array());
-        assert!(metrics.as_array().unwrap().len() >= 1);
+        assert!(!metrics.as_array().unwrap().is_empty());
     }
 
     #[test]

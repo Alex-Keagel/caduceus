@@ -1359,7 +1359,7 @@ mod tests {
         let sandbox = BashSandbox::new(dir.path());
         // We can't actually classify commands in BashSandbox (it just executes),
         // but we verify that rm -rf / fails or is contained:
-        let result = sandbox
+        let _result = sandbox
             .execute(ExecRequest {
                 command: "rm -rf / --no-preserve-root 2>&1 || true".into(),
                 args: vec![],

@@ -1185,8 +1185,8 @@ fn split_identifier(s: &str) -> Vec<String> {
         for i in 0..chars.len() {
             let ch = chars[i];
             if ch.is_uppercase() && !current.is_empty() {
-                let next_is_lower = chars.get(i + 1).map_or(false, |c| c.is_lowercase());
-                let prev_is_upper = current.chars().last().map_or(false, |c| c.is_uppercase());
+                let next_is_lower = chars.get(i + 1).is_some_and(|c| c.is_lowercase());
+                let prev_is_upper = current.chars().last().is_some_and(|c| c.is_uppercase());
                 // Split at acronym→word boundary (e.g., P in HTTPServer)
                 if next_is_lower && prev_is_upper && current.len() > 1 {
                     let last = current.pop().unwrap();

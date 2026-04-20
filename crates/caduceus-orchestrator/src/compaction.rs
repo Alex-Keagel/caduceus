@@ -2225,7 +2225,7 @@ mod tests {
     #[test]
     fn from_provider_messages_round_trip_through_grouping() {
         use caduceus_core::{ToolResult, ToolUse};
-        let provider_msgs = vec![
+        let provider_msgs = [
             caduceus_providers::Message::user("do it"),
             caduceus_providers::Message {
                 role: "assistant".into(),

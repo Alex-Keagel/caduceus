@@ -51,7 +51,7 @@ pub struct ArchivalSummary {
     pub replaced_entries: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MemoryBlocks {
     pub persona: String,
     pub project_context: String,
@@ -81,18 +81,6 @@ impl Default for BlockLimits {
             project_context_tokens: 8_000,
             working_history_tokens: 32_000,
             archival_summary_tokens: 16_000,
-        }
-    }
-}
-
-impl Default for MemoryBlocks {
-    fn default() -> Self {
-        Self {
-            persona: String::new(),
-            project_context: String::new(),
-            working_history: VecDeque::new(),
-            archival_summary: Vec::new(),
-            limits: BlockLimits::default(),
         }
     }
 }

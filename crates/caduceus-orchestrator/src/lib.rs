@@ -1551,7 +1551,7 @@ impl AgentHarness {
         for m in messages {
             // Coarse token estimate: 4 chars per token (matches
             // memory_blocks own internal heuristic).
-            let tokens = (m.content.len() as u32 + 3) / 4;
+            let tokens = (m.content.len() as u32).div_ceil(4);
             // Pair id: assistant messages with tool_calls use the
             // first tool_call id; the matching tool message carries
             // its `tool_use_id` in tool_result. This keeps the pair
@@ -2841,7 +2841,7 @@ impl AgentHarness {
                             tokens_after: tokens_after_u,
                             messages_before: before,
                             messages_after: after,
-                            turn_index: state.turn_count as u32,
+                            turn_index: state.turn_count,
                             at_secs: now,
                             downstream_re_ask: None,
                         });
@@ -4273,7 +4273,7 @@ mod tests {
         let assembler = ContextAssembler::new(100, "You are helpful.");
         let mut history = ConversationHistory::new();
         for i in 0..50 {
-            history.append(caduceus_providers::Message::user(&format!("message {i}")));
+            history.append(caduceus_providers::Message::user(format!("message {i}")));
         }
         let assembled = assembler.assemble(&history);
         // Should have system message plus whatever fits
@@ -4634,6 +4634,7 @@ mod tests {
     use caduceus_tools::{BashTool, ReadFileTool};
     use std::sync::Arc;
 
+    #[allow(dead_code)]
     fn make_final_stream(text: &str) -> Vec<StreamChunk> {
         vec![StreamChunk {
             delta: text.to_string(),
@@ -7279,7 +7280,7 @@ mod tests {
     #[test]
     fn tail_chars_respects_utf8_boundaries() {
         // 4-byte emoji should never be split.
-        let s = format!("{}", "🚀".repeat(20));
+        let s = "🚀".repeat(20).to_string();
         let t = tail_chars(&s, 10);
         // Every char in the tail must be the rocket emoji intact.
         for c in t.chars() {
@@ -8270,7 +8271,7 @@ mod feature_tests_236_246 {
         let mut tree = TaskTree::new();
         let root = tree.add_task("Root", None);
         let c1 = tree.add_task("C1", Some(root));
-        let c2 = tree.add_task("C2", Some(root));
+        let _c2 = tree.add_task("C2", Some(root));
         let gc = tree.add_task("GC", Some(c1));
         assert_eq!(tree.children(root).len(), 2);
         let sub = tree.subtree(root);

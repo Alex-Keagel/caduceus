@@ -4872,7 +4872,7 @@ mod feature_tests_256_258 {
     fn watcher_snapshot_ignores_untracked_extensions() {
         let dir = tempfile::tempdir().unwrap();
         let w = WikiWatcher::new();
-        std::fs::write(dir.path().join("image.png"), &[0u8, 1, 2]).unwrap();
+        std::fs::write(dir.path().join("image.png"), [0u8, 1, 2]).unwrap();
         let snap = w.snapshot_project(dir.path());
         assert!(snap.is_empty());
     }
@@ -5209,7 +5209,7 @@ mod feature_tests_256_258 {
         let mut trigger = WikiAutoTrigger::new();
         // No initial snapshot set — previous_hashes is empty → file looks new
         let report = trigger.force_maintenance(dir.path()).unwrap();
-        assert!(report.pages_created > 0 || report.pages_updated >= 0);
+        assert!(report.pages_created > 0);
     }
 
     #[test]

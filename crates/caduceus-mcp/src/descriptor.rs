@@ -27,7 +27,7 @@ pub struct SanitiseConfig {
     pub max_name_bytes: usize,
     /// Max bytes for `description`. 4 KiB is enough for "what this does
     /// + when to use it"; anything longer is almost always padded
-    /// instructions to the model.
+    ///   instructions to the model.
     pub max_description_bytes: usize,
     /// Max bytes for the serialised `inputSchema`. Schemas this large
     /// usually hide nested `description` fields stuffed with prose.

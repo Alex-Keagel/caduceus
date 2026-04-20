@@ -224,8 +224,10 @@ impl TranscriptStore {
 }
 
 /// Extract a short list of "key points" from a transcript:
+///
 ///   * the first markdown heading we find,
 ///   * any line starting with `KEY:` (case-insensitive).
+///
 /// Caps at 30 lines / 1000 chars total to keep the folded payload
 /// small.
 fn extract_key_points(text: &str) -> Vec<String> {

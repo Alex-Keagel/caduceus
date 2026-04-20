@@ -32,18 +32,13 @@ use crate::types::{McpServerConfig, McpToolDef};
 
 /// Per-server approval state. `Pending` is the safe default — a
 /// not-yet-approved server cannot be invoked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerApproval {
+    #[default]
     Pending,
     Approved,
     Denied,
-}
-
-impl Default for ServerApproval {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 /// What tools may be invoked on an approved server.

@@ -114,7 +114,7 @@ pub const PATH_LIKE_FIELDS: &[&str] = &[
 /// Returns `true` if a given JSON field name is treated as path-shaped
 /// for normalisation purposes.
 pub fn is_path_like_field(name: &str) -> bool {
-    PATH_LIKE_FIELDS.iter().any(|&p| p == name)
+    PATH_LIKE_FIELDS.contains(&name)
 }
 
 #[cfg(test)]

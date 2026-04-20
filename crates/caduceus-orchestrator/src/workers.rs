@@ -534,6 +534,7 @@ impl ApprovalListCritiqueGateway {
     }
 
     /// Convenience: build from any iterator of `Into<String>`.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_iter<I, S>(iter: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -598,9 +599,10 @@ pub struct Coordinator {
 /// Inspired by Du & Mordatch's Multi-Agent Debate (2024) and Reflexion
 /// (Shinn et al., 2023). Trades one extra LLM call for substantially
 /// higher faithfulness when leaves diverge.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum MergeStrategy {
     /// Single-pass synthesis (existing behaviour). No conflict tracking.
+    #[default]
     Concatenate,
     /// Two-pass: critic LLM first emits {merged, conflicts}, then the
     /// coordinator's `synthesise()` returns that merged answer with
@@ -620,12 +622,6 @@ pub enum MergeStrategy {
         /// new callers should set `Some(0.3)` as a reasonable default.
         critic_temperature: Option<f32>,
     },
-}
-
-impl Default for MergeStrategy {
-    fn default() -> Self {
-        MergeStrategy::Concatenate
-    }
 }
 
 /// Result of a critic pass over leaf outputs.
@@ -957,6 +953,7 @@ impl Coordinator {
     /// Uses `try_send` so the coordinator never blocks on UI buffer
     /// pressure; a dropped event is acceptable here since the same
     /// information lands in tracing.
+    #[allow(clippy::too_many_arguments)]
     async fn emit_critique_event(
         &self,
         critic_model: &ModelId,
@@ -1057,7 +1054,7 @@ async fn run_task(
         } else {
             available_tools
                 .iter()
-                .filter(|spec| cfg.tools.iter().any(|t| spec.name == *t))
+                .filter(|spec| cfg.tools.contains(&spec.name))
                 .cloned()
                 .collect()
         }

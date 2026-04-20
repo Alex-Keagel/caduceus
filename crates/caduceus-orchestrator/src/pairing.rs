@@ -31,7 +31,7 @@ pub(crate) fn pair_aware_units<M: PairAwareMessage>(messages: &[M]) -> Vec<(usiz
             let mut j = i + 1;
             while j < messages.len() {
                 match messages[j].tool_result_id() {
-                    Some(id) if expected_ids.iter().any(|expected| *expected == id) => j += 1,
+                    Some(id) if expected_ids.contains(&id) => j += 1,
                     _ => break,
                 }
             }

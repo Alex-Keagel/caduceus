@@ -880,7 +880,7 @@ mod tests {
         let tokens = estimate_tokens("hello world");
         assert!(tokens > 0);
         // 11 chars / 3.75 * 1.1 ≈ 3.23 → 4
-        assert!(tokens >= 3 && tokens <= 5, "got {tokens}");
+        assert!((3..=5).contains(&tokens), "got {tokens}");
     }
 
     #[test]

@@ -465,23 +465,24 @@ impl PermissionOutcome {
     }
 }
 
-/// Wire-protocol contract for `AgentEvent`:
-///
-/// `AgentEvent` uses internally-tagged serde (`#[serde(tag = "type")]`).
-/// As of G33 the enum carries a `#[serde(other)]`-marked `Unknown` unit
-/// variant, so any `type` tag a reader doesn't recognise deserialises
-/// to `Unknown` instead of failing — this gives us forward-compatible
-/// rolling deploys (newer producer / older consumer) without breaking
-/// the IPC stream. Same treatment applies to [`PermissionOutcome`].
-///
-/// Producers MUST NOT use the literal tag `"unknown"` for any new
-/// variant; doing so would short-circuit the catch-all on every reader
-/// and silently drop the new variant's fields.
-///
-/// New variants on the producer side should still be paired with a
-/// wire-format roundtrip test (see `permission_decision_wire_format`)
-/// so we don't accidentally break the *backwards* direction (newer
-/// reader, older producer).
+// Wire-protocol contract for `AgentEvent`:
+//
+// `AgentEvent` uses internally-tagged serde (`#[serde(tag = "type")]`).
+// As of G33 the enum carries a `#[serde(other)]`-marked `Unknown` unit
+// variant, so any `type` tag a reader doesn't recognise deserialises
+// to `Unknown` instead of failing — this gives us forward-compatible
+// rolling deploys (newer producer / older consumer) without breaking
+// the IPC stream. Same treatment applies to [`PermissionOutcome`].
+//
+// Producers MUST NOT use the literal tag `"unknown"` for any new
+// variant; doing so would short-circuit the catch-all on every reader
+// and silently drop the new variant's fields.
+//
+// New variants on the producer side should still be paired with a
+// wire-format roundtrip test (see `permission_decision_wire_format`)
+// so we don't accidentally break the *backwards* direction (newer
+// reader, older producer).
+// --- G33 envelope ---
 
 /// G33 — wire envelope wrapping an `AgentEvent` with an explicit
 /// schema version. Use `VersionedAgentEvent` whenever events are
@@ -1241,7 +1242,7 @@ impl TokenBudget {
 /// Defaults to [`ToolKind::Destructive`] under serde so an older
 /// persisted spec (or a tool that forgot to set this) is treated as
 /// the most dangerous case — fail safe, never fail open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolKind {
     /// Pure read; never mutates state on the local machine, the
@@ -1257,13 +1258,8 @@ pub enum ToolKind {
     /// against everything else in the same batch — a destructive
     /// task in a batch downgrades the whole batch to sequential
     /// execution.
+    #[default]
     Destructive,
-}
-
-impl Default for ToolKind {
-    fn default() -> Self {
-        Self::Destructive
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
