@@ -15,3 +15,8 @@ anyhow = { workspace = true }
 toml = "0.8"
 dirs = "5"
 tracing = { workspace = true }
+static_assertions = "1.1"
+futures = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -872,7 +872,7 @@ pub struct TokenBudget {
 | IMP-015 | `caduceus-audit::trace` + `caduceus-audit::costs`: usage events, token snapshots, daily rollups, secret scrubbing | IMP-002, IMP-004, IMP-006, IMP-013 | Model/tool events emit durable traces; token/cost rollups populate correctly; secrets are not logged | M |
 | IMP-016 | `caduceus-runtime::sandbox`: E2B sandbox lifecycle + secure token handling | IMP-001, IMP-003 | Create/connect/kill/health succeed against E2B; secure token is required on follow-up calls | L |
 | IMP-017 | `caduceus-runtime::process` + `caduceus-runtime::fs`: command execution, background jobs, file CRUD, watch | IMP-016 | Shell commands, background handles, file read/write/list/watch all work in sandbox mode | L |
-| IMP-018 | `caduceus-pty`: PTY create/send/resize/kill + silence detection | IMP-016, IMP-017 | PTY streams correctly, resizes, and transitions to idle after silence timeout | M |
+| IMP-018 | `caduceus-pty`: PTY create/send/resize/kill + silence detection | IMP-016, IMP-017 | PTY streams correctly, resizes, and tranyes sitions to idle after silence timeout | M |
 | IMP-019 | `caduceus-app`: Tauri shell + IPC registration | IMP-001, IMP-002 | App boots; core IPC endpoints are invokable from frontend | M |
 | IMP-020 | `caduceus-session`: Hermes session manager and lifecycle transitions | IMP-009, IMP-018, IMP-019 | Sessions move through Hermes states correctly for local and PTY-backed flows | M |
 | IMP-021 | `caduceus-scan`: workspace/project cartography, framework/language/convention detection | IMP-002, IMP-020 | Scanner identifies repo roots, languages, frameworks, and stores normalized project metadata | M |

@@ -1,27 +1,22 @@
 [package]
-name = "caduceus-providers"
+name = "caduceus-eval"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 caduceus-core = { path = "../caduceus-core" }
+caduceus-providers = { path = "../caduceus-providers" }
+caduceus-orchestrator = { path = "../caduceus-orchestrator" }
+caduceus-tools = { path = "../caduceus-tools" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
 async-trait = { workspace = true }
-reqwest = { version = "0.12", features = ["json", "stream"] }
-futures = "0.3"
-eventsource-stream = "0.2"
-rand = "0.8"
-hmac = "0.12"
-sha2 = "0.10"
-hex = "0.4"
 chrono = { workspace = true }
-url = "2"
+tracing = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"

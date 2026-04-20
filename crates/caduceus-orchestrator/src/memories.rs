@@ -423,6 +423,7 @@ mod tests {
             content_blocks: None,
             tool_calls: Vec::new(),
             tool_result: None,
+            cache_breakpoint: false,
         }
     }
 

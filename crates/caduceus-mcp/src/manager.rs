@@ -1,4 +1,7 @@
 use crate::client::McpClient;
+use crate::descriptor::{
+    DescriptorChange, DescriptorIssue, DescriptorSanitiser, DescriptorSnapshot, IssueSeverity,
+};
 use crate::error::{McpError, Result};
 use crate::types::{McpServerConfig, McpToolDef, ServerStatus};
 use serde_json::Value;
@@ -11,8 +14,18 @@ use tracing::{error, info, instrument, warn};
 
 struct ServerEntry {
     client: McpClient,
-    /// Cached tool list (populated after connect).
+    /// Cached tool list (populated after connect, post-sanitise).
     tools: Vec<McpToolDef>,
+    /// Snapshot of tool fingerprints from the *previous* successful
+    /// `list_tools`. Used to detect silent server-side mutation
+    /// across reconnects / health-check refreshes (gap G18.b).
+    /// `None` until the first successful list.
+    last_snapshot: Option<DescriptorSnapshot>,
+    /// Issues raised by the descriptor sanitiser on the most recent
+    /// `list_tools`. Useful for UI surfacing and tests.
+    last_issues: Vec<DescriptorIssue>,
+    /// Drift events from the most recent diff (for telemetry / UI).
+    last_drift: Vec<DescriptorChange>,
 }
 
 /// Shared, per-server lock. Held while talking to that one server's stdio
@@ -30,15 +43,93 @@ type ServerHandle = Arc<Mutex<ServerEntry>>;
 /// (insert/remove/snapshot of `Arc` handles); per-server I/O happens under
 /// each server's own `Mutex`, so a slow or hung MCP process can never
 /// block calls targeting other servers (fix for audit finding #3).
+///
+/// **Descriptor safety (G18)**: every successful `list_tools` is run
+/// through [`DescriptorSanitiser`] before the tools are exposed. Any
+/// descriptor with a `Reject`-severity issue is dropped from the cache;
+/// warnings are logged. The previous snapshot is retained so the next
+/// refresh can detect added / removed / mutated descriptors and surface
+/// them via [`McpServerManager::drift_for`].
 pub struct McpServerManager {
     servers: Arc<RwLock<HashMap<String, ServerHandle>>>,
+    sanitiser: Arc<DescriptorSanitiser>,
 }
 
 impl McpServerManager {
     pub fn new() -> Self {
         Self {
             servers: Arc::new(RwLock::new(HashMap::new())),
+            sanitiser: Arc::new(DescriptorSanitiser::with_defaults()),
         }
+    }
+
+    /// Construct with a custom descriptor sanitiser configuration.
+    pub fn with_sanitiser(sanitiser: DescriptorSanitiser) -> Self {
+        Self {
+            servers: Arc::new(RwLock::new(HashMap::new())),
+            sanitiser: Arc::new(sanitiser),
+        }
+    }
+
+    /// Sanitise + diff a freshly-fetched tool list against the prior
+    /// snapshot stored in the entry, mutating the entry's `tools`,
+    /// `last_snapshot`, `last_issues`, and `last_drift` fields. Logs
+    /// warnings and rejections via tracing. Returns the post-filter
+    /// tool count for caller-side telemetry.
+    fn apply_tool_refresh(
+        &self,
+        server_id: &str,
+        entry: &mut ServerEntry,
+        fresh: Vec<McpToolDef>,
+    ) -> usize {
+        let (accepted, issues) = self.sanitiser.filter(fresh);
+        for issue in &issues {
+            match issue.severity {
+                IssueSeverity::Reject => {
+                    warn!(
+                        target: "caduceus.mcp.descriptor",
+                        server = %server_id,
+                        tool = %issue.tool_name,
+                        kind = ?issue.kind,
+                        "rejecting MCP descriptor: {}",
+                        issue.detail
+                    );
+                }
+                IssueSeverity::Warn => {
+                    info!(
+                        target: "caduceus.mcp.descriptor",
+                        server = %server_id,
+                        tool = %issue.tool_name,
+                        kind = ?issue.kind,
+                        "MCP descriptor warning: {}",
+                        issue.detail
+                    );
+                }
+            }
+        }
+
+        let next_snapshot = DescriptorSnapshot::from_tools(&accepted);
+        let drift = match entry.last_snapshot.as_ref() {
+            Some(prev) => {
+                let d = prev.diff(&next_snapshot);
+                for change in &d {
+                    warn!(
+                        target: "caduceus.mcp.descriptor",
+                        server = %server_id,
+                        change = ?change,
+                        "MCP descriptor drift detected since last refresh"
+                    );
+                }
+                d
+            }
+            None => Vec::new(),
+        };
+
+        entry.tools = accepted;
+        entry.last_snapshot = Some(next_snapshot);
+        entry.last_issues = issues;
+        entry.last_drift = drift;
+        entry.tools.len()
     }
 
     /// Snapshot the current `(id, handle)` pairs without holding the outer
@@ -59,21 +150,38 @@ impl McpServerManager {
         let id = config.id.clone();
         let mut client = McpClient::new(config);
 
-        let tools = if connect {
+        let fresh_tools = if connect {
             info!("Connecting to MCP server '{}'", id);
             match client.connect().await {
                 Ok(()) => match client.list_tools().await {
                     Ok(t) => {
-                        info!("Server '{}' ready — {} tools", id, t.len());
+                        info!(
+                            target: "caduceus.mcp",
+                            "Server '{}' raw tool count: {}",
+                            id,
+                            t.len()
+                        );
                         t
                     }
                     Err(e) => {
-                        warn!("Could not list tools for '{}': {}", id, e);
+                        warn!(
+                            target: "caduceus.mcp.error",
+                            kind = e.kind().label(),
+                            server = %id,
+                            error = %e,
+                            "could not list tools after connect"
+                        );
                         vec![]
                     }
                 },
                 Err(e) => {
-                    error!("Failed to connect to '{}': {}", id, e);
+                    error!(
+                        target: "caduceus.mcp.error",
+                        kind = e.kind().label(),
+                        server = %id,
+                        error = %e,
+                        "failed to connect to MCP server"
+                    );
                     client.status = ServerStatus::Error;
                     vec![]
                 }
@@ -82,9 +190,26 @@ impl McpServerManager {
             vec![]
         };
 
+        let mut entry = ServerEntry {
+            client,
+            tools: Vec::new(),
+            last_snapshot: None,
+            last_issues: Vec::new(),
+            last_drift: Vec::new(),
+        };
+        if connect {
+            let final_count = self.apply_tool_refresh(&id, &mut entry, fresh_tools);
+            info!(
+                "Server '{}' ready — {} tools after sanitiser",
+                id, final_count
+            );
+        }
+        // When connect=false, leave last_snapshot=None so the first
+        // real refresh later doesn't synthesise spurious drift events.
+
         // Outer write lock held only for the map insert — no I/O underneath.
         let mut servers = self.servers.write().await;
-        servers.insert(id, Arc::new(Mutex::new(ServerEntry { client, tools })));
+        servers.insert(id, Arc::new(Mutex::new(entry)));
         Ok(())
     }
 
@@ -123,13 +248,27 @@ impl McpServerManager {
                 continue;
             }
             if let Err(e) = entry.client.connect().await {
-                error!("Failed to start '{}': {}", id, e);
+                error!(
+                    target: "caduceus.mcp.error",
+                    kind = e.kind().label(),
+                    server = %id,
+                    error = %e,
+                    "failed to start MCP server"
+                );
                 entry.client.status = ServerStatus::Error;
                 continue;
             }
             match entry.client.list_tools().await {
-                Ok(t) => entry.tools = t,
-                Err(e) => warn!("Could not list tools for '{}': {}", id, e),
+                Ok(t) => {
+                    self.apply_tool_refresh(&id, &mut entry, t);
+                }
+                Err(e) => warn!(
+                    target: "caduceus.mcp.error",
+                    kind = e.kind().label(),
+                    server = %id,
+                    error = %e,
+                    "could not list tools after start_all connect"
+                ),
             }
         }
         Ok(())
@@ -190,9 +329,17 @@ impl McpServerManager {
             if entry.client.is_running() {
                 // Refresh tool list as a lightweight ping.
                 match entry.client.list_tools().await {
-                    Ok(t) => entry.tools = t,
+                    Ok(t) => {
+                        self.apply_tool_refresh(&id, &mut entry, t);
+                    }
                     Err(e) => {
-                        warn!("Health check failed for '{}': {}", id, e);
+                        warn!(
+                            target: "caduceus.mcp.error",
+                            kind = e.kind().label(),
+                            server = %id,
+                            error = %e,
+                            "health check failed"
+                        );
                         entry.client.status = ServerStatus::Degraded;
                     }
                 }
@@ -225,6 +372,33 @@ impl McpServerManager {
         }
         out
     }
+
+    /// Sanitiser issues raised on `server_id`'s most recent tool refresh.
+    /// Returns `None` if the server is unknown. (G18 diagnostic surface.)
+    pub async fn issues_for(&self, server_id: &str) -> Option<Vec<DescriptorIssue>> {
+        let handles = self.snapshot_handles().await;
+        for (id, handle) in handles {
+            if id == server_id {
+                let entry = handle.lock().await;
+                return Some(entry.last_issues.clone());
+            }
+        }
+        None
+    }
+
+    /// Drift events recorded on `server_id`'s most recent refresh
+    /// (added / removed / mutated tools since the previous snapshot).
+    /// Empty vec ≠ stale: it means "no drift on the last refresh".
+    pub async fn drift_for(&self, server_id: &str) -> Option<Vec<DescriptorChange>> {
+        let handles = self.snapshot_handles().await;
+        for (id, handle) in handles {
+            if id == server_id {
+                let entry = handle.lock().await;
+                return Some(entry.last_drift.clone());
+            }
+        }
+        None
+    }
 }
 
 impl Default for McpServerManager {
@@ -251,7 +425,7 @@ mod tests {
                 args: vec![],
                 env: HashMap::new(),
             },
-            auto_start: false,
+            auto_start: false, trust_tier: crate::types::TrustTier::Trusted,
         }
     }
 
@@ -304,6 +478,114 @@ mod tests {
         mgr.add_server(dummy_config("srv4"), false).await.unwrap();
         mgr.add_server(dummy_config("srv5"), false).await.unwrap();
         mgr.shutdown_all().await; // should not panic
+    }
+
+    // ── G18 wiring tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn descriptor_diagnostics_present_for_added_server() {
+        // add_server with connect=false runs apply_tool_refresh on an
+        // empty list, so issues_for / drift_for return Some(empty)
+        // — distinguishes "server known, no issues" from "unknown".
+        let mgr = McpServerManager::new();
+        mgr.add_server(dummy_config("vetme"), false).await.unwrap();
+
+        let issues = mgr.issues_for("vetme").await;
+        assert!(issues.is_some());
+        assert!(issues.unwrap().is_empty());
+
+        let drift = mgr.drift_for("vetme").await;
+        assert!(drift.is_some());
+        assert!(drift.unwrap().is_empty());
+
+        // Unknown server returns None (not Some(empty)).
+        assert!(mgr.issues_for("unknown").await.is_none());
+        assert!(mgr.drift_for("unknown").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_tool_refresh_rejects_poisoned_descriptors() {
+        use crate::types::McpToolDef;
+        use serde_json::json;
+
+        let mgr = McpServerManager::new();
+        mgr.add_server(dummy_config("poison"), false).await.unwrap();
+
+        // Reach into the entry via the same path as production refresh
+        // would: snapshot the handle, lock it, call apply_tool_refresh.
+        let handle = {
+            let servers = mgr.servers.read().await;
+            Arc::clone(servers.get("poison").expect("registered"))
+        };
+        let mut entry = handle.lock().await;
+
+        let poisoned = vec![
+            McpToolDef {
+                name: "good_tool".into(),
+                description: "Reads a file.".into(),
+                input_schema: json!({"type": "object"}),
+            },
+            McpToolDef {
+                name: "evil".into(),
+                description: "Does X. <script>steal()</script>".into(),
+                input_schema: json!({"type": "object"}),
+            },
+        ];
+        let kept = mgr.apply_tool_refresh("poison", &mut entry, poisoned);
+        assert_eq!(kept, 1, "evil tool must be rejected");
+        assert_eq!(entry.tools.len(), 1);
+        assert_eq!(entry.tools[0].name, "good_tool");
+        assert!(entry
+            .last_issues
+            .iter()
+            .any(|i| i.tool_name == "evil" && i.severity == IssueSeverity::Reject));
+    }
+
+    #[tokio::test]
+    async fn apply_tool_refresh_records_drift_on_second_call() {
+        use crate::types::McpToolDef;
+        use serde_json::json;
+
+        let mgr = McpServerManager::new();
+        mgr.add_server(dummy_config("drift"), false).await.unwrap();
+
+        let handle = {
+            let servers = mgr.servers.read().await;
+            Arc::clone(servers.get("drift").expect("registered"))
+        };
+        let mut entry = handle.lock().await;
+
+        let v1 = vec![McpToolDef {
+            name: "read".into(),
+            description: "v1".into(),
+            input_schema: json!({}),
+        }];
+        mgr.apply_tool_refresh("drift", &mut entry, v1);
+        assert!(entry.last_drift.is_empty(), "no drift on first refresh");
+
+        let v2 = vec![
+            McpToolDef {
+                name: "read".into(),
+                description: "v2 — silently changed".into(),
+                input_schema: json!({}),
+            },
+            McpToolDef {
+                name: "write".into(),
+                description: "newly added".into(),
+                input_schema: json!({}),
+            },
+        ];
+        mgr.apply_tool_refresh("drift", &mut entry, v2);
+        // Two changes: read mutated, write added.
+        assert_eq!(entry.last_drift.len(), 2);
+        assert!(entry.last_drift.iter().any(|c| matches!(
+            c,
+            crate::descriptor::DescriptorChange::Mutated { tool_name, .. } if tool_name == "read"
+        )));
+        assert!(entry.last_drift.iter().any(|c| matches!(
+            c,
+            crate::descriptor::DescriptorChange::Added { tool_name } if tool_name == "write"
+        )));
     }
 
     // ── Additional manager tests ─────────────────────────────────────────

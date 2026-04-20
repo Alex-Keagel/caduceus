@@ -7,7 +7,7 @@
 //! - `Coordinator`: decomposes a goal, runs the DAG, synthesises a final result
 //! - `Team` / `run_team`: top-level entry point
 
-use caduceus_core::{ModelId, ProviderId, TokenUsage};
+use caduceus_core::{AgentEvent, ModelId, ProviderId, TokenUsage};
 use caduceus_providers::{ChatRequest, LlmAdapter, Message};
 use std::{
     cell::{Cell, RefCell},
@@ -18,7 +18,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 // ── AgentConfig ────────────────────────────────────────────────────────────────
 
@@ -270,35 +270,194 @@ impl TaskDAG {
 
 // ── SharedContext ──────────────────────────────────────────────────────────────
 
-/// Append-only, thread-safe store mapping task IDs → task output strings.
+/// A `(branch, key)` pair identifying one slot in a [`SharedContext`].
+/// Branches isolate parallel coordinator runs (e.g. an A/B verification
+/// rollout) so two tasks named `summary` in different branches don't
+/// stomp each other (gap G30).
+///
+/// The default branch is `""` (empty string) — pre-G30 callers using
+/// `write(key, value)` land here, preserving compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContextKey {
+    pub branch: String,
+    pub key: String,
+}
+
+impl ContextKey {
+    pub fn root(key: impl Into<String>) -> Self {
+        Self {
+            branch: String::new(),
+            key: key.into(),
+        }
+    }
+
+    pub fn branched(branch: impl Into<String>, key: impl Into<String>) -> Self {
+        Self {
+            branch: branch.into(),
+            key: key.into(),
+        }
+    }
+
+    /// Stable string form for the legacy `HashMap<String, String>` API
+    /// surface (e.g. `snapshot()` and `build_synthesis_prompt`). Empty
+    /// branch → just the key (preserves existing log/format strings);
+    /// non-empty → `"<branch>::<key>"`. Chosen separator is `::` to
+    /// avoid colliding with realistic key names which tend to use `_`,
+    /// `-`, `/`, or `.`.
+    pub fn flat(&self) -> String {
+        if self.branch.is_empty() {
+            self.key.clone()
+        } else {
+            format!("{}::{}", self.branch, self.key)
+        }
+    }
+}
+
+/// One write to a [`SharedContext`] slot. Stored when `record_writes`
+/// is enabled so callers (and tests) can assert no collisions
+/// occurred. Pre-G30 the only signal a collision had happened was a
+/// silently overwritten value.
+#[derive(Debug, Clone)]
+pub struct ContextWriteRecord {
+    pub key: ContextKey,
+    /// `true` iff this write replaced an existing value at the slot.
+    pub overwrote: bool,
+    /// Monotonic write index (per `SharedContext`). Useful for
+    /// reproducing the order of two competing writes.
+    pub seq: u64,
+}
+
+#[derive(Debug, Default)]
+struct ContextInner {
+    map: HashMap<String, String>,
+    /// Append-only audit trail; only populated when `record_writes`
+    /// is true on the parent `SharedContext`. Bounded to 1024 entries
+    /// to avoid unbounded growth on a long-running session — newest
+    /// entries displace oldest. Sufficient for "did this batch
+    /// collide" inspection; full audit needs the telemetry stream.
+    writes: Vec<ContextWriteRecord>,
+    seq: u64,
+}
+
+const CONTEXT_WRITES_RING_CAP: usize = 1024;
+
+/// Append-only, thread-safe store mapping `(branch, key)` → task output
+/// strings.
+///
+/// Backwards-compatible: callers using the legacy `write(key, value)` /
+/// `read(key)` API land in the empty-branch namespace.
 #[derive(Clone, Debug, Default)]
 pub struct SharedContext {
-    inner: Arc<RwLock<HashMap<String, String>>>,
+    inner: Arc<RwLock<ContextInner>>,
+    record_writes: bool,
 }
 
 impl SharedContext {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(HashMap::new())),
+            inner: Arc::new(RwLock::new(ContextInner::default())),
+            record_writes: false,
         }
     }
 
-    /// Write a result for `key`.  Overwrites if the key already exists
-    /// (tasks are only written once in practice, but idempotency is safe).
-    pub async fn write(&self, key: impl Into<String>, value: impl Into<String>) {
-        let mut map = self.inner.write().await;
-        map.insert(key.into(), value.into());
+    /// Enable the per-write audit trail consumed by [`writes`] /
+    /// [`collisions`]. Off by default to keep the hot path zero-cost.
+    pub fn with_write_audit(mut self) -> Self {
+        self.record_writes = true;
+        self
     }
 
-    /// Read the result for `key`, if present.
+    /// Write a result for `key` in the root (empty) branch.
+    /// Overwrites if the key already exists. The G30 helpers
+    /// [`writes`] / [`collisions`] / [`had_collisions`] surface
+    /// any overwrite that did happen.
+    pub async fn write(&self, key: impl Into<String>, value: impl Into<String>) {
+        self.write_at(ContextKey::root(key), value).await;
+    }
+
+    /// Branch-scoped write (gap G30). Use when a coordinator runs the
+    /// same DAG across multiple branches (verification rollouts,
+    /// speculative re-tries) and must not let branches contend on a
+    /// shared key.
+    pub async fn write_at(&self, key: ContextKey, value: impl Into<String>) {
+        let mut inner = self.inner.write().await;
+        let flat = key.flat();
+        let overwrote = inner.map.insert(flat, value.into()).is_some();
+        if self.record_writes {
+            inner.seq += 1;
+            let seq = inner.seq;
+            inner.writes.push(ContextWriteRecord {
+                key,
+                overwrote,
+                seq,
+            });
+            if inner.writes.len() > CONTEXT_WRITES_RING_CAP {
+                let drop = inner.writes.len() - CONTEXT_WRITES_RING_CAP;
+                inner.writes.drain(0..drop);
+            }
+            if overwrote {
+                tracing::warn!(
+                    target: "caduceus.coordinator.shared_context",
+                    seq,
+                    "shared-context write collision"
+                );
+            }
+        } else if overwrote {
+            // Without the audit trail we can still surface the warning
+            // — the cost of one tracing call on each overwrite is
+            // negligible vs the debugging value when two concurrent
+            // tasks unexpectedly touched the same slot.
+            tracing::warn!(
+                target: "caduceus.coordinator.shared_context",
+                "shared-context write collision (audit disabled — \
+                 enable with `.with_write_audit()` for details)"
+            );
+        }
+    }
+
+    /// Read the result for `key` in the root branch.
     pub async fn read(&self, key: &str) -> Option<String> {
-        let map = self.inner.read().await;
-        map.get(key).cloned()
+        self.read_at(&ContextKey::root(key)).await
+    }
+
+    /// Branch-scoped read counterpart of [`write_at`].
+    pub async fn read_at(&self, key: &ContextKey) -> Option<String> {
+        let inner = self.inner.read().await;
+        inner.map.get(&key.flat()).cloned()
     }
 
     /// Snapshot the whole map (for synthesis prompt building).
+    /// Branch-scoped keys appear as `"<branch>::<key>"` in the output;
+    /// root-branch keys are returned bare.
     pub async fn snapshot(&self) -> HashMap<String, String> {
-        self.inner.read().await.clone()
+        self.inner.read().await.map.clone()
+    }
+
+    /// Returns the recorded write trail, oldest first. Empty when
+    /// `with_write_audit()` was not called.
+    pub async fn writes(&self) -> Vec<ContextWriteRecord> {
+        self.inner.read().await.writes.clone()
+    }
+
+    /// Returns only the writes that overwrote an existing value.
+    /// Useful for asserting "no collisions happened in this turn"
+    /// in tests and for surfacing the collision list to a debug pane.
+    pub async fn collisions(&self) -> Vec<ContextWriteRecord> {
+        self.inner
+            .read()
+            .await
+            .writes
+            .iter()
+            .filter(|w| w.overwrote)
+            .cloned()
+            .collect()
+    }
+
+    /// Quick check used in hot paths: did any collision happen since
+    /// this `SharedContext` was created? Cheap (single read lock,
+    /// short scan).
+    pub async fn had_collisions(&self) -> bool {
+        self.inner.read().await.writes.iter().any(|w| w.overwrote)
     }
 }
 
@@ -314,6 +473,94 @@ pub struct TeamResult {
 
 // ── Coordinator ────────────────────────────────────────────────────────────────
 
+/// Decision returned by a [`CritiqueGateway`] hook before each
+/// critique LLM call. `Allow` lets the call proceed; `Deny(reason)`
+/// causes the coordinator to skip the critic and fall back to single-
+/// pass synthesis, emitting `AgentEvent::CritiqueCall { denied: true }`
+/// so the UI can show that the critic was bypassed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CritiqueGatewayDecision {
+    Allow,
+    Deny(String),
+}
+
+/// Hook trait that gates a coordinator's critique LLM call (gap G19).
+/// Implementations typically check the active session budget, HITL
+/// approval state, or provider-side rate limits.
+///
+/// Trait object form (`dyn`) is required because the coordinator may
+/// be constructed at runtime with hook impls from multiple crates
+/// (caduceus-bridge owns the production budget guard, while tests
+/// supply a stub).
+pub trait CritiqueGateway: Send + Sync {
+    /// Invoked synchronously before each critique call. Returning
+    /// `Deny` cancels the call.
+    fn check(&self, critic_model: &ModelId, leaf_count: usize) -> CritiqueGatewayDecision;
+}
+
+/// Always-allow gateway. Default when no production guard is wired
+/// in. Behaviour is identical to pre-G19 (the historical bypass) but
+/// the call is still emitted as a `CritiqueCall` event so it is now
+/// visible to telemetry.
+pub struct AllowAllCritiqueGateway;
+
+impl CritiqueGateway for AllowAllCritiqueGateway {
+    fn check(&self, _critic_model: &ModelId, _leaf_count: usize) -> CritiqueGatewayDecision {
+        CritiqueGatewayDecision::Allow
+    }
+}
+
+/// G19 / P10.3 — `CritiqueGateway` backed by the harness's HITL approval
+/// allow-list. Denies the critic call (forcing fall-back to single-pass
+/// synthesis + a `CritiqueCall { denied: true }` event) when the literal
+/// string `"critique"`, the critic model id, or the wildcard `"*"` is
+/// present in the supplied set.
+///
+/// Rationale: prior to P10.3 the critic LLM call bypassed the same HITL
+/// list users configured for tool calls. Operators auditing token spend
+/// or running offline-only sessions had no way to suppress the third
+/// LLM round. Treating the critic as a tool-equivalent in the allow-list
+/// closes that gap without introducing a new approval channel.
+///
+/// Construction is `From<HashSet<String>>`-friendly so callers can hand
+/// it the same set used in `AgentHarness::with_approval_flow`.
+pub struct ApprovalListCritiqueGateway {
+    blocked: std::collections::HashSet<String>,
+}
+
+impl ApprovalListCritiqueGateway {
+    pub fn new(blocked: std::collections::HashSet<String>) -> Self {
+        Self { blocked }
+    }
+
+    /// Convenience: build from any iterator of `Into<String>`.
+    pub fn from_iter<I, S>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            blocked: iter.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl CritiqueGateway for ApprovalListCritiqueGateway {
+    fn check(&self, critic_model: &ModelId, _leaf_count: usize) -> CritiqueGatewayDecision {
+        if self.blocked.contains("*")
+            || self.blocked.contains("critique")
+            || self.blocked.contains(&critic_model.0)
+        {
+            CritiqueGatewayDecision::Deny(format!(
+                "critic '{}' requires HITL approval (configured allow-list)",
+                critic_model.0
+            ))
+        } else {
+            CritiqueGatewayDecision::Allow
+        }
+    }
+}
+
 /// Drives the coordinator pattern:
 ///
 /// 1. Send goal to coordinator LLM → get JSON task list
@@ -325,6 +572,101 @@ pub struct Coordinator {
     context: SharedContext,
     /// Available tool specs that sub-tasks can use (filtered per agent config)
     available_tools: Vec<caduceus_core::ToolSpec>,
+    /// How to merge sub-task outputs into a final answer (gap G7).
+    /// Defaults to `Concatenate` — historical behaviour, no critic call.
+    merge_strategy: MergeStrategy,
+    /// Optional event sink for `AgentEvent::CritiqueCall` (gap G19).
+    /// `None` is acceptable for headless callers and tests; production
+    /// wiring should always plug this in.
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
+    /// Optional gateway hook applied before each critique call. `None`
+    /// is treated as [`AllowAllCritiqueGateway`].
+    critique_gateway: Option<Arc<dyn CritiqueGateway>>,
+}
+
+/// How a `Coordinator` merges sub-task outputs into the final synthesis
+/// (gap G7).
+///
+/// `Concatenate` is the default and reproduces the pre-G7 behaviour:
+/// `synthesise()` calls a single coordinator LLM with all leaf outputs
+/// inlined and asks it to write the answer. There is no explicit conflict
+/// surfacing; if two leaves disagree, the synthesiser silently picks one.
+///
+/// `Critique` adds an explicit critic pass: a critic LLM (potentially a
+/// different model than the coordinator) reads each leaf's full output
+/// independently, produces a merged answer AND a flagged-conflicts list.
+/// Inspired by Du & Mordatch's Multi-Agent Debate (2024) and Reflexion
+/// (Shinn et al., 2023). Trades one extra LLM call for substantially
+/// higher faithfulness when leaves diverge.
+#[derive(Debug, Clone)]
+pub enum MergeStrategy {
+    /// Single-pass synthesis (existing behaviour). No conflict tracking.
+    Concatenate,
+    /// Two-pass: critic LLM first emits {merged, conflicts}, then the
+    /// coordinator's `synthesise()` returns that merged answer with
+    /// conflicts appended as a structured section.
+    Critique {
+        /// Model ID for the critic. The provider is the same one used
+        /// for the rest of the team — having two providers in flight
+        /// during synthesis is a rabbit hole we deliberately avoid.
+        critic_model: ModelId,
+        /// G31 / P10.2 — sampling temperature for the critic LLM call.
+        /// Historically pinned at `0.0` for JSON reliability, but
+        /// M³MAD-Bench (2025) and ACC-Collab show temperature 0.3–0.7
+        /// produces meaningfully better merges on hard cases — a
+        /// pure-greedy critic tends to launder leaf disagreements
+        /// instead of surfacing them. `None` keeps the historical
+        /// behaviour (`0.0`) for back-compat with existing pipelines;
+        /// new callers should set `Some(0.3)` as a reasonable default.
+        critic_temperature: Option<f32>,
+    },
+}
+
+impl Default for MergeStrategy {
+    fn default() -> Self {
+        MergeStrategy::Concatenate
+    }
+}
+
+/// Result of a critic pass over leaf outputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CritiqueOutput {
+    /// The critic's merged answer to the original goal.
+    pub merged: String,
+    /// Pairs `(leaf_key_a, leaf_key_b, description)` flagged as
+    /// disagreeing. Empty when leaves agreed (or the critic missed
+    /// the conflict — caller should still surface this honestly).
+    pub conflicts: Vec<ConflictNote>,
+}
+
+/// A single conflict the critic noticed between two sub-task outputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictNote {
+    pub between: (String, String),
+    pub note: String,
+}
+
+impl CritiqueOutput {
+    /// Render as the final answer body for `synthesise()`. Conflicts are
+    /// appended as a clearly-labelled section so users see them; an empty
+    /// conflict list collapses to just the merged text.
+    pub fn render(&self) -> String {
+        if self.conflicts.is_empty() {
+            return self.merged.clone();
+        }
+        let mut out = self.merged.clone();
+        out.push_str("\n\n── flagged conflicts (critic) ───────────────\n");
+        for (i, c) in self.conflicts.iter().enumerate() {
+            out.push_str(&format!(
+                "{}. [{} vs {}] {}\n",
+                i + 1,
+                c.between.0,
+                c.between.1,
+                c.note
+            ));
+        }
+        out
+    }
 }
 
 impl Coordinator {
@@ -333,6 +675,9 @@ impl Coordinator {
             agents,
             context: SharedContext::new(),
             available_tools: Vec::new(),
+            merge_strategy: MergeStrategy::Concatenate,
+            event_tx: None,
+            critique_gateway: None,
         }
     }
 
@@ -344,6 +689,30 @@ impl Coordinator {
     /// Set available tools that sub-task agents can use
     pub fn with_tools(mut self, tools: Vec<caduceus_core::ToolSpec>) -> Self {
         self.available_tools = tools;
+        self
+    }
+
+    /// Override the merge strategy (gap G7). Default is `Concatenate`.
+    pub fn with_merge_strategy(mut self, strategy: MergeStrategy) -> Self {
+        self.merge_strategy = strategy;
+        self
+    }
+
+    /// Wire an event sink for `AgentEvent::CritiqueCall` (gap G19).
+    /// Production callers should pass the same sender used by the
+    /// agent harness so the critic appears in the live event stream
+    /// and the retention ring.
+    pub fn with_event_tx(mut self, tx: mpsc::Sender<AgentEvent>) -> Self {
+        self.event_tx = Some(tx);
+        self
+    }
+
+    /// Wire a critique gateway hook (gap G19). When set, the hook is
+    /// consulted before every critique LLM call; a `Deny` response
+    /// causes the coordinator to fall back to single-pass synthesis
+    /// and emit `AgentEvent::CritiqueCall { denied: true }`.
+    pub fn with_critique_gateway(mut self, gw: Arc<dyn CritiqueGateway>) -> Self {
+        self.critique_gateway = Some(gw);
         self
     }
 
@@ -366,6 +735,7 @@ impl Coordinator {
             tool_choice: None,
             tools: vec![],
             response_format: None,
+            logprobs: None,
         };
 
         let raw = match provider.chat(req).await {
@@ -445,6 +815,46 @@ impl Coordinator {
         provider: &dyn LlmAdapter,
         model: &ModelId,
     ) -> Result<(String, TokenUsage), String> {
+        // G7 — if a critic is configured, run it FIRST. The critic
+        // produces the merged answer + a conflict list; we render that
+        // and return it directly without a second coordinator-synthesis
+        // pass. Reasoning: an extra coordinator call after the critic
+        // would let the model "smooth over" the conflicts the critic
+        // surfaced, defeating the point of having one.
+        //
+        // G19 — the critic call is gated by `critique_gateway` (budget
+        // / HITL hook) and emits `AgentEvent::CritiqueCall` either way
+        // so observers can see the hidden third call.
+        if let MergeStrategy::Critique {
+            ref critic_model,
+            critic_temperature,
+        } = self.merge_strategy
+        {
+            let leaf_count = self.context.snapshot().await.len();
+            let decision = self
+                .critique_gateway
+                .as_ref()
+                .map(|gw| gw.check(critic_model, leaf_count))
+                .unwrap_or(CritiqueGatewayDecision::Allow);
+
+            if let CritiqueGatewayDecision::Deny(reason) = decision {
+                tracing::info!(
+                    target: "caduceus.coordinator.critique",
+                    critic_model = ?critic_model,
+                    leaf_count,
+                    reason = %reason,
+                    "critique gateway denied — falling back to single-pass synthesis"
+                );
+                self.emit_critique_event(critic_model, leaf_count, 0, 0, 0, 0, true)
+                    .await;
+                // Fall through to plain synthesis below.
+            } else {
+                return self
+                    .critique_and_merge(goal, provider, critic_model, critic_temperature, leaf_count)
+                    .await;
+            }
+        }
+
         let outputs = self.context.snapshot().await;
         let prompt = build_synthesis_prompt(goal, &outputs);
         let req = ChatRequest {
@@ -457,6 +867,7 @@ impl Coordinator {
             tool_choice: None,
             tools: vec![],
             response_format: None,
+            logprobs: None,
         };
 
         provider
@@ -471,6 +882,103 @@ impl Coordinator {
                 (r.content, usage)
             })
             .map_err(|e: caduceus_core::CaduceusError| e.to_string())
+    }
+
+    /// G7 — run the configured critic LLM over leaf outputs and return
+    /// `(rendered_answer, usage)`. The critic prompt asks for a JSON
+    /// object `{ "merged": "...", "conflicts": [{"between":["a","b"],"note":"..."}] }`.
+    /// On parse failure we degrade gracefully: the entire critic response
+    /// becomes the merged answer with no conflicts, so a malformed critic
+    /// never loses the user's work — it just downgrades to "synthesis,
+    /// minus the structured conflict list".
+    ///
+    /// G19 — emits `AgentEvent::CritiqueCall` after the call completes
+    /// so observers see the third LLM round (which was previously
+    /// invisible because it didn't go through the per-turn loop).
+    async fn critique_and_merge(
+        &self,
+        goal: &str,
+        provider: &dyn LlmAdapter,
+        critic_model: &ModelId,
+        critic_temperature: Option<f32>,
+        leaf_count: usize,
+    ) -> Result<(String, TokenUsage), String> {
+        let outputs = self.context.snapshot().await;
+        let prompt = build_critique_prompt(goal, &outputs);
+        let req = ChatRequest {
+            model: critic_model.clone(),
+            messages: vec![Message::user(&prompt)],
+            system: Some(critic_system_prompt()),
+            max_tokens: 4096,
+            // G31 / P10.2 — temperature was historically pinned at 0.0
+            // for JSON reliability, but evidence (M³MAD-Bench, ACC-Collab)
+            // shows a non-zero critic produces better merges. Honour
+            // the configured value, defaulting to 0.0 for back-compat.
+            temperature: Some(critic_temperature.unwrap_or(0.0)),
+            thinking_mode: false,
+            tool_choice: None,
+            tools: vec![],
+            response_format: None,
+            logprobs: None,
+        };
+        let started = Instant::now();
+        let resp = provider
+            .chat(req)
+            .await
+            .map_err(|e: caduceus_core::CaduceusError| e.to_string())?;
+        let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let usage = TokenUsage {
+            input_tokens: resp.input_tokens,
+            output_tokens: resp.output_tokens,
+            ..Default::default()
+        };
+        let critique = parse_critique_response(&resp.content);
+        self.emit_critique_event(
+            critic_model,
+            leaf_count,
+            critique.conflicts.len(),
+            resp.input_tokens,
+            resp.output_tokens,
+            duration_ms,
+            false,
+        )
+        .await;
+        Ok((critique.render(), usage))
+    }
+
+    /// Best-effort emit of a [`AgentEvent::CritiqueCall`] (gap G19).
+    /// Uses `try_send` so the coordinator never blocks on UI buffer
+    /// pressure; a dropped event is acceptable here since the same
+    /// information lands in tracing.
+    async fn emit_critique_event(
+        &self,
+        critic_model: &ModelId,
+        leaf_count: usize,
+        conflicts_found: usize,
+        input_tokens: u32,
+        output_tokens: u32,
+        duration_ms: u64,
+        denied: bool,
+    ) {
+        let Some(tx) = self.event_tx.as_ref() else {
+            return;
+        };
+        let event = AgentEvent::CritiqueCall {
+            critic_model: format!("{critic_model:?}"),
+            leaf_count,
+            conflicts_found,
+            input_tokens,
+            output_tokens,
+            duration_ms,
+            denied,
+        };
+        if let Err(err) = tx.try_send(event) {
+            tracing::debug!(
+                target: "caduceus.coordinator.critique",
+                ?err,
+                "dropping CritiqueCall event (channel full or closed)"
+            );
+        }
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -564,6 +1072,7 @@ async fn run_task(
             tool_choice: None,
             tools: task_tools.clone(),
             response_format: None,
+            logprobs: None,
         };
 
         match provider.chat(req).await {
@@ -713,6 +1222,128 @@ fn build_synthesis_prompt(goal: &str, outputs: &HashMap<String, String>) -> Stri
          Synthesise a coherent final answer from the above outputs.",
         parts.join("\n\n")
     )
+}
+
+// ── G7: Critic prompt + parser ────────────────────────────────────────────────
+
+fn critic_system_prompt() -> String {
+    "You are an impartial critic merging outputs from multiple sub-agents. \
+     Your job is to (1) produce a single coherent answer to the user's \
+     goal, and (2) explicitly list any factual or directional disagreements \
+     between the sub-agents. Do NOT hide conflicts to make the answer look \
+     cleaner — surfacing them is the entire reason you exist."
+        .to_string()
+}
+
+fn build_critique_prompt(goal: &str, outputs: &HashMap<String, String>) -> String {
+    let parts: Vec<String> = outputs
+        .iter()
+        .map(|(id, out)| format!("[{id}]:\n{out}"))
+        .collect();
+    format!(
+        "Original goal: {goal}\n\n\
+         Sub-agent outputs:\n{outputs_block}\n\n\
+         Respond with ONLY a single JSON object (no prose, no markdown \
+         fence) with this exact shape:\n\
+         {{\n\
+         \x20 \"merged\": \"<final merged answer to the goal>\",\n\
+         \x20 \"conflicts\": [\n\
+         \x20   {{ \"between\": [\"<sub-agent id>\", \"<sub-agent id>\"], \"note\": \"<what they disagree on>\" }}\n\
+         \x20 ]\n\
+         }}\n\
+         If there are no conflicts, set \"conflicts\" to []. Use the \
+         exact bracket-prefixed IDs from the sub-agent outputs above.",
+        outputs_block = parts.join("\n\n")
+    )
+}
+
+/// Parse the critic's response into a `CritiqueOutput`.
+///
+/// Robust to common deviations:
+/// - JSON wrapped in ```json fences → strip the fence.
+/// - Leading/trailing prose → extract the first balanced `{ ... }` block.
+/// - Malformed JSON → degrade to `{ merged: <full response>, conflicts: [] }`
+///   so the user still gets something useful.
+fn parse_critique_response(raw: &str) -> CritiqueOutput {
+    let cleaned = strip_code_fence(raw);
+    let json_slice = extract_first_json_object(cleaned).unwrap_or(cleaned);
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(json_slice);
+    let v = match parsed {
+        Ok(v) => v,
+        Err(_) => {
+            // Degrade gracefully — the critic's whole output becomes the
+            // merged answer. Better than panicking or returning empty.
+            return CritiqueOutput {
+                merged: raw.to_string(),
+                conflicts: Vec::new(),
+            };
+        }
+    };
+    let merged = v
+        .get("merged")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    let conflicts = v
+        .get("conflicts")
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let between = item.get("between")?.as_array()?;
+                    let a = between.first()?.as_str()?.to_string();
+                    let b = between.get(1)?.as_str()?.to_string();
+                    let note = item.get("note")?.as_str()?.to_string();
+                    Some(ConflictNote {
+                        between: (a, b),
+                        note,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if merged.is_empty() {
+        // Critic returned a JSON object but with no "merged" — fall back
+        // to the raw response so we don't ship an empty answer.
+        return CritiqueOutput {
+            merged: raw.to_string(),
+            conflicts,
+        };
+    }
+    CritiqueOutput { merged, conflicts }
+}
+
+fn strip_code_fence(s: &str) -> &str {
+    let s = s.trim();
+    let stripped = s.strip_prefix("```json").or_else(|| s.strip_prefix("```"));
+    if let Some(after_open) = stripped {
+        if let Some(end) = after_open.rfind("```") {
+            return after_open[..end].trim();
+        }
+    }
+    s
+}
+
+/// Extract the first balanced top-level `{...}` block, or None if there
+/// isn't one. Naive depth counting — good enough for critic output that
+/// is supposed to be a single JSON object.
+fn extract_first_json_object(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 // ── Team ───────────────────────────────────────────────────────────────────────
@@ -1709,12 +2340,30 @@ pub struct BusMessage {
     pub channel: String,
 }
 
+#[deprecated(
+    since = "0.1.0",
+    note = "P9.7: prefer `BroadcastBus` for new code. `MessageBus` is retained \
+            only for back-compat (sliding-window history + sync read_since); \
+            new callers should use `BroadcastBus::new() + subscribe()`. \
+            Existing callers may keep using MessageBus::with_broadcast(bus) as a \
+            transitional dual-write. Scheduled for removal one release after \
+            all internal callers migrate."
+)]
 #[derive(Debug, Default)]
 pub struct MessageBus {
     channels: HashMap<String, VecDeque<BusMessage>>,
     subscribers: HashMap<String, Vec<String>>,
+    /// Optional async broadcast fan-out (gap G9 / P4.3 / P9.7). When
+    /// attached via [`MessageBus::with_broadcast`], every successful
+    /// `publish` is also forwarded to the broadcast bus so async
+    /// subscribers (e.g. UI streams, sibling agents) get push delivery
+    /// instead of polling `read_since`. The local sliding-window
+    /// history is preserved unchanged so existing callers are
+    /// unaffected.
+    broadcast: Option<crate::broadcast_bus::BroadcastBus>,
 }
 
+#[allow(deprecated)]
 impl MessageBus {
     /// Audit finding (round 2): channels grow without bound; long-running
     /// sessions accumulate every BusMessage forever. Cap per-channel
@@ -1725,6 +2374,24 @@ impl MessageBus {
 
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach an async [`BroadcastBus`] (gap G9 / P4.3 / P9.7) for
+    /// push-delivery to UI streams and sibling agents. Subsequent
+    /// `publish` calls fan-out to the broadcast bus AFTER updating
+    /// the local sliding-window history. A no-subscribers broadcast
+    /// is silently dropped (matches BroadcastBus semantics) so
+    /// attaching the bus never changes `publish`'s observable
+    /// behaviour from the local-history perspective.
+    pub fn with_broadcast(mut self, bus: crate::broadcast_bus::BroadcastBus) -> Self {
+        self.broadcast = Some(bus);
+        self
+    }
+
+    /// Borrow the attached [`BroadcastBus`] so callers can subscribe
+    /// without going through `MessageBus::subscribe`.
+    pub fn broadcast(&self) -> Option<&crate::broadcast_bus::BroadcastBus> {
+        self.broadcast.as_ref()
     }
 
     pub fn subscribe(&mut self, agent: &str, channel: &str) {
@@ -1764,10 +2431,26 @@ impl MessageBus {
             .channels
             .entry(message.channel.clone())
             .or_default();
-        queue.push_back(message);
+        queue.push_back(message.clone());
         // Sliding-window eviction: drop oldest until under cap.
         while queue.len() > Self::MAX_MESSAGES_PER_CHANNEL {
             queue.pop_front();
+        }
+        // P9.7 fan-out: forward to async subscribers if a BroadcastBus
+        // is attached. Errors (no live receivers) are silently
+        // ignored — local history retention is the source of truth
+        // for slow-poll consumers; the broadcast is best-effort push.
+        if let Some(ref bb) = self.broadcast {
+            // BusMessage from workers and broadcast_bus are field-
+            // identical; convert by destructuring rather than
+            // requiring a `From` impl across modules.
+            let bm = crate::broadcast_bus::BusMessage {
+                from: message.from,
+                content: message.content,
+                timestamp: message.timestamp,
+                channel: message.channel,
+            };
+            let _ = bb.publish(bm);
         }
     }
 
@@ -2392,6 +3075,7 @@ fn split_command_line(command: &str) -> Result<Vec<String>, String> {
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use caduceus_core::{ModelId, ProviderId};
@@ -3136,4 +3820,873 @@ Here is the task plan:
         // Unsubscribed agent gets nothing even though the message exists.
         assert!(bus.read_since("bob", "alerts", 0).is_empty());
     }
+
+    // ── G7: MergeStrategy::Critique tests ─────────────────────────────────
+
+    #[test]
+    fn critique_output_render_no_conflicts_is_just_merged() {
+        let c = CritiqueOutput {
+            merged: "all clean".into(),
+            conflicts: vec![],
+        };
+        assert_eq!(c.render(), "all clean");
+    }
+
+    #[test]
+    fn critique_output_render_appends_conflicts_section() {
+        let c = CritiqueOutput {
+            merged: "answer".into(),
+            conflicts: vec![ConflictNote {
+                between: ("alice".into(), "bob".into()),
+                note: "disagree on port".into(),
+            }],
+        };
+        let r = c.render();
+        assert!(r.starts_with("answer"));
+        assert!(r.contains("flagged conflicts"));
+        assert!(r.contains("[alice vs bob]"));
+        assert!(r.contains("port"));
+    }
+
+    #[test]
+    fn parse_critique_response_accepts_clean_json() {
+        let raw = r#"{"merged":"final","conflicts":[]}"#;
+        let c = parse_critique_response(raw);
+        assert_eq!(c.merged, "final");
+        assert!(c.conflicts.is_empty());
+    }
+
+    #[test]
+    fn parse_critique_response_strips_code_fence() {
+        let raw = "```json\n{\"merged\":\"x\",\"conflicts\":[]}\n```";
+        let c = parse_critique_response(raw);
+        assert_eq!(c.merged, "x");
+    }
+
+    #[test]
+    fn parse_critique_response_extracts_json_from_prose() {
+        let raw =
+            "Sure, here's the result:\n{\"merged\":\"y\",\"conflicts\":[]}\nHope that helps!";
+        let c = parse_critique_response(raw);
+        assert_eq!(c.merged, "y");
+    }
+
+    #[test]
+    fn parse_critique_response_parses_conflicts() {
+        let raw = r#"{
+            "merged": "joint",
+            "conflicts": [
+                {"between":["t1","t2"], "note":"disagree on X"},
+                {"between":["t1","t3"], "note":"disagree on Y"}
+            ]
+        }"#;
+        let c = parse_critique_response(raw);
+        assert_eq!(c.conflicts.len(), 2);
+        assert_eq!(c.conflicts[0].between, ("t1".to_string(), "t2".to_string()));
+        assert_eq!(c.conflicts[1].note, "disagree on Y");
+    }
+
+    #[test]
+    fn parse_critique_response_degrades_on_malformed_json() {
+        // Critic produced prose, no JSON at all → entire response becomes
+        // the merged answer (so we don't lose user-facing work).
+        let raw = "I think the answer is 42 but they disagree.";
+        let c = parse_critique_response(raw);
+        assert!(c.merged.contains("42"));
+        assert!(c.conflicts.is_empty());
+    }
+
+    #[test]
+    fn parse_critique_response_falls_back_when_merged_missing() {
+        // Valid JSON but no `merged` key → use raw response.
+        let raw = r#"{"conflicts":[]}"#;
+        let c = parse_critique_response(raw);
+        assert_eq!(c.merged, raw);
+    }
+
+    #[test]
+    fn extract_first_json_object_handles_nested_braces() {
+        let s = "prefix {\"a\":{\"b\":1},\"c\":2} suffix";
+        let extracted = extract_first_json_object(s).unwrap();
+        assert_eq!(extracted, "{\"a\":{\"b\":1},\"c\":2}");
+    }
+
+    #[test]
+    fn extract_first_json_object_returns_none_when_unbalanced() {
+        assert_eq!(extract_first_json_object("no braces"), None);
+        assert_eq!(extract_first_json_object("{ unclosed"), None);
+    }
+
+    #[test]
+    fn merge_strategy_default_is_concatenate() {
+        let c = Coordinator::new(vec![make_agent("a")]);
+        assert!(matches!(c.merge_strategy, MergeStrategy::Concatenate));
+    }
+
+    #[test]
+    fn coordinator_with_merge_strategy_critique_stores_strategy() {
+        let c = Coordinator::new(vec![make_agent("a")]).with_merge_strategy(
+            MergeStrategy::Critique {
+                critic_model: ModelId::new("critic-m"),
+                critic_temperature: None,
+            },
+        );
+        match c.merge_strategy {
+            MergeStrategy::Critique { ref critic_model, .. } => {
+                assert_eq!(critic_model.0, "critic-m");
+            }
+            _ => panic!("expected Critique strategy"),
+        }
+    }
+
+    #[tokio::test]
+    async fn synthesise_with_critique_uses_critic_response() {
+        // Build a coordinator with critique strategy. Stub provider
+        // returns a JSON critique. SharedContext has 2 leaf outputs.
+        use caduceus_providers::mock::MockLlmAdapter;
+        use caduceus_providers::ChatResponse;
+
+        let provider = Arc::new(MockLlmAdapter::new(vec![ChatResponse {
+            content: r#"{"merged":"merged answer","conflicts":[{"between":["leaf1","leaf2"],"note":"timestamps differ"}]}"#
+                .to_string(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: caduceus_core::StopReason::EndTurn,
+            tool_calls: vec![],
+                logprobs: None,
+        }]));
+
+        let ctx = SharedContext::new();
+        ctx.write("leaf1", "result one").await;
+        ctx.write("leaf2", "result two with different timestamp").await;
+
+        let coord = Coordinator::new(vec![make_agent("a")])
+            .with_context(ctx)
+            .with_merge_strategy(MergeStrategy::Critique {
+                critic_model: ModelId::new("critic-m"),
+                critic_temperature: None,
+            });
+
+        let (answer, _usage) = coord
+            .synthesise(
+                "produce a thing",
+                provider.as_ref(),
+                &ModelId::new("primary-m"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            answer.contains("merged answer"),
+            "expected critic merged text in answer, got: {answer}"
+        );
+        assert!(
+            answer.contains("flagged conflicts"),
+            "expected conflicts section, got: {answer}"
+        );
+        assert!(answer.contains("timestamps differ"));
+    }
+
+    #[tokio::test]
+    async fn synthesise_with_concatenate_uses_synthesis_path() {
+        // Default strategy → original synthesis path. Mock returns plain
+        // text (not JSON) — would fail under Critique parser if wrong path.
+        use caduceus_providers::mock::MockLlmAdapter;
+        use caduceus_providers::ChatResponse;
+
+        let provider = Arc::new(MockLlmAdapter::new(vec![ChatResponse {
+            content: "plain synthesis text — no json here".to_string(),
+            input_tokens: 5,
+            output_tokens: 10,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: caduceus_core::StopReason::EndTurn,
+            tool_calls: vec![],
+                logprobs: None,
+        }]));
+
+        let ctx = SharedContext::new();
+        ctx.write("leaf1", "x").await;
+        let coord = Coordinator::new(vec![make_agent("a")]).with_context(ctx);
+        let (answer, _) = coord
+            .synthesise("g", provider.as_ref(), &ModelId::new("m"))
+            .await
+            .unwrap();
+        assert_eq!(answer, "plain synthesis text — no json here");
+    }
+
+    // ── G31 / P10.2: critic temperature tunability tests ──────────────────
+
+    async fn run_critique_synthesise_capturing_temp(
+        critic_temperature: Option<f32>,
+    ) -> Option<f32> {
+        use caduceus_providers::mock::MockLlmAdapter;
+        use caduceus_providers::ChatResponse;
+        let provider = Arc::new(MockLlmAdapter::new(vec![ChatResponse {
+            content: r#"{"merged":"m","conflicts":[]}"#.to_string(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: caduceus_core::StopReason::EndTurn,
+            tool_calls: vec![],
+            logprobs: None,
+        }]));
+        let ctx = SharedContext::new();
+        ctx.write("leaf1", "x").await;
+        let coord = Coordinator::new(vec![make_agent("a")])
+            .with_context(ctx)
+            .with_merge_strategy(MergeStrategy::Critique {
+                critic_model: ModelId::new("critic-m"),
+                critic_temperature,
+            });
+        let _ = coord
+            .synthesise("g", provider.as_ref(), &ModelId::new("primary-m"))
+            .await
+            .unwrap();
+        provider
+            .recorded_requests()
+            .into_iter()
+            .next()
+            .and_then(|r| r.temperature)
+    }
+
+    #[tokio::test]
+    async fn critic_temperature_defaults_to_zero_when_none() {
+        let t = run_critique_synthesise_capturing_temp(None).await;
+        assert_eq!(t, Some(0.0), "None must preserve historical 0.0 default");
+    }
+
+    #[tokio::test]
+    async fn critic_temperature_honours_configured_value() {
+        let t = run_critique_synthesise_capturing_temp(Some(0.3)).await;
+        assert_eq!(t, Some(0.3), "configured 0.3 must reach the provider");
+    }
+
+    #[tokio::test]
+    async fn critic_temperature_accepts_higher_creative_value() {
+        let t = run_critique_synthesise_capturing_temp(Some(0.7)).await;
+        assert_eq!(t, Some(0.7));
+    }
+
+    #[tokio::test]
+    async fn critic_temperature_zero_explicit_still_zero() {
+        let t = run_critique_synthesise_capturing_temp(Some(0.0)).await;
+        assert_eq!(t, Some(0.0));
+    }
+
+    #[test]
+    fn merge_strategy_critique_field_round_trips_in_clone() {
+        let s = MergeStrategy::Critique {
+            critic_model: ModelId::new("m"),
+            critic_temperature: Some(0.5),
+        };
+        let s2 = s.clone();
+        match s2 {
+            MergeStrategy::Critique {
+                critic_temperature, ..
+            } => assert_eq!(critic_temperature, Some(0.5)),
+            _ => panic!("expected Critique"),
+        }
+    }
+
+    // ── G19 / P10.3: ApprovalListCritiqueGateway tests ─────────────────────
+
+    #[test]
+    fn approval_gateway_allows_when_critic_not_in_list() {
+        let gw = ApprovalListCritiqueGateway::from_iter(["read_file", "bash"]);
+        match gw.check(&ModelId::new("critic-m"), 2) {
+            CritiqueGatewayDecision::Allow => {}
+            d => panic!("expected Allow, got {:?}", d),
+        }
+    }
+
+    #[test]
+    fn approval_gateway_denies_when_critique_keyword_present() {
+        let gw = ApprovalListCritiqueGateway::from_iter(["bash", "critique"]);
+        match gw.check(&ModelId::new("critic-m"), 2) {
+            CritiqueGatewayDecision::Deny(reason) => {
+                assert!(
+                    reason.contains("critic-m") && reason.contains("HITL"),
+                    "deny reason should name model and HITL: {reason}"
+                );
+            }
+            d => panic!("expected Deny, got {:?}", d),
+        }
+    }
+
+    #[test]
+    fn approval_gateway_denies_when_specific_model_listed() {
+        let gw = ApprovalListCritiqueGateway::from_iter(["critic-m"]);
+        assert!(matches!(
+            gw.check(&ModelId::new("critic-m"), 2),
+            CritiqueGatewayDecision::Deny(_)
+        ));
+        // Different model still allowed.
+        assert!(matches!(
+            gw.check(&ModelId::new("other-m"), 2),
+            CritiqueGatewayDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn approval_gateway_wildcard_denies_everything() {
+        let gw = ApprovalListCritiqueGateway::from_iter(["*"]);
+        assert!(matches!(
+            gw.check(&ModelId::new("any-m"), 1),
+            CritiqueGatewayDecision::Deny(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn approval_gateway_falls_back_to_concatenate_when_denied() {
+        // Wire the approval gateway into a real Coordinator and verify
+        // the critic LLM call is suppressed (no JSON parse ever runs).
+        use caduceus_providers::mock::MockLlmAdapter;
+        use caduceus_providers::ChatResponse;
+        let provider = Arc::new(MockLlmAdapter::new(vec![ChatResponse {
+            content: "fallback synthesis text".to_string(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: caduceus_core::StopReason::EndTurn,
+            tool_calls: vec![],
+            logprobs: None,
+        }]));
+        let ctx = SharedContext::new();
+        ctx.write("leaf1", "x").await;
+        let gw: Arc<dyn CritiqueGateway> =
+            Arc::new(ApprovalListCritiqueGateway::from_iter(["critique"]));
+        let coord = Coordinator::new(vec![make_agent("a")])
+            .with_context(ctx)
+            .with_critique_gateway(gw)
+            .with_merge_strategy(MergeStrategy::Critique {
+                critic_model: ModelId::new("critic-m"),
+                critic_temperature: Some(0.3),
+            });
+        let (answer, _) = coord
+            .synthesise("g", provider.as_ref(), &ModelId::new("primary-m"))
+            .await
+            .unwrap();
+        assert!(
+            answer.contains("fallback synthesis text"),
+            "denied critique must fall through to plain synthesis, got: {answer}"
+        );
+    }
+
+    // ── G19: critique gateway + CritiqueCall event tests ────────────────────
+
+    /// Test gateway hook that records every check and returns a
+    /// configurable decision. Captures `(critic_model, leaf_count)`
+    /// so tests can assert the dispatcher passed the right inputs.
+    struct RecordingGateway {
+        decision: CritiqueGatewayDecision,
+        calls: std::sync::Mutex<Vec<(ModelId, usize)>>,
+    }
+
+    impl RecordingGateway {
+        fn new(decision: CritiqueGatewayDecision) -> Arc<Self> {
+            Arc::new(Self {
+                decision,
+                calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl CritiqueGateway for RecordingGateway {
+        fn check(&self, critic_model: &ModelId, leaf_count: usize) -> CritiqueGatewayDecision {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((critic_model.clone(), leaf_count));
+            self.decision.clone()
+        }
+    }
+
+    fn drain_events(rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn critique_emits_critiquecall_event_on_success() {
+        use caduceus_providers::mock::MockLlmAdapter;
+        use caduceus_providers::ChatResponse;
+
+        let provider = Arc::new(MockLlmAdapter::new(vec![ChatResponse {
+            content: r#"{"merged":"m","conflicts":[{"between":["a","b"],"note":"n"}]}"#
+                .to_string(),
+            input_tokens: 11,
+            output_tokens: 22,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: caduceus_core::StopReason::EndTurn,
+            tool_calls: vec![],
+                logprobs: None,
+        }]));
+
+        let ctx = SharedContext::new();
+        ctx.write("leaf1", "one").await;
+        ctx.write("leaf2", "two").await;
+
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let coord = Coordinator::new(vec![make_agent("a")])
+            .with_context(ctx)
+            .with_event_tx(tx)
+            .with_merge_strategy(MergeStrategy::Critique {
+                critic_model: ModelId::new("critic-m"),
+                critic_temperature: None,
+            });
+
+        let _ = coord
+            .synthesise("g", provider.as_ref(), &ModelId::new("primary"))
+            .await
+            .unwrap();
+
+        let events = drain_events(&mut rx);
+        let crit = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::CritiqueCall {
+                    critic_model,
+                    leaf_count,
+                    conflicts_found,
+                    input_tokens,
+                    output_tokens,
+                    denied,
+                    ..
+                } => Some((
+                    critic_model.clone(),
+                    *leaf_count,
+                    *conflicts_found,
+                    *input_tokens,
+                    *output_tokens,
+                    *denied,
+                )),
+                _ => None,
+            })
+            .expect("expected one CritiqueCall event");
+        assert!(crit.0.contains("critic-m"));
+        assert_eq!(crit.1, 2, "leaf_count");
+        assert_eq!(crit.2, 1, "conflicts_found");
+        assert_eq!(crit.3, 11, "input_tokens");
+        assert_eq!(crit.4, 22, "output_tokens");
+        assert!(!crit.5, "denied=false on success");
+    }
+
+    #[tokio::test]
+    async fn critique_gateway_deny_falls_back_to_synthesis_and_emits_denied_event() {
+        use caduceus_providers::mock::MockLlmAdapter;
+        use caduceus_providers::ChatResponse;
+
+        // Single response — synthesis path, NOT the critic call. If
+        // the gateway didn't actually deny, we'd parse this as JSON and
+        // the assertion below would fail.
+        let provider = Arc::new(MockLlmAdapter::new(vec![ChatResponse {
+            content: "plain fallback synthesis text".to_string(),
+            input_tokens: 3,
+            output_tokens: 4,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: caduceus_core::StopReason::EndTurn,
+            tool_calls: vec![],
+                logprobs: None,
+        }]));
+
+        let ctx = SharedContext::new();
+        ctx.write("leaf1", "x").await;
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let gw = RecordingGateway::new(CritiqueGatewayDecision::Deny("budget".into()));
+
+        let coord = Coordinator::new(vec![make_agent("a")])
+            .with_context(ctx)
+            .with_event_tx(tx)
+            .with_critique_gateway(gw.clone())
+            .with_merge_strategy(MergeStrategy::Critique {
+                critic_model: ModelId::new("critic-m"),
+                critic_temperature: None,
+            });
+
+        let (answer, _) = coord
+            .synthesise("g", provider.as_ref(), &ModelId::new("primary"))
+            .await
+            .unwrap();
+        assert_eq!(answer, "plain fallback synthesis text");
+
+        let calls = gw.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "gateway consulted exactly once");
+        assert_eq!(calls[0].1, 1, "leaf_count passed to gateway");
+
+        let events = drain_events(&mut rx);
+        let denied = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::CritiqueCall {
+                    denied,
+                    input_tokens,
+                    output_tokens,
+                    duration_ms,
+                    ..
+                } => Some((*denied, *input_tokens, *output_tokens, *duration_ms)),
+                _ => None,
+            })
+            .expect("expected denied CritiqueCall event");
+        assert!(denied.0, "denied=true");
+        assert_eq!(denied.1, 0, "no tokens charged on deny");
+        assert_eq!(denied.2, 0);
+        assert_eq!(denied.3, 0, "no wall time on deny");
+    }
+
+    #[tokio::test]
+    async fn critique_without_emitter_does_not_panic() {
+        use caduceus_providers::mock::MockLlmAdapter;
+        use caduceus_providers::ChatResponse;
+
+        let provider = Arc::new(MockLlmAdapter::new(vec![ChatResponse {
+            content: r#"{"merged":"ok","conflicts":[]}"#.to_string(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: caduceus_core::StopReason::EndTurn,
+            tool_calls: vec![],
+                logprobs: None,
+        }]));
+
+        let ctx = SharedContext::new();
+        ctx.write("l", "x").await;
+
+        let coord = Coordinator::new(vec![make_agent("a")])
+            .with_context(ctx)
+            .with_merge_strategy(MergeStrategy::Critique {
+                critic_model: ModelId::new("critic-m"),
+                critic_temperature: None,
+            });
+
+        // No emitter, no gateway — should still work and return critic
+        // output. The whole point is that G19 must NOT regress callers
+        // who haven't opted in.
+        let (answer, _) = coord
+            .synthesise("g", provider.as_ref(), &ModelId::new("primary"))
+            .await
+            .unwrap();
+        assert!(answer.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn critique_gateway_allow_decision_proceeds_to_critic_call() {
+        use caduceus_providers::mock::MockLlmAdapter;
+        use caduceus_providers::ChatResponse;
+
+        let provider = Arc::new(MockLlmAdapter::new(vec![ChatResponse {
+            content: r#"{"merged":"allowed","conflicts":[]}"#.to_string(),
+            input_tokens: 7,
+            output_tokens: 8,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            stop_reason: caduceus_core::StopReason::EndTurn,
+            tool_calls: vec![],
+                logprobs: None,
+        }]));
+
+        let ctx = SharedContext::new();
+        ctx.write("l", "x").await;
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let gw = RecordingGateway::new(CritiqueGatewayDecision::Allow);
+
+        let coord = Coordinator::new(vec![make_agent("a")])
+            .with_context(ctx)
+            .with_event_tx(tx)
+            .with_critique_gateway(gw.clone())
+            .with_merge_strategy(MergeStrategy::Critique {
+                critic_model: ModelId::new("critic-m"),
+                critic_temperature: None,
+            });
+
+        let (answer, _) = coord
+            .synthesise("g", provider.as_ref(), &ModelId::new("primary"))
+            .await
+            .unwrap();
+        assert_eq!(answer, "allowed");
+
+        let events = drain_events(&mut rx);
+        let crit = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::CritiqueCall {
+                    denied,
+                    input_tokens,
+                    ..
+                } => Some((*denied, *input_tokens)),
+                _ => None,
+            })
+            .expect("expected CritiqueCall event");
+        assert!(!crit.0, "denied=false");
+        assert_eq!(crit.1, 7, "input tokens populated on allow");
+        assert_eq!(gw.calls.lock().unwrap().len(), 1);
+    }
+
+    // ── G30: SharedContext write-collision + branch-scoped key tests ──────
+
+    #[tokio::test]
+    async fn shared_context_records_collisions_when_audit_enabled() {
+        let ctx = SharedContext::new().with_write_audit();
+        ctx.write("k", "v1").await;
+        ctx.write("k", "v2").await; // overwrite
+        ctx.write("other", "x").await;
+
+        let collisions = ctx.collisions().await;
+        assert_eq!(collisions.len(), 1, "exactly one overwrite expected");
+        assert_eq!(collisions[0].key.key, "k");
+        assert_eq!(collisions[0].key.branch, "");
+        assert!(collisions[0].overwrote);
+        assert!(ctx.had_collisions().await);
+    }
+
+    #[tokio::test]
+    async fn shared_context_branch_scoped_keys_do_not_collide() {
+        let ctx = SharedContext::new().with_write_audit();
+        ctx.write_at(ContextKey::branched("rollout-1", "summary"), "a")
+            .await;
+        ctx.write_at(ContextKey::branched("rollout-2", "summary"), "b")
+            .await;
+        ctx.write("summary", "root").await;
+
+        // Three distinct keys → no collisions.
+        assert!(!ctx.had_collisions().await);
+        assert_eq!(
+            ctx.read_at(&ContextKey::branched("rollout-1", "summary")).await,
+            Some("a".into())
+        );
+        assert_eq!(
+            ctx.read_at(&ContextKey::branched("rollout-2", "summary")).await,
+            Some("b".into())
+        );
+        assert_eq!(ctx.read("summary").await, Some("root".into()));
+    }
+
+    #[tokio::test]
+    async fn shared_context_snapshot_uses_branch_double_colon_format() {
+        let ctx = SharedContext::new();
+        ctx.write_at(ContextKey::branched("br", "k"), "v").await;
+        ctx.write("plain", "p").await;
+        let snap = ctx.snapshot().await;
+        assert_eq!(snap.get("br::k"), Some(&"v".into()));
+        assert_eq!(snap.get("plain"), Some(&"p".into()));
+    }
+
+    #[tokio::test]
+    async fn shared_context_no_audit_means_no_writes_recorded() {
+        let ctx = SharedContext::new();
+        ctx.write("k", "v1").await;
+        ctx.write("k", "v2").await;
+        // No audit → empty writes list, but the warning was still
+        // emitted via tracing. `had_collisions` returns false because
+        // it only consults the (empty) audit trail; this is the
+        // documented trade-off.
+        assert!(ctx.writes().await.is_empty());
+        assert!(!ctx.had_collisions().await);
+    }
+
+    #[test]
+    fn context_key_flat_omits_empty_branch() {
+        assert_eq!(ContextKey::root("x").flat(), "x");
+        assert_eq!(ContextKey::branched("b", "x").flat(), "b::x");
+    }
+
+    // ── P9.7: MessageBus → BroadcastBus migration ─────────────────────
+
+    #[tokio::test]
+    async fn p9_7_with_broadcast_attaches_async_fanout() {
+        use crate::broadcast_bus::BroadcastBus;
+
+        let bb = BroadcastBus::new();
+        let bus = MessageBus::new().with_broadcast(bb.clone());
+        assert!(bus.broadcast().is_some());
+    }
+
+    #[tokio::test]
+    async fn p9_7_publish_fans_out_to_broadcast_subscribers() {
+        use crate::broadcast_bus::BroadcastBus;
+
+        let bb = BroadcastBus::new();
+        let mut rx = bb.subscribe("alerts");
+        let mut bus = MessageBus::new().with_broadcast(bb.clone());
+
+        // Local subscription (workers-side semantic).
+        bus.subscribe("agent_a", "alerts");
+
+        bus.publish(BusMessage {
+            from: "agent_b".into(),
+            content: "fire".into(),
+            timestamp: 1,
+            channel: "alerts".into(),
+        });
+
+        // Local history retained.
+        let local = bus.read("agent_a", "alerts");
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].content, "fire");
+
+        // Async receiver pushed.
+        let m = rx.recv().await.expect("broadcast delivered");
+        assert_eq!(m.content, "fire");
+        assert_eq!(m.from, "agent_b");
+    }
+
+    #[tokio::test]
+    async fn p9_7_publish_to_no_broadcast_subscribers_is_silent_drop() {
+        use crate::broadcast_bus::BroadcastBus;
+
+        let bb = BroadcastBus::new();
+        let mut bus = MessageBus::new().with_broadcast(bb);
+        bus.subscribe("agent_a", "alerts");
+
+        // No broadcast subscriber for "alerts" — must NOT panic / err.
+        bus.publish(BusMessage {
+            from: "x".into(),
+            content: "y".into(),
+            timestamp: 1,
+            channel: "alerts".into(),
+        });
+
+        // Local-only path still works.
+        assert_eq!(bus.read("agent_a", "alerts").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn p9_7_multiple_async_subscribers_all_receive() {
+        use crate::broadcast_bus::BroadcastBus;
+
+        let bb = BroadcastBus::new();
+        let mut rx1 = bb.subscribe("logs");
+        let mut rx2 = bb.subscribe("logs");
+        let mut bus = MessageBus::new().with_broadcast(bb);
+
+        bus.publish(BusMessage {
+            from: "a".into(),
+            content: "hello".into(),
+            timestamp: 1,
+            channel: "logs".into(),
+        });
+
+        let m1 = rx1.recv().await.unwrap();
+        let m2 = rx2.recv().await.unwrap();
+        assert_eq!(m1.content, "hello");
+        assert_eq!(m2.content, "hello");
+    }
+
+    #[tokio::test]
+    async fn p9_7_legacy_publish_without_broadcast_unchanged() {
+        let mut bus = MessageBus::new();
+        bus.subscribe("a", "ch");
+        bus.publish(BusMessage {
+            from: "b".into(),
+            content: "x".into(),
+            timestamp: 1,
+            channel: "ch".into(),
+        });
+        assert_eq!(bus.read("a", "ch").len(), 1);
+    }
+
+    // ── P9.7 deprecation acceptance ────────────────────────────────────
+    //
+    // These tests pin the migration story: `BroadcastBus` is the
+    // canonical async fan-out path; `MessageBus` is `#[deprecated]`
+    // but must remain wire-compatible until removal.
+
+    #[tokio::test]
+    async fn p9_7_broadcast_bus_is_drop_in_for_message_bus_publish() {
+        use crate::broadcast_bus::BroadcastBus;
+
+        let bb = BroadcastBus::new();
+        let mut rx = bb.subscribe("alerts");
+        bb.publish(crate::broadcast_bus::BusMessage {
+                from: "x".into(),
+                content: "hi".into(),
+                timestamp: 0,
+                channel: "alerts".into(),
+            })
+            .expect("delivered");
+        let m = rx.recv().await.expect("delivered");
+        assert_eq!(m.content, "hi");
+    }
+
+    #[tokio::test]
+    async fn p9_7_broadcast_bus_supports_multiple_subscribers() {
+        use crate::broadcast_bus::BroadcastBus;
+
+        let bb = BroadcastBus::new();
+        let mut a = bb.subscribe("ch");
+        let mut b = bb.subscribe("ch");
+        bb.publish(crate::broadcast_bus::BusMessage {
+                from: "p".into(),
+                content: "fan".into(),
+                timestamp: 0,
+                channel: "ch".into(),
+            })
+            .expect("delivered");
+        assert_eq!(a.recv().await.unwrap().content, "fan");
+        assert_eq!(b.recv().await.unwrap().content, "fan");
+    }
+
+    #[tokio::test]
+    async fn p9_7_message_bus_dual_write_preserves_local_history() {
+        use crate::broadcast_bus::BroadcastBus;
+
+        let bb = BroadcastBus::new();
+        let mut bus = MessageBus::new().with_broadcast(bb);
+        bus.subscribe("a", "ch");
+        for i in 0..3 {
+            bus.publish(BusMessage {
+                from: "p".into(),
+                content: format!("m{i}"),
+                timestamp: i as u64,
+                channel: "ch".into(),
+            });
+        }
+        let local = bus.read("a", "ch");
+        assert_eq!(local.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn p9_7_broadcast_bus_distinct_channels_are_isolated() {
+        use crate::broadcast_bus::BroadcastBus;
+
+        let bb = BroadcastBus::new();
+        let mut a = bb.subscribe("ch_a");
+        let mut b = bb.subscribe("ch_b");
+        bb.publish(crate::broadcast_bus::BusMessage {
+                from: "p".into(),
+                content: "to_a".into(),
+                timestamp: 0,
+                channel: "ch_a".into(),
+            })
+            .expect("delivered");
+        assert_eq!(a.recv().await.unwrap().content, "to_a");
+        // ch_b receiver must NOT receive ch_a's message — non-blocking
+        // try_recv should yield Empty.
+        assert!(b.try_recv().is_err());
+    }
+
+    #[test]
+    fn p9_7_message_bus_deprecation_lint_is_active_at_struct_level() {
+        // Pin the deprecation: the struct itself carries `#[deprecated]`
+        // so any *new* code that constructs a bare `MessageBus` outside
+        // the test/back-compat shield will get a compiler warning. We
+        // can't observe lints at runtime, but we can at least verify
+        // the back-compat constructor still produces an empty bus, so
+        // the migration path stays usable.
+        let bus = MessageBus::new();
+        assert!(bus.broadcast().is_none());
+    }
 }
+

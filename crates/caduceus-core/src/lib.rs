@@ -2,14 +2,27 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
 pub mod keybindings;
+pub mod path_norm;
+pub mod process_reward;
+pub mod sanitizer;
+pub mod verification;
 
 pub use keybindings::{resolve_platform_shortcut, Keybinding, KeybindingConfig, KeybindingPreset};
+pub use path_norm::{is_path_like_field, normalize_lex, PATH_LIKE_FIELDS};
+pub use sanitizer::{
+    SanitizationFlags, SanitizedOutput, ToolOutputSanitizer, DEFAULT_MAX_BYTES as DEFAULT_TOOL_OUTPUT_MAX_BYTES,
+};
+pub use process_reward::{
+    EnsembleCombiner, EnsembleStepVerifier, ObservedToolCall, OffStepVerifier, StepScore,
+    StepVerifier, StepView,
+};
+pub use verification::{majority_vote, weighted_majority_vote, VerificationStrategy, VoteOutcome};
 
 // ── ID newtypes ────────────────────────────────────────────────────────────────
 
@@ -75,11 +88,54 @@ impl ToolCallId {
 
 // ── Session types ──────────────────────────────────────────────────────────────
 
+// ── G26 / P7.1: monotonic StepId ─────────────────────────────────────────────
+//
+// A `StepId` identifies one logical iteration of the agent loop: typically
+// "one LLM call plus its associated tool batch". It is the join key that
+// downstream consumers (OTel exporter — G23, trajectory recorder — G22)
+// use to align tool calls with the LLM step that requested them. Without
+// it, batched parallel tool calls cannot be reliably traced back to the
+// step that produced them once they land out of order on the wire.
+//
+// Properties:
+// * monotonic, per-session, never reused
+// * starts at 0 — so an unstamped event implicitly belongs to "pre-loop"
+//   work (history setup, system prompt assembly, etc.)
+// * carried as a plain `u64` on `AgentEvent::StepStarted` /
+//   `AgentEvent::StepCompleted` so wire decoders don't need a new type
+// * the counter itself lives on `SessionState` and is shared with the
+//   emitter via `Arc<AtomicU64>` so producer threads can fetch the
+//   current step without locking
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct StepId(pub u64);
+
+impl StepId {
+    pub const PRELOOP: StepId = StepId(0);
+
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for StepId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "step#{}", self.0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionPhase {
     Idle,
     Running,
     AwaitingPermission,
+    /// P6.6 / G21 — verification step (rollout vote, PRM scoring) is
+    /// running. Distinct from `Running` so the UI can show a "verifying"
+    /// indicator and so cancellation hits the verifier `tokio::select!`
+    /// arm rather than the main turn loop.
+    Verifying,
+    /// P6.6 / G21 — test-gate is executing the build / test suite to
+    /// validate the candidate solution before committing.
+    TestGating,
     Cancelling,
     Completed,
     Error,
@@ -96,6 +152,18 @@ pub struct SessionState {
     pub turn_count: u32,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// G26 / P7.1 — monotonic step counter. Skipped from serde because
+    /// it's a runtime clock; persisted sessions resume from `current()`
+    /// at zero (replays use the recorded `StepStarted` events to drive
+    /// progression deterministically). Wrapped in `Arc<AtomicU64>` so
+    /// the orchestrator can hand a clone to the `AgentEventEmitter`
+    /// for read-only "current step" queries from any task.
+    #[serde(skip, default = "default_step_counter")]
+    pub step_counter: Arc<AtomicU64>,
+}
+
+fn default_step_counter() -> Arc<AtomicU64> {
+    Arc::new(AtomicU64::new(0))
 }
 
 impl SessionState {
@@ -111,7 +179,27 @@ impl SessionState {
             turn_count: 0,
             created_at: now,
             updated_at: now,
+            step_counter: default_step_counter(),
         }
+    }
+
+    /// Atomically allocate the next `StepId`. Monotonic across the
+    /// lifetime of the `SessionState`. Safe to call from any task; the
+    /// underlying counter is shared with any emitter cloned via
+    /// [`SessionState::step_counter`].
+    pub fn next_step(&self) -> StepId {
+        let n = self.step_counter.fetch_add(1, Ordering::Relaxed);
+        // Reserve `0` for "pre-loop" work (StepId::PRELOOP). The first
+        // real step the loop allocates is therefore `1`. We accomplish
+        // this by treating `fetch_add`'s return as the *previous*
+        // value and skipping zero on first allocation.
+        StepId(n + 1)
+    }
+
+    /// Read the current (last-allocated) step id without advancing the
+    /// counter. Returns `StepId::PRELOOP` before the first `next_step`.
+    pub fn current_step(&self) -> StepId {
+        StepId(self.step_counter.load(Ordering::Relaxed))
     }
 }
 
@@ -214,6 +302,12 @@ pub enum StopReason {
     /// could return Err without ever emitting TurnComplete, leaving UI
     /// listeners hung waiting for a turn-end boundary.
     Error,
+    /// The orchestrator-side [`TurnBudget`] (gap G11) was exceeded before
+    /// the model emitted a natural stop. Distinct from `MaxTokens`
+    /// (provider-side context cap) and `Error` (transport failure) so the
+    /// UI can surface a clear "rate limit / budget" message and offer a
+    /// "raise budget and continue" affordance instead of restarting.
+    BudgetExceeded,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +338,209 @@ impl LlmResponse {
 }
 
 // ── Streaming Events (Orchestrator → Frontend) ────────────────────────────────
+
+/// Outcome of a permission/approval request emitted as `PermissionDecision`.
+/// The UI uses this to render an accurate post-prompt status (e.g. "timed out"
+/// vs "denied") and the orchestrator can attribute telemetry per-outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PermissionOutcome {
+    /// User explicitly approved the action.
+    Approved,
+    /// User explicitly denied the action.
+    Denied,
+    /// No response received within the configured window. The orchestrator
+    /// treats this as a denial for safety, but UIs should label it distinctly
+    /// because the user didn't actually choose.
+    TimedOut { waited_secs: u64 },
+    /// Approval channel was closed (frontend gone, IPC torn down). Treated
+     /// as a denial, surfaced separately so callers can distinguish from a
+    /// real "no" or a dropped prompt.
+    ChannelClosed,
+    /// A decision arrived but its `id` did not match the request we were
+    /// waiting on. Indicates an out-of-order or stale UI message; the
+    /// orchestrator denies for safety. Carries the ids for diagnostics.
+    MismatchedId { expected: String, got: String },
+    /// G33 — forward-compat catch-all. Any tag this build doesn't
+    /// recognise deserialises here so older readers don't crash on a
+    /// newer wire payload. Treated as a denial by [`is_approved`] —
+    /// fail-safe for permission decisions specifically.
+    #[serde(other)]
+    Unknown,
+}
+
+/// G27 / P10.4 — coarse decision bucket used by [`AgentEvent::ApprovalDecided`]
+/// for analytics (approval rate, timeout rate, decision latency). Wider
+/// classifications than [`PermissionOutcome`] collapse to `Denied` so
+/// dashboards stay readable; the structured outcome stays available on
+/// the sibling [`AgentEvent::PermissionDecision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    Approved,
+    Denied,
+    TimedOut,
+}
+
+impl ApprovalDecision {
+    /// Lossy projection from the harness's full [`PermissionOutcome`].
+    /// Channel-closed, mismatched-id, and unknown collapse to `Denied`
+    /// because, from a metrics standpoint, they are user-equivalent
+    /// to "no" — the action did not run.
+    pub fn from_outcome(o: &PermissionOutcome) -> Self {
+        match o {
+            PermissionOutcome::Approved => ApprovalDecision::Approved,
+            PermissionOutcome::TimedOut { .. } => ApprovalDecision::TimedOut,
+            PermissionOutcome::Denied
+            | PermissionOutcome::ChannelClosed
+            | PermissionOutcome::MismatchedId { .. }
+            | PermissionOutcome::Unknown => ApprovalDecision::Denied,
+        }
+    }
+}
+
+impl PermissionOutcome {
+    /// Returns true if the outcome should permit tool execution.
+    pub fn is_approved(&self) -> bool {
+        matches!(self, PermissionOutcome::Approved)
+    }
+
+    /// User-facing message embedded in the synthesized tool result when the
+    /// action is skipped. Kept compact so it doesn't dilute the LLM context;
+    /// `got` in `MismatchedId` is bounded so a malicious or buggy bridge
+    /// cannot inject arbitrarily large strings into model context via the
+    /// approval channel.
+    pub fn skip_message(&self) -> String {
+        match self {
+            // Reachable only via direct construction; the orchestrator never
+            // calls `skip_message` on Approved (it executes the tool instead).
+            // Keep this arm so the match is exhaustive and the type is usable
+            // in test fixtures, but flag misuse loudly in debug builds.
+            PermissionOutcome::Approved => {
+                debug_assert!(
+                    false,
+                    "skip_message called on Approved outcome; callers should execute the tool"
+                );
+                "Permission granted".to_string()
+            }
+            PermissionOutcome::Denied => "Permission denied by user".to_string(),
+            PermissionOutcome::TimedOut { waited_secs } => format!(
+                "Permission request timed out after {}s with no user response (treated as denied)",
+                waited_secs
+            ),
+            PermissionOutcome::ChannelClosed => {
+                "Permission channel closed before a decision was made (treated as denied)".to_string()
+            }
+            PermissionOutcome::MismatchedId { expected, got } => {
+                // Bound `got` so an oversized id (from a malicious or buggy
+                // bridge) can't bloat LLM context or smuggle attacker-controlled
+                // content. 128 chars is comfortably above any well-formed id
+                // (`perm_<tool_use.id>` is typically <40 chars).
+                const MAX_GOT: usize = 128;
+                let truncated: String = got.chars().take(MAX_GOT).collect();
+                let suffix = if got.chars().count() > MAX_GOT {
+                    "…(truncated)"
+                } else {
+                    ""
+                };
+                format!(
+                    "Permission decision id mismatch (expected {}, got {}{}; treated as denied)",
+                    expected, truncated, suffix
+                )
+            }
+            PermissionOutcome::Unknown => {
+                // G33 — wire payload from a newer producer; we can't
+                // know what the user actually decided, so we surface
+                // the unknown state explicitly and treat it as a
+                // denial in `is_approved`. Distinct phrasing so an
+                // operator triaging an incident can tell this apart
+                // from a real "no".
+                "Permission decision had an unrecognised outcome \
+                 (treated as denied; client may be older than producer)"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// Wire-protocol contract for `AgentEvent`:
+///
+/// `AgentEvent` uses internally-tagged serde (`#[serde(tag = "type")]`).
+/// As of G33 the enum carries a `#[serde(other)]`-marked `Unknown` unit
+/// variant, so any `type` tag a reader doesn't recognise deserialises
+/// to `Unknown` instead of failing — this gives us forward-compatible
+/// rolling deploys (newer producer / older consumer) without breaking
+/// the IPC stream. Same treatment applies to [`PermissionOutcome`].
+///
+/// Producers MUST NOT use the literal tag `"unknown"` for any new
+/// variant; doing so would short-circuit the catch-all on every reader
+/// and silently drop the new variant's fields.
+///
+/// New variants on the producer side should still be paired with a
+/// wire-format roundtrip test (see `permission_decision_wire_format`)
+/// so we don't accidentally break the *backwards* direction (newer
+/// reader, older producer).
+
+/// G33 — wire envelope wrapping an `AgentEvent` with an explicit
+/// schema version. Use `VersionedAgentEvent` whenever events are
+/// persisted (replay logs, telemetry sinks, recorded fixtures);
+/// untagged in-process IPC streams can keep using bare `AgentEvent`
+/// where the lockstep deploy assumption holds.
+///
+/// `v` is bumped only on a *breaking* change to a variant's payload
+/// (renamed field, type change, removed field). Adding a new variant
+/// is non-breaking thanks to the `Unknown` catch-all and does NOT
+/// require a version bump.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionedAgentEvent {
+    /// Schema version. Current value: [`AGENT_EVENT_SCHEMA_VERSION`].
+    pub v: u16,
+    /// The wrapped event. May deserialise to [`AgentEvent::Unknown`]
+    /// if the producer is on a newer schema.
+    pub event: AgentEvent,
+}
+
+/// Current schema version for [`VersionedAgentEvent`]. Bump on
+/// *breaking* changes only; additive variant changes are absorbed by
+/// the `Unknown` catch-all and do not require a bump.
+pub const AGENT_EVENT_SCHEMA_VERSION: u16 = 1;
+
+impl VersionedAgentEvent {
+    /// Wrap an event with the current schema version.
+    pub fn current(event: AgentEvent) -> Self {
+        Self {
+            v: AGENT_EVENT_SCHEMA_VERSION,
+            event,
+        }
+    }
+
+    /// `true` iff this envelope was emitted by a newer producer than
+    /// this build understands. Readers SHOULD log a warning and may
+    /// surface a "client out of date" hint to the user.
+    pub fn is_from_newer_producer(&self) -> bool {
+        self.v > AGENT_EVENT_SCHEMA_VERSION
+    }
+}
+
+/// Lightweight reference describing a message group that was evicted from
+/// the active context window during compaction. Used in
+/// [`AgentEvent::ContextGroupsEvicted`] (G31) so consumers can render *what*
+/// was dropped without re-reading the full message body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvictedGroupRef {
+    /// Free-form group kind: `"system"`, `"user"`, `"assistant_text"`,
+    /// `"tool_call"`, `"summary"`, etc. Stringly-typed so callers in
+    /// downstream crates (compaction, history) can stamp their own
+    /// taxonomies without forcing a core-side enum dependency.
+    pub kind: String,
+    /// Number of underlying messages collapsed into this evicted unit.
+    pub message_count: u32,
+    /// Approximate token cost recovered by dropping this group.
+    pub token_count: u32,
+    /// Why this group was evicted. Examples: `"oldest-non-system"`,
+    /// `"window-overflow"`, `"emergency-budget"`, `"tool-collapse"`.
+    pub reason: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -298,6 +595,124 @@ pub enum AgentEvent {
         before: u32,
         after: u32,
     },
+    /// Emitted when one or more message groups are dropped from the active
+    /// context window. Carries enough metadata for replay tooling and the UI
+    /// to render *what* was lost (kind, role/message count, approximate
+    /// tokens) and *why* (strategy name + per-group reason). G31.
+    ///
+    /// `strategy` identifies the eviction source (e.g. `"truncate-oldest"`,
+    /// `"sliding-window"`, `"emergency-truncator"`). `groups` lists each
+    /// dropped unit oldest-first. `total_tokens` is the sum of
+    /// `EvictedGroupRef::token_count` across `groups` for cheap UI access.
+    ContextGroupsEvicted {
+        strategy: String,
+        groups: Vec<EvictedGroupRef>,
+        total_tokens: u32,
+    },
+    /// Emitted once per stale approval message that the orchestrator drained
+    /// from the approval channel while looking for the response that matches
+    /// the currently-pending [`AgentEvent::PermissionRequest`]. Surfaces
+    /// otherwise-silent buffer-clearing so operators can correlate with UI
+    /// double-click bugs, dropped websockets, or out-of-order replies.
+    /// G28 — telemetry half (durable per-turn id rebuild deferred).
+    DrainedStaleApproval {
+        /// The id we *expected* on this turn.
+        expected: String,
+        /// The id actually pulled out of the channel.
+        drained: String,
+    },
+
+    /// A new step has been recorded in Plan mode and is awaiting either
+    /// (a) execution when the user switches to Act mode, or (b) an
+    /// optional user amendment via the `amend_plan` IPC. (G4 / P3.1)
+    /// The UI shows this as an editable row in the plan panel.
+    PlanStepPending {
+        /// 1-indexed step number within the plan.
+        step: usize,
+        /// Per-step revision (starts at 0, bumps on each amendment).
+        revision: u64,
+        /// Plan-level revision after this step was added.
+        plan_revision: u64,
+        /// Tool that will be invoked.
+        tool_name: String,
+        /// Human-readable description (the rendered tool call args).
+        description: String,
+    },
+
+    /// An external `amend_plan` IPC mutated the plan. Emitted on
+    /// success AND failure so consumers can stay in sync. (G4 / P3.1)
+    PlanAmended {
+        /// What kind of amendment was attempted ("replace", "insert",
+        /// "remove"). Snake_case to match `PlanAmendment` serde.
+        kind: String,
+        /// The step the amendment targeted (1-indexed). For Insert,
+        /// this is the FINAL position of the new step on success.
+        step: usize,
+        /// `true` if applied, `false` if rejected.
+        ok: bool,
+        /// Human-readable summary on success, error message on failure.
+        reason: String,
+        /// Plan-level revision AFTER the amendment (unchanged on
+        /// failure — UIs can use this to detect "no-op" reliably).
+        plan_revision: u64,
+    },
+
+    /// Per-completion token-logprob summary (gap G10 / P3.2). Emitted
+    /// once per `provider.chat()` round when the provider returned
+    /// `ChatResponse.logprobs = Some(_)`. The UI uses `confidence` to
+    /// render a tri-state dot next to the assistant message; the
+    /// numeric fields are surfaced on hover. Absence of this event
+    /// means "provider does not support logprobs OR they were not
+    /// requested" — never treat as low confidence.
+    TokenLogprobSummary {
+        n_tokens: u32,
+        min_token_p: f32,
+        mean_token_p: f32,
+        confidence: String,
+    },
+
+    /// A tool-batch checkpoint was created (gap G13 / P3.3). UI
+    /// renders an entry in the timeline with a one-click revert
+    /// button. `files` is the count of file snapshots captured.
+    CheckpointCreated {
+        id: u64,
+        turn_index: u32,
+        tool_summary: String,
+        files: u32,
+    },
+
+    /// User invoked revert on a checkpoint (gap G13 / P3.3). `ok =
+    /// false` means the checkpoint id was unknown / already reverted /
+    /// still open; `reason` carries the diagnostic. UI greys out the
+    /// entry on success and shows a toast on failure.
+    CheckpointReverted {
+        id: u64,
+        ok: bool,
+        files: u32,
+        reason: String,
+    },
+
+    /// A background agent reached a terminal state (gap G15 / P3.4).
+    /// Mirror of `BackgroundNotification` for consumers that prefer
+    /// the `AgentEvent` stream over `subscribe_notifications()`.
+    BackgroundAgentDone {
+        agent_id: String,
+        task_description: String,
+        /// "completed" / "failed" / "cancelled".
+        kind: String,
+        detail: String,
+    },
+
+    /// The harness re-resolved the active token budget — typically
+    /// when a new model was selected and `TokenBudget::for_model` was
+    /// applied (gap G26 / P9.3). UI status bar shows the new ceiling.
+    /// `model_id` is the resolved model name; `context_limit` and
+    /// `reserved_output` are the new budget values in tokens.
+    BudgetUpdated {
+        model_id: String,
+        context_limit: u32,
+        reserved_output: u32,
+    },
 
     // ── Loop / failure detection ──────────────────────────────────────────────
     LoopDetected {
@@ -333,6 +748,30 @@ pub enum AgentEvent {
         capability: String,
         description: String,
     },
+    /// Emitted after a permission request is resolved (or fails to resolve).
+    /// Lets the UI distinguish user-deny from timeout / channel-closed /
+    /// id-mismatch scenarios so it can surface the right message and metric.
+    PermissionDecision {
+        id: String,
+        capability: String,
+        outcome: PermissionOutcome,
+    },
+
+    /// G27 / P10.4 — analytics-friendly companion to [`PermissionDecision`].
+    /// Same information, plus the wall-clock latency between `PermissionRequest`
+    /// and resolution. Emitted so downstream dashboards can compute
+    /// approval-rate, time-to-decision, and timeout-rate without joining
+    /// two event streams. Source of preference data for an offline
+    /// "what-the-user-usually-approves" pre-filter (Constitutional AI / RLAIF).
+    ApprovalDecided {
+        /// Tool name (capability) the user was prompted on.
+        tool: String,
+        /// Resolution bucket — coarser than `PermissionOutcome` so the
+        /// dashboard schema is stable across UI variants.
+        decision: ApprovalDecision,
+        /// Wall-clock milliseconds from prompt → decision; capped at u32::MAX.
+        latency_ms: u32,
+    },
 
     // ── Turn lifecycle ────────────────────────────────────────────────────────
     TurnComplete {
@@ -355,7 +794,216 @@ pub enum AgentEvent {
         /// The threshold used
         threshold: f64,
     },
+
+    /// Synthetic event emitted by [`AgentEventEmitter`] when its mpsc buffer
+    /// has been full and one or more events were dropped from the live
+    /// channel (gap G27). The dropped events are still preserved in the
+    /// emitter's retention ring (P1.4 / G14), so a UI that calls
+    /// `replay()` after seeing this event can rebuild the missing slice.
+    ///
+    /// Emitted at most once per "drop streak": the counter resets to 0
+    /// after a successful emit, and the next overflow re-arms the
+    /// notification. UIs should treat this as a soft signal that they
+    /// missed live events but did NOT lose data.
+    EventBufferOverflow {
+        dropped_since_last: u64,
+    },
+
+    /// A multi-agent coordinator's *critic* LLM call (gap G19). This
+    /// surfaces what was previously a hidden third LLM round so the UI
+    /// can render it, the budget guard can charge it, and observers
+    /// can audit-trail it. Emitted by `Coordinator::critique_and_merge`
+    /// once the critic returns; `denied=true` means the gateway hook
+    /// refused the call and the coordinator fell back to plain synthesis.
+    CritiqueCall {
+        /// Model id of the critic (may differ from coordinator/team
+        /// model — that's the whole point of having a critic).
+        critic_model: String,
+        /// How many leaf outputs the critic was shown.
+        leaf_count: usize,
+        /// Number of conflicts the critic flagged. `0` means agreement
+        /// (or the critic missed the conflict — UI should still surface
+        /// the count honestly).
+        conflicts_found: usize,
+        /// Tokens consumed by THIS specific call (not cumulative).
+        /// Zero on `denied=true`.
+        input_tokens: u32,
+        output_tokens: u32,
+        /// Wall-clock duration of the critic call in milliseconds.
+        /// Zero on `denied=true`.
+        duration_ms: u64,
+        /// `true` iff a budget/HITL gateway hook refused the call;
+        /// the coordinator silently downgraded to single-pass
+        /// synthesis. UI should make this visible — silent denial of
+        /// a critic is itself a confidence signal.
+        denied: bool,
+    },
+
+    // ── Verification + test-gate phase events (gap G21) ───────────────────
+    /// The post-loop verification phase has begun. Emitted before the
+    /// first rollout / test invocation. `strategy` is a short label
+    /// ("test_gated" | "rollout_vote") suitable for UI rendering;
+    /// `sample_count` is the number of additional rollouts (0 for
+    /// `TestGated`, `extra_samples` for `RolloutVote`).
+    VerificationStarted {
+        strategy: String,
+        sample_count: usize,
+    },
+    /// Verification finished. `ballots_collected` includes the
+    /// original answer; `agreed` is true iff a majority winner
+    /// emerged AND it differed from the original answer (the only
+    /// case where the user-visible answer actually changes). `cancelled`
+    /// is true iff the user cancelled mid-verification.
+    VerificationCompleted {
+        ballots_collected: usize,
+        agreed: bool,
+        cancelled: bool,
+    },
+    /// A test-gate run is about to be spawned. The command is sent
+    /// joined-as-it-would-be-displayed (NOT shell-parsed) so the UI
+    /// can show it verbatim; sensitive args should be filtered by the
+    /// caller before reaching this event.
+    TestGateStarted {
+        command_display: String,
+        working_dir: String,
+        timeout_secs: u64,
+    },
+    /// A test-gate run finished. `outcome` is one of
+    /// `"pass" | "fail" | "timeout" | "spawn_error" | "cancelled"` —
+    /// matches the [`crate::TestGateOutcome`] variants plus the
+    /// new G21 cancel state. `exit_code` is `None` on timeout /
+    /// spawn_error / cancelled.
+    TestGateCompleted {
+        outcome: String,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+    },
+
+    // ── Parallel-tool batch diagnostics (gap G29) ─────────────────────────
+    /// A parallel tool batch is starting. `parallelisable` is `false`
+    /// when the dispatcher has downgraded the batch to sequential
+    /// execution (for example because at least one tool is
+    /// `ToolKind::Destructive`); UIs should surface that downgrade so
+    /// the user can see why their batch isn't actually parallel.
+    ParallelToolBatchStarted {
+        tool_count: usize,
+        parallelisable: bool,
+    },
+    /// A parallel tool batch finished. `ok_count + error_count ==
+    /// tool_count` always holds; `duration_ms` is wall-clock for the
+    /// whole batch (max of each tool's runtime, not the sum).
+    ParallelToolBatchCompleted {
+        tool_count: usize,
+        ok_count: usize,
+        error_count: usize,
+        duration_ms: u64,
+    },
+
+    /// G34 / P11.2 — emitted once per individual tool that exceeded its
+    /// per-tool wall-clock budget. Always paired with a `Tool` result
+    /// carrying `is_error = true`; the dedicated event makes it cheap
+    /// for dashboards to count timeouts without parsing tool result
+    /// content. `timeout_secs` reflects the budget that was applied
+    /// (per-tool override OR global default).
+    ToolTimedOut {
+        tool: String,
+        timeout_secs: u64,
+        elapsed_ms: u64,
+    },
+
+    /// P11.5 — emitted once per individual tool whose execution was
+    /// aborted because the run-level cancellation token fired AFTER
+    /// the tool already started. The tool's spawned future is
+    /// dropped; the corresponding tool_result message carries
+    /// `is_error = true` and a "Tool '...' cancelled" content so the
+    /// model can observe the abort. `elapsed_ms` is the time the
+    /// tool actually ran before cancellation hit.
+    ToolCancelled {
+        tool: String,
+        elapsed_ms: u64,
+    },
+
+    // ── G26 / P7.1: step boundaries ──────────────────────────────────────
+    //
+    // Bracket every iteration of the agent loop. Downstream consumers
+    // (OTel exporter — G23, trajectory replayer — G22) align tool calls
+    // with the LLM step that requested them by reading the surrounding
+    // `StepStarted` / `StepCompleted` pair. Pre-loop work (history
+    // assembly, system prompt resolution) belongs to `StepId::PRELOOP`
+    // and is not bracketed.
+    /// A new agent loop iteration began. `step_id` is monotonic per
+    /// session (allocated via `SessionState::next_step`). Always paired
+    /// with a `StepCompleted` carrying the same id, even on error /
+    /// cancellation, so consumers can balance the bracket.
+    StepStarted {
+        step_id: u64,
+    },
+    /// The current iteration finished. `ok` is `false` if the step
+    /// terminated due to error, cancellation, or unmet verification —
+    /// downstream telemetry uses this to compute step success rates.
+    StepCompleted {
+        step_id: u64,
+        ok: bool,
+    },
+
+    /// P13.2 (G‑R5.2) — the harness reflected on a tool failure
+    /// mid‑turn (Shinn et al., Reflexion 2023) and recorded a lesson
+    /// that was both stored in `ReflexionMemory` AND inlined into the
+    /// failing tool_result so the next provider call sees it in the
+    /// same turn (no inter‑attempt delay). UIs SHOULD render this as
+    /// an inline note attached to the failed tool, not as a separate
+    /// event row, so the user sees what the agent learned.
+    ReflexionRecorded {
+        /// The tool whose failure triggered the reflection.
+        tool: String,
+        /// The lesson string that was both stored and shown to the
+        /// model. Truncated to 512 chars by emitter contract.
+        lesson: String,
+    },
+
+    /// P13.6 (G‑R10.1) — the per‑turn critic produced a verdict on
+    /// the candidate final response. `accepted=true` means the
+    /// harness emitted `TurnComplete`; `accepted=false` means the
+    /// harness appended `feedback` as a synthetic user message and
+    /// is running a revision turn. `iteration` is the zero‑indexed
+    /// revision count BEFORE this verdict (so the first verdict on
+    /// a turn is always `iteration=0`).
+    ///
+    /// Inspired by Self‑Refine (Madaan et al., NeurIPS 2023) and
+    /// CRITIC (Gou et al., ICLR 2024). UIs SHOULD render rejects
+    /// distinctly so users can see why a turn ran twice.
+    CriticVerdict {
+        accepted: bool,
+        feedback: String,
+        iteration: u32,
+    },
+
+    /// G33 — forward-compat catch-all. Any `type` tag this build
+    /// doesn't recognise deserialises here, so an older reader doesn't
+    /// hard-fail on a newer wire payload. UIs SHOULD render this as a
+    /// neutral "unrecognised event (upgrade your client)" placeholder
+    /// rather than dropping it silently — silent drops would let new
+    /// safety-relevant events go invisible on stale clients.
+    #[serde(other)]
+    Unknown,
 }
+
+// G25 — defensive contracts. The retention ring (P1.4) clones every
+// `AgentEvent` it stores and broadcasts it across tasks via tokio
+// channels, so the type MUST be `Clone + Send + Sync + 'static`.
+// These bounds are enforced today by transitive use sites (the code
+// won't compile if they're broken), but a contributor adding e.g. a
+// `Box<dyn Trait>` field could subtly weaken `Send`/`Sync` and the
+// regression would only surface deep inside an async test failure.
+// `assert_impl_all!` makes the contract a compile-time error at the
+// definition site, with a clear message pointing at this module.
+//
+// Same contract for `PermissionOutcome` (carried across the IPC
+// boundary by the same channels) and `VersionedAgentEvent` (the
+// persisted-stream wrapper introduced in G33).
+static_assertions::assert_impl_all!(AgentEvent: Clone, Send, Sync);
+static_assertions::assert_impl_all!(PermissionOutcome: Clone, Send, Sync);
+static_assertions::assert_impl_all!(VersionedAgentEvent: Clone, Send, Sync);
 
 /// A candidate agent/skill evaluated during semantic routing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -443,6 +1091,98 @@ impl TokenBudget {
     pub const DEFAULT_RESERVED_OUTPUT: u32 = 8_192;
     /// Default context window assumed when a model isn't recognized.
     pub const DEFAULT_CONTEXT_LIMIT: u32 = 200_000;
+
+    /// Per-model context-aware defaults (gap G12 / P4.4). Returns the
+    /// `(context_limit, reserved_output)` tuple for the given model
+    /// id; falls back to the conservative defaults above if the id
+    /// isn't recognised. Match is by case-insensitive substring on
+    /// the model name so both bare ids ("gpt-4o") and provider-
+    /// prefixed forms ("openai/gpt-4o-mini-2024-07-18") resolve.
+    ///
+    /// Sources (Nov 2025): vendor docs for context windows and
+    /// max_tokens defaults. We pick a reserved_output that is roughly
+    /// the model's documented max output, capped at 1/4 of the
+    /// context window to leave room for the prompt.
+    pub fn model_spec(model_id: &str) -> (u32, u32) {
+        let m = model_id.to_ascii_lowercase();
+
+        // Helper: cap reserved at ¼ of context_limit so a tiny model
+        // can't reserve >25% of its window for output.
+        let pick = |ctx: u32, max_out: u32| -> (u32, u32) {
+            let cap = ctx / 4;
+            (ctx, max_out.min(cap.max(1)))
+        };
+
+        // Anthropic
+        if m.contains("opus-4") {
+            return pick(200_000, 32_000);
+        }
+        if m.contains("sonnet-4") {
+            return pick(200_000, 16_000);
+        }
+        if m.contains("haiku-4") {
+            return pick(200_000, 8_192);
+        }
+        if m.contains("claude-3-5-sonnet") || m.contains("claude-3.5-sonnet") {
+            return pick(200_000, 8_192);
+        }
+        if m.contains("claude-3-5-haiku") || m.contains("claude-3.5-haiku") {
+            return pick(200_000, 8_192);
+        }
+        if m.contains("claude-3-opus") {
+            return pick(200_000, 4_096);
+        }
+
+        // OpenAI
+        if m.contains("gpt-4o-mini") {
+            return pick(128_000, 16_384);
+        }
+        if m.contains("gpt-4o") {
+            return pick(128_000, 16_384);
+        }
+        if m.contains("gpt-4-turbo") || m.contains("gpt-4.1") {
+            return pick(128_000, 8_192);
+        }
+        if m.contains("o1-mini") {
+            return pick(128_000, 65_536);
+        }
+        if m.contains("o1") {
+            return pick(200_000, 100_000);
+        }
+        if m.contains("gpt-3.5") {
+            return pick(16_385, 4_096);
+        }
+
+        // Google
+        if m.contains("gemini-1.5-pro") {
+            return pick(2_000_000, 8_192);
+        }
+        if m.contains("gemini-1.5-flash") {
+            return pick(1_000_000, 8_192);
+        }
+        if m.contains("gemini-2") {
+            return pick(1_000_000, 8_192);
+        }
+
+        // Mistral
+        if m.contains("mistral-large") {
+            return pick(128_000, 8_192);
+        }
+
+        (Self::DEFAULT_CONTEXT_LIMIT, Self::DEFAULT_RESERVED_OUTPUT)
+    }
+
+    /// Build a `TokenBudget` sized for the named model. Per-model
+    /// `context_limit` and `reserved_output` come from `model_spec`.
+    pub fn for_model(model_id: &str) -> Self {
+        let (ctx, reserved) = Self::model_spec(model_id);
+        Self {
+            context_limit: ctx,
+            used_input: 0,
+            used_output: 0,
+            reserved_output: reserved,
+        }
+    }
 }
 
 impl Default for TokenBudget {
@@ -492,6 +1232,38 @@ impl TokenBudget {
 
 // ── Tool types ─────────────────────────────────────────────────────────────────
 
+/// Side-effect classification for a tool. Used by the parallel
+/// dispatcher (gap G20) to decide whether two queued tool calls may
+/// safely run concurrently.
+///
+/// Defaults to [`ToolKind::Destructive`] under serde so an older
+/// persisted spec (or a tool that forgot to set this) is treated as
+/// the most dangerous case — fail safe, never fail open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    /// Pure read; never mutates state on the local machine, the
+    /// filesystem, or any remote service. Two `ReadOnly` calls may
+    /// always run in parallel, even on the same resource.
+    ReadOnly,
+    /// Mutates state, but the operation is idempotent: applying it
+    /// twice yields the same result as applying it once. Safe to
+    /// retry; *not* generally safe to run concurrently with another
+    /// tool on the same resource.
+    Idempotent,
+    /// Mutates state with no idempotency guarantee. Must serialise
+    /// against everything else in the same batch — a destructive
+    /// task in a batch downgrades the whole batch to sequential
+    /// execution.
+    Destructive,
+}
+
+impl Default for ToolKind {
+    fn default() -> Self {
+        Self::Destructive
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
@@ -537,6 +1309,132 @@ impl ToolResult {
     pub fn with_tool_use_id(mut self, id: impl Into<String>) -> Self {
         self.tool_use_id = Some(id.into());
         self
+    }
+}
+
+// ── Turn budget (gap G11) ─────────────────────────────────────────────────────
+
+/// Per-turn execution budget. Bounds tool-call count, cumulative tool wall-
+/// clock, and total bytes of tool output a single agent turn may consume,
+/// so a runaway loop can't fire 50 iterations × 4 parallel calls × 100 KiB
+/// each before the model itself decides to stop.
+///
+/// This is **orchestrator-side** rate limiting, distinct from
+/// `TokenBudget` (provider context) and the `tool_timeout` per single call.
+/// The full picture is:
+///
+/// | Layer            | Bounds                                      |
+/// |------------------|---------------------------------------------|
+/// | `TokenBudget`    | input + output tokens vs context window     |
+/// | `tool_timeout`   | wall-clock of one tool call                 |
+/// | `TurnBudget`     | call count + cumulative wall-clock + bytes  |
+///
+/// Defaults are sized to the conservative "deeply automated refactor"
+/// envelope used by the reference workflows; raise them per-host (CI,
+/// long-running batch agents) via the builder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnBudget {
+    pub max_tool_calls: u32,
+    pub max_total_tool_seconds: u64,
+    pub max_total_bytes_read: u64,
+}
+
+impl TurnBudget {
+    pub const DEFAULT_MAX_TOOL_CALLS: u32 = 200;
+    pub const DEFAULT_MAX_TOTAL_TOOL_SECONDS: u64 = 600; // 10 min
+    pub const DEFAULT_MAX_TOTAL_BYTES_READ: u64 = 50 * 1024 * 1024; // 50 MiB
+
+    pub fn unlimited() -> Self {
+        Self {
+            max_tool_calls: u32::MAX,
+            max_total_tool_seconds: u64::MAX,
+            max_total_bytes_read: u64::MAX,
+        }
+    }
+}
+
+impl Default for TurnBudget {
+    fn default() -> Self {
+        Self {
+            max_tool_calls: Self::DEFAULT_MAX_TOOL_CALLS,
+            max_total_tool_seconds: Self::DEFAULT_MAX_TOTAL_TOOL_SECONDS,
+            max_total_bytes_read: Self::DEFAULT_MAX_TOTAL_BYTES_READ,
+        }
+    }
+}
+
+/// Mutable accumulator paired with a [`TurnBudget`] for a single turn.
+/// Created at turn start, updated after every tool call, queried before
+/// each new round.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TurnBudgetUsage {
+    pub tool_calls: u32,
+    pub total_tool_seconds: u64,
+    pub total_bytes_read: u64,
+}
+
+/// Reason the budget tripped, surfaced in events / logs / tool-result
+/// synth so the model can see exactly why we stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BudgetBreach {
+    ToolCalls { used: u32, limit: u32 },
+    ToolSeconds { used: u64, limit: u64 },
+    BytesRead { used: u64, limit: u64 },
+}
+
+impl BudgetBreach {
+    /// Single-line message suitable for both the synthesised tool result
+    /// and a UI toast. Stable wording — assert on it from tests.
+    pub fn message(&self) -> String {
+        match self {
+            BudgetBreach::ToolCalls { used, limit } => format!(
+                "Turn budget exceeded: {used} tool calls (limit {limit}). \
+                 Stopping turn; raise turn_budget.max_tool_calls to continue."
+            ),
+            BudgetBreach::ToolSeconds { used, limit } => format!(
+                "Turn budget exceeded: {used}s of tool wall-clock (limit {limit}s). \
+                 Stopping turn; raise turn_budget.max_total_tool_seconds to continue."
+            ),
+            BudgetBreach::BytesRead { used, limit } => format!(
+                "Turn budget exceeded: {used} bytes of tool output (limit {limit}). \
+                 Stopping turn; raise turn_budget.max_total_bytes_read to continue."
+            ),
+        }
+    }
+}
+
+impl TurnBudgetUsage {
+    /// Add one tool call's bookkeeping. Saturating arithmetic so a buggy
+    /// caller can't wrap around and silently re-arm the budget.
+    pub fn record(&mut self, wall_seconds: u64, bytes_read: u64) {
+        self.tool_calls = self.tool_calls.saturating_add(1);
+        self.total_tool_seconds = self.total_tool_seconds.saturating_add(wall_seconds);
+        self.total_bytes_read = self.total_bytes_read.saturating_add(bytes_read);
+    }
+
+    /// Returns `Some(BudgetBreach)` if the current usage exceeds any limit.
+    /// Caller should bail and emit `StopReason::BudgetExceeded`.
+    pub fn check(&self, budget: &TurnBudget) -> Option<BudgetBreach> {
+        if self.tool_calls > budget.max_tool_calls {
+            return Some(BudgetBreach::ToolCalls {
+                used: self.tool_calls,
+                limit: budget.max_tool_calls,
+            });
+        }
+        if self.total_tool_seconds > budget.max_total_tool_seconds {
+            return Some(BudgetBreach::ToolSeconds {
+                used: self.total_tool_seconds,
+                limit: budget.max_total_tool_seconds,
+            });
+        }
+        if self.total_bytes_read > budget.max_total_bytes_read {
+            return Some(BudgetBreach::BytesRead {
+                used: self.total_bytes_read,
+                limit: budget.max_total_bytes_read,
+            });
+        }
+        None
     }
 }
 
@@ -1599,6 +2497,108 @@ mod tests {
     }
 
     #[test]
+    fn turn_budget_default_has_sane_limits() {
+        let b = TurnBudget::default();
+        assert!(b.max_tool_calls >= 50);
+        assert!(b.max_total_tool_seconds >= 60);
+        assert!(b.max_total_bytes_read >= 1024 * 1024);
+    }
+
+    #[test]
+    fn turn_budget_unlimited_never_trips() {
+        let b = TurnBudget::unlimited();
+        let mut u = TurnBudgetUsage::default();
+        for _ in 0..1000 {
+            u.record(10, 100_000);
+        }
+        assert!(u.check(&b).is_none());
+    }
+
+    #[test]
+    fn turn_budget_trips_on_call_count() {
+        let b = TurnBudget {
+            max_tool_calls: 3,
+            ..TurnBudget::unlimited()
+        };
+        let mut u = TurnBudgetUsage::default();
+        for _ in 0..3 {
+            u.record(0, 0);
+        }
+        assert!(u.check(&b).is_none(), "exactly limit should NOT trip");
+        u.record(0, 0);
+        match u.check(&b) {
+            Some(BudgetBreach::ToolCalls { used: 4, limit: 3 }) => {}
+            other => panic!("expected ToolCalls breach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_budget_trips_on_seconds() {
+        let b = TurnBudget {
+            max_total_tool_seconds: 5,
+            ..TurnBudget::unlimited()
+        };
+        let mut u = TurnBudgetUsage::default();
+        u.record(6, 0);
+        assert!(matches!(
+            u.check(&b),
+            Some(BudgetBreach::ToolSeconds { used: 6, limit: 5 })
+        ));
+    }
+
+    #[test]
+    fn turn_budget_trips_on_bytes() {
+        let b = TurnBudget {
+            max_total_bytes_read: 1000,
+            ..TurnBudget::unlimited()
+        };
+        let mut u = TurnBudgetUsage::default();
+        u.record(0, 1500);
+        assert!(matches!(
+            u.check(&b),
+            Some(BudgetBreach::BytesRead {
+                used: 1500,
+                limit: 1000
+            })
+        ));
+    }
+
+    #[test]
+    fn turn_budget_record_saturates_on_overflow() {
+        let mut u = TurnBudgetUsage {
+            tool_calls: u32::MAX,
+            total_tool_seconds: u64::MAX,
+            total_bytes_read: u64::MAX,
+        };
+        u.record(100, 100);
+        // Saturated, not wrapped — the breach check must still see MAX,
+        // not 99 (which would silently re-arm the budget).
+        assert_eq!(u.tool_calls, u32::MAX);
+        assert_eq!(u.total_tool_seconds, u64::MAX);
+        assert_eq!(u.total_bytes_read, u64::MAX);
+    }
+
+    #[test]
+    fn budget_breach_messages_are_actionable() {
+        let m = BudgetBreach::ToolCalls { used: 100, limit: 50 }.message();
+        assert!(m.contains("100"));
+        assert!(m.contains("50"));
+        assert!(m.contains("max_tool_calls"));
+    }
+
+    #[test]
+    fn budget_breach_serde_round_trip() {
+        let breach = BudgetBreach::BytesRead {
+            used: 999,
+            limit: 100,
+        };
+        let json = serde_json::to_string(&breach).unwrap();
+        assert!(json.contains("bytes_read"));
+        let back: BudgetBreach = serde_json::from_str(&json).unwrap();
+        assert_eq!(breach, back);
+    }
+
+    #[test]
     fn llm_response_extracts_text_and_tools() {
         let resp = LlmResponse {
             content: vec![
@@ -1622,6 +2622,99 @@ mod tests {
         let event = AgentEvent::TextDelta { text: "hi".into() };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"TextDelta\""));
+    }
+
+    /// Pin the `PermissionDecision` wire format so an accidental change to
+    /// `tag = "type"` or to `PermissionOutcome`'s `tag = "kind"` /
+    /// `rename_all = "snake_case"` is caught by the test suite. Any consumer
+    /// (the bridge, telemetry, replay logging) depends on the exact layout
+    /// asserted here.
+    #[test]
+    fn permission_decision_wire_format() {
+        // TimedOut variant — payload field carried.
+        let event = AgentEvent::PermissionDecision {
+            id: "perm_x".into(),
+            capability: "write_file".into(),
+            outcome: PermissionOutcome::TimedOut { waited_secs: 300 },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"type\":\"PermissionDecision\""),
+            "AgentEvent tag must be PermissionDecision, got: {json}"
+        );
+        assert!(
+            json.contains("\"kind\":\"timed_out\""),
+            "PermissionOutcome should serialize TimedOut as snake_case, got: {json}"
+        );
+        assert!(
+            json.contains("\"waited_secs\":300"),
+            "TimedOut payload must include waited_secs, got: {json}"
+        );
+
+        // Denied variant — pure unit, no payload.
+        let denied = AgentEvent::PermissionDecision {
+            id: "perm_x".into(),
+            capability: "write_file".into(),
+            outcome: PermissionOutcome::Denied,
+        };
+        let json2 = serde_json::to_string(&denied).unwrap();
+        assert!(
+            json2.contains("\"kind\":\"denied\""),
+            "Denied should serialize as kind=denied, got: {json2}"
+        );
+
+        // MismatchedId — both ids preserved on the wire.
+        let mismatched = AgentEvent::PermissionDecision {
+            id: "perm_x".into(),
+            capability: "write_file".into(),
+            outcome: PermissionOutcome::MismatchedId {
+                expected: "perm_x".into(),
+                got: "perm_y".into(),
+            },
+        };
+        let json3 = serde_json::to_string(&mismatched).unwrap();
+        assert!(
+            json3.contains("\"kind\":\"mismatched_id\""),
+            "got: {json3}"
+        );
+        assert!(json3.contains("\"expected\":\"perm_x\""), "got: {json3}");
+        assert!(json3.contains("\"got\":\"perm_y\""), "got: {json3}");
+    }
+
+    /// G33 — after introducing `#[serde(other)] Unknown`, the contract
+    /// flipped: unknown `AgentEvent` tags now deserialise to `Unknown`
+    /// instead of erroring. This preserves forward-compat across rolling
+    /// deploys (newer producer / older consumer). If serde ever changes
+    /// `#[serde(other)]` semantics on internally-tagged enums, this test
+    /// breaks loudly so we can re-evaluate the compat story.
+    #[test]
+    fn agent_event_unknown_variant_errors_cleanly() {
+        let json = r#"{"type":"FutureUnknownVariant","data":"x"}"#;
+        let parsed: AgentEvent = serde_json::from_str(json)
+            .expect("unknown tag should fall through to Unknown, not error");
+        assert!(matches!(parsed, AgentEvent::Unknown));
+    }
+
+    /// Bound-check on `MismatchedId.skip_message`: an oversized `got` is
+    /// truncated so a malicious bridge can't bloat LLM context with arbitrary
+    /// content via the approval channel.
+    #[test]
+    fn mismatched_id_skip_message_truncates_oversized_got() {
+        let huge = "x".repeat(5_000);
+        let outcome = PermissionOutcome::MismatchedId {
+            expected: "perm_real".into(),
+            got: huge,
+        };
+        let msg = outcome.skip_message();
+        assert!(
+            msg.len() < 300,
+            "skip_message must truncate huge `got`; got len={}",
+            msg.len()
+        );
+        assert!(
+            msg.contains("(truncated)"),
+            "skip_message should signal truncation, got: {msg}"
+        );
     }
 
     #[test]
@@ -2243,5 +3336,197 @@ log_level = "debug"
             color: "green".to_string(),
         });
         assert_eq!(tracker.all_cursors().len(), 2);
+    }
+
+    // ── G33: forward-compat catch-all + schema version envelope ──────────
+
+    #[test]
+    fn agent_event_unknown_variant_absorbs_unrecognised_tag() {
+        let payload = r#"{"type":"some_future_event_we_dont_know","field":42}"#;
+        let parsed: AgentEvent = serde_json::from_str(payload).unwrap();
+        assert!(matches!(parsed, AgentEvent::Unknown));
+    }
+
+    #[test]
+    fn agent_event_known_variant_still_parses_post_unknown() {
+        let payload = r#"{"type":"TextDelta","text":"hello"}"#;
+        let parsed: AgentEvent = serde_json::from_str(payload).unwrap();
+        match parsed {
+            AgentEvent::TextDelta { text } => assert_eq!(text, "hello"),
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn permission_outcome_unknown_absorbs_future_kind() {
+        let payload = r#"{"kind":"some_future_outcome"}"#;
+        let parsed: PermissionOutcome = serde_json::from_str(payload).unwrap();
+        assert!(matches!(parsed, PermissionOutcome::Unknown));
+        // Critical safety property: unknown outcomes MUST NOT be
+        // treated as approval. If this ever flips we lose the fail-
+        // safe and a producer could silently authorise a tool.
+        assert!(!parsed.is_approved());
+        assert!(parsed.skip_message().contains("unrecognised"));
+    }
+
+    #[test]
+    fn permission_outcome_approved_still_parses() {
+        let payload = r#"{"kind":"approved"}"#;
+        let parsed: PermissionOutcome = serde_json::from_str(payload).unwrap();
+        assert!(parsed.is_approved());
+    }
+
+    #[test]
+    fn versioned_agent_event_roundtrips_at_current_version() {
+        let env = VersionedAgentEvent::current(AgentEvent::TextDelta {
+            text: "x".into(),
+        });
+        let s = serde_json::to_string(&env).unwrap();
+        let back: VersionedAgentEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.v, AGENT_EVENT_SCHEMA_VERSION);
+        assert!(!back.is_from_newer_producer());
+        assert!(matches!(back.event, AgentEvent::TextDelta { .. }));
+    }
+
+    #[test]
+    fn versioned_agent_event_detects_newer_producer() {
+        let payload = format!(
+            r#"{{"v":{},"event":{{"type":"TextDelta","text":"x"}}}}"#,
+            AGENT_EVENT_SCHEMA_VERSION + 1
+        );
+        let env: VersionedAgentEvent = serde_json::from_str(&payload).unwrap();
+        assert!(env.is_from_newer_producer());
+    }
+
+    // ── G26 / P7.1: StepId tests ─────────────────────────────────────────
+
+    #[test]
+    fn step_id_starts_at_one_and_is_monotonic() {
+        let session = SessionState::new(
+            std::path::PathBuf::from("/tmp/x"),
+            ProviderId::new("p"),
+            ModelId::new("m"),
+        );
+        assert_eq!(session.current_step(), StepId::PRELOOP);
+        let s1 = session.next_step();
+        let s2 = session.next_step();
+        let s3 = session.next_step();
+        assert_eq!(s1.raw(), 1);
+        assert_eq!(s2.raw(), 2);
+        assert_eq!(s3.raw(), 3);
+        assert_eq!(session.current_step(), StepId(3));
+    }
+
+    #[test]
+    fn step_id_counter_is_shared_across_clones() {
+        let session = SessionState::new(
+            std::path::PathBuf::from("/tmp/x"),
+            ProviderId::new("p"),
+            ModelId::new("m"),
+        );
+        let cloned = session.clone();
+        let _ = session.next_step();
+        let _ = cloned.next_step();
+        // Both views observe the same monotonic clock — clone shares
+        // the Arc, not a fresh counter, so step ids cannot collide
+        // between an orchestrator and an emitter that holds a clone.
+        assert_eq!(session.current_step().raw(), 2);
+        assert_eq!(cloned.current_step().raw(), 2);
+    }
+
+    #[test]
+    fn step_id_skipped_after_serde_roundtrip_is_safe() {
+        let session = SessionState::new(
+            std::path::PathBuf::from("/tmp/x"),
+            ProviderId::new("p"),
+            ModelId::new("m"),
+        );
+        let _ = session.next_step();
+        let _ = session.next_step();
+        let json = serde_json::to_string(&session).unwrap();
+        // step_counter is #[serde(skip)], so a restored session
+        // resumes from 0 — replays drive progression deterministically
+        // via recorded StepStarted events.
+        let restored: SessionState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.current_step(), StepId::PRELOOP);
+        assert_eq!(restored.next_step().raw(), 1);
+    }
+
+    #[test]
+    fn step_started_completed_serde_roundtrip() {
+        let started = AgentEvent::StepStarted { step_id: 7 };
+        let json = serde_json::to_string(&started).unwrap();
+        assert!(json.contains("\"step_id\":7"));
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, AgentEvent::StepStarted { step_id: 7 }));
+
+        let completed = AgentEvent::StepCompleted {
+            step_id: 7,
+            ok: false,
+        };
+        let json = serde_json::to_string(&completed).unwrap();
+        assert!(json.contains("\"ok\":false"));
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            AgentEvent::StepCompleted { step_id: 7, ok: false }
+        ));
+    }
+
+    #[test]
+    fn token_budget_for_model_picks_anthropic_specs() {
+        let b = TokenBudget::for_model("claude-opus-4.6");
+        assert_eq!(b.context_limit, 200_000);
+        assert_eq!(b.reserved_output, 32_000);
+
+        let b = TokenBudget::for_model("anthropic/claude-haiku-4-5");
+        assert_eq!(b.context_limit, 200_000);
+        assert_eq!(b.reserved_output, 8_192);
+    }
+
+    #[test]
+    fn token_budget_for_model_picks_openai_specs() {
+        let b = TokenBudget::for_model("gpt-4o-mini");
+        assert_eq!(b.context_limit, 128_000);
+        assert_eq!(b.reserved_output, 16_384);
+
+        let b = TokenBudget::for_model("openai/gpt-3.5-turbo");
+        assert_eq!(b.context_limit, 16_385);
+        // Cap kicks in: 4_096 vs ¼ of 16_385 (4_096) → equal.
+        assert!(b.reserved_output <= b.context_limit / 4 + 1);
+    }
+
+    #[test]
+    fn token_budget_for_model_picks_gemini_specs() {
+        let b = TokenBudget::for_model("gemini-1.5-pro-001");
+        assert_eq!(b.context_limit, 2_000_000);
+        assert_eq!(b.reserved_output, 8_192);
+    }
+
+    #[test]
+    fn token_budget_for_model_unknown_falls_back_to_defaults() {
+        let b = TokenBudget::for_model("totally-bogus-model-xyz");
+        assert_eq!(b.context_limit, TokenBudget::DEFAULT_CONTEXT_LIMIT);
+        assert_eq!(b.reserved_output, TokenBudget::DEFAULT_RESERVED_OUTPUT);
+    }
+
+    #[test]
+    fn token_budget_for_model_is_case_insensitive() {
+        let lo = TokenBudget::for_model("claude-sonnet-4-5");
+        let mixed = TokenBudget::for_model("Claude-Sonnet-4-5");
+        assert_eq!(lo.context_limit, mixed.context_limit);
+        assert_eq!(lo.reserved_output, mixed.reserved_output);
+    }
+
+    #[test]
+    fn token_budget_reserved_output_caps_at_quarter_of_window() {
+        // o1 wants 100k reserved, context 200k → cap is 50k (¼).
+        let b = TokenBudget::for_model("o1");
+        assert!(
+            b.reserved_output <= b.context_limit / 4,
+            "reserved_output {} exceeds 1/4 of context_limit {}",
+            b.reserved_output,
+            b.context_limit
+        );
     }
 }

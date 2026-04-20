@@ -330,12 +330,20 @@ pub struct ModeConfig {
 // ── Plan/Act separation ────────────────────────────────────────────────────────
 
 /// A single action planned during Plan mode.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlannedAction {
     pub step: usize,
     pub tool_name: String,
     pub args: serde_json::Value,
     pub description: String,
+    /// Per-step revision counter (gap G4 / P3.1). Bumps on every
+    /// successful in-place amendment of THIS step. Used by external
+    /// amend-IPC to detect stale edits: a UI form that opened against
+    /// `revision = 2` MUST attach `expected_revision = 2` to its
+    /// amendment; if the planner has since advanced and bumped it to
+    /// `3`, the amendment is rejected as stale.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 impl PlannedAction {
@@ -346,20 +354,92 @@ impl PlannedAction {
             tool_name: tool_name.to_string(),
             args: args.clone(),
             description,
+            revision: 0,
         }
     }
+}
+
+/// In-flight amendment to an [`ActionPlan`] (gap G4 / P3.1).
+///
+/// All variants carry an `expected_revision` against which the plan
+/// validates before applying; this is the per-step revision for
+/// `Replace` / `Remove` and the plan-level revision for `Insert`.
+/// Stale amendments fail loudly via [`AmendError::StaleRevision`] so
+/// the UI can re-fetch and re-display.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanAmendment {
+    /// Replace the args / description of an existing step in place.
+    /// Step ordering is preserved.
+    Replace {
+        step: usize,
+        args: serde_json::Value,
+        description: String,
+        expected_revision: u64,
+    },
+    /// Insert a new action AFTER `after_step` (use 0 to prepend).
+    /// Subsequent steps are renumbered; their per-step revisions are
+    /// preserved (the *contents* didn't change).
+    Insert {
+        after_step: usize,
+        tool_name: String,
+        args: serde_json::Value,
+        description: String,
+        expected_plan_revision: u64,
+    },
+    /// Remove the step at index `step`.
+    Remove {
+        step: usize,
+        expected_revision: u64,
+    },
+}
+
+/// Reasons an amendment can fail. Returned by
+/// [`ActionPlan::apply_amendment`] without panicking.
+#[derive(Debug, Clone, thiserror::Error, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AmendError {
+    #[error("step {step} does not exist (plan has {len} actions)")]
+    StepOutOfRange { step: usize, len: usize },
+    #[error(
+        "stale revision: amendment expected {expected}, current is {actual}"
+    )]
+    StaleRevision { expected: u64, actual: u64 },
+    #[error("plan is empty; cannot amend")]
+    EmptyPlan,
+}
+
+/// Result of a successful [`PlanAmendment`] (gap G4 / P3.1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppliedAmendment {
+    /// Which step was affected (post-amendment index for Insert; the
+    /// removed step's old index for Remove; same index for Replace).
+    pub step: usize,
+    /// New per-step revision (for Insert/Remove this is 0; for Replace
+    /// this is the bumped value).
+    pub new_revision: u64,
+    /// New plan-level revision after this amendment.
+    pub new_plan_revision: u64,
+    /// Short human-readable summary, e.g. `"replaced step 2"`.
+    pub summary: String,
 }
 
 /// An ordered list of actions produced during Plan mode.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActionPlan {
     pub actions: Vec<PlannedAction>,
+    /// Plan-level revision counter (gap G4 / P3.1). Bumps on EVERY
+    /// structural change (add / replace / insert / remove). Lets the UI
+    /// cheap-poll for "has anything changed?" without diffing actions.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 impl ActionPlan {
     pub fn new() -> Self {
         Self {
             actions: Vec::new(),
+            revision: 0,
         }
     }
 
@@ -373,6 +453,7 @@ impl ActionPlan {
             serde_json::to_string(args).unwrap_or_else(|_| "{}".into())
         );
         self.actions.push(action);
+        self.revision += 1;
         msg
     }
 
@@ -396,6 +477,124 @@ impl ActionPlan {
 
     pub fn is_empty(&self) -> bool {
         self.actions.is_empty()
+    }
+
+    /// Apply an external mid-flight amendment (gap G4 / P3.1).
+    ///
+    /// Validates revisions, mutates the plan, and bumps both the
+    /// affected step's revision (for `Replace`) and the plan-level
+    /// revision. NEVER panics on bad input — returns
+    /// [`AmendError`] with enough detail for the UI to recover.
+    pub fn apply_amendment(
+        &mut self,
+        amendment: PlanAmendment,
+    ) -> Result<AppliedAmendment, AmendError> {
+        match amendment {
+            PlanAmendment::Replace {
+                step,
+                args,
+                description,
+                expected_revision,
+            } => {
+                let idx = self.checked_index(step)?;
+                let action = &mut self.actions[idx];
+                if action.revision != expected_revision {
+                    return Err(AmendError::StaleRevision {
+                        expected: expected_revision,
+                        actual: action.revision,
+                    });
+                }
+                action.args = args;
+                action.description = description;
+                action.revision += 1;
+                let new_revision = action.revision;
+                self.revision += 1;
+                Ok(AppliedAmendment {
+                    step,
+                    new_revision,
+                    new_plan_revision: self.revision,
+                    summary: format!("replaced step {}", step),
+                })
+            }
+            PlanAmendment::Insert {
+                after_step,
+                tool_name,
+                args,
+                description,
+                expected_plan_revision,
+            } => {
+                if self.revision != expected_plan_revision {
+                    return Err(AmendError::StaleRevision {
+                        expected: expected_plan_revision,
+                        actual: self.revision,
+                    });
+                }
+                // `after_step = 0` → insert at the very front. Otherwise
+                // validate the step exists, then insert after it.
+                let insert_at = if after_step == 0 {
+                    0
+                } else {
+                    self.checked_index(after_step)? + 1
+                };
+                let mut new_action = PlannedAction::new(
+                    insert_at + 1, // step number; will be re-numbered below
+                    &tool_name,
+                    &args,
+                );
+                new_action.description = description;
+                self.actions.insert(insert_at, new_action);
+                // Renumber steps so they stay 1-indexed and contiguous.
+                for (i, a) in self.actions.iter_mut().enumerate() {
+                    a.step = i + 1;
+                }
+                self.revision += 1;
+                Ok(AppliedAmendment {
+                    step: insert_at + 1,
+                    new_revision: 0,
+                    new_plan_revision: self.revision,
+                    summary: format!("inserted step at {}", insert_at + 1),
+                })
+            }
+            PlanAmendment::Remove {
+                step,
+                expected_revision,
+            } => {
+                let idx = self.checked_index(step)?;
+                if self.actions[idx].revision != expected_revision {
+                    return Err(AmendError::StaleRevision {
+                        expected: expected_revision,
+                        actual: self.actions[idx].revision,
+                    });
+                }
+                self.actions.remove(idx);
+                for (i, a) in self.actions.iter_mut().enumerate() {
+                    a.step = i + 1;
+                }
+                self.revision += 1;
+                Ok(AppliedAmendment {
+                    step,
+                    new_revision: 0,
+                    new_plan_revision: self.revision,
+                    summary: format!("removed step {}", step),
+                })
+            }
+        }
+    }
+
+    /// Translate a 1-indexed step to a 0-indexed `Vec` position with
+    /// range-checking. Folds the `EmptyPlan` short-circuit so callers
+    /// get the more specific error rather than a generic out-of-range.
+    fn checked_index(&self, step: usize) -> Result<usize, AmendError> {
+        if self.actions.is_empty() {
+            return Err(AmendError::EmptyPlan);
+        }
+        if step == 0 || step > self.actions.len() {
+            return Err(AmendError::StepOutOfRange {
+                step,
+                len: self.actions.len(),
+            });
+        }
+        Ok(step - 1)
     }
 }
 
@@ -450,6 +649,17 @@ impl ModeManager {
     /// Take the plan for execution in Act mode, resetting it.
     pub fn take_plan(&mut self) -> ActionPlan {
         std::mem::take(&mut self.plan)
+    }
+
+    /// Apply an external mid-flight plan amendment (gap G4 / P3.1).
+    /// Convenience delegate so callers don't have to navigate through
+    /// `plan_mut()`. Returns the same `Result` shape so the IPC layer
+    /// can stay shallow.
+    pub fn apply_amendment(
+        &mut self,
+        amendment: PlanAmendment,
+    ) -> Result<AppliedAmendment, AmendError> {
+        self.plan.apply_amendment(amendment)
     }
 }
 
@@ -714,5 +924,217 @@ mod tests {
         assert!(config.tool_access.is_tool_allowed("write_file"));
         assert!(config.tool_access.is_tool_allowed("bash"));
         assert!(config.tool_access.is_tool_allowed("read_file"));
+    }
+
+    // ── G4 / P3.1 — Mid-flight plan amendment tests ───────────────────────
+
+    fn seed_plan() -> ActionPlan {
+        let mut p = ActionPlan::new();
+        p.add("bash", &serde_json::json!({"command": "ls"}));
+        p.add("read_file", &serde_json::json!({"path": "src/lib.rs"}));
+        p.add("write_file", &serde_json::json!({"path": "out.txt"}));
+        p
+    }
+
+    #[test]
+    fn amend_replace_bumps_step_revision_and_plan_revision() {
+        let mut p = seed_plan();
+        let plan_rev_before = p.revision;
+        let step_rev_before = p.actions[0].revision;
+        let res = p.apply_amendment(PlanAmendment::Replace {
+            step: 1,
+            args: serde_json::json!({"command": "ls -la"}),
+            description: "list with details".into(),
+            expected_revision: step_rev_before,
+        });
+        let applied = res.expect("amendment should apply");
+        assert_eq!(applied.step, 1);
+        assert_eq!(applied.new_revision, step_rev_before + 1);
+        assert_eq!(applied.new_plan_revision, plan_rev_before + 1);
+        assert_eq!(p.actions[0].args["command"], "ls -la");
+        assert_eq!(p.actions[0].description, "list with details");
+        assert_eq!(p.actions[0].revision, step_rev_before + 1);
+    }
+
+    #[test]
+    fn amend_replace_rejects_stale_revision() {
+        let mut p = seed_plan();
+        let res = p.apply_amendment(PlanAmendment::Replace {
+            step: 1,
+            args: serde_json::json!({}),
+            description: "stale edit".into(),
+            // Plan starts every step at revision 0; passing 99 is stale.
+            expected_revision: 99,
+        });
+        assert!(matches!(res, Err(AmendError::StaleRevision { .. })));
+        // Nothing should have changed.
+        assert_eq!(p.actions[0].args["command"], "ls");
+    }
+
+    #[test]
+    fn amend_replace_out_of_range_returns_step_error() {
+        let mut p = seed_plan();
+        let res = p.apply_amendment(PlanAmendment::Replace {
+            step: 99,
+            args: serde_json::json!({}),
+            description: "nope".into(),
+            expected_revision: 0,
+        });
+        assert!(matches!(
+            res,
+            Err(AmendError::StepOutOfRange { step: 99, .. })
+        ));
+    }
+
+    #[test]
+    fn amend_insert_renumbers_subsequent_steps() {
+        let mut p = seed_plan();
+        let plan_rev = p.revision;
+        let res = p.apply_amendment(PlanAmendment::Insert {
+            after_step: 1,
+            tool_name: "grep".into(),
+            args: serde_json::json!({"pattern": "TODO"}),
+            description: "grep TODOs".into(),
+            expected_plan_revision: plan_rev,
+        });
+        let applied = res.expect("insert should apply");
+        assert_eq!(applied.step, 2);
+        assert_eq!(p.actions.len(), 4);
+        assert_eq!(p.actions[1].tool_name, "grep");
+        // Subsequent steps must be renumbered to 1..=N.
+        for (i, a) in p.actions.iter().enumerate() {
+            assert_eq!(a.step, i + 1);
+        }
+    }
+
+    #[test]
+    fn amend_insert_at_zero_prepends() {
+        let mut p = seed_plan();
+        let res = p.apply_amendment(PlanAmendment::Insert {
+            after_step: 0,
+            tool_name: "echo".into(),
+            args: serde_json::json!({"msg": "start"}),
+            description: "preamble".into(),
+            expected_plan_revision: p.revision,
+        });
+        let applied = res.expect("prepend should apply");
+        assert_eq!(applied.step, 1);
+        assert_eq!(p.actions[0].tool_name, "echo");
+    }
+
+    #[test]
+    fn amend_insert_rejects_stale_plan_revision() {
+        let mut p = seed_plan();
+        let res = p.apply_amendment(PlanAmendment::Insert {
+            after_step: 1,
+            tool_name: "x".into(),
+            args: serde_json::json!({}),
+            description: "stale".into(),
+            expected_plan_revision: 0, // plan is at revision 3 after seed
+        });
+        assert!(matches!(res, Err(AmendError::StaleRevision { .. })));
+    }
+
+    #[test]
+    fn amend_remove_compacts_and_renumbers() {
+        let mut p = seed_plan();
+        let res = p.apply_amendment(PlanAmendment::Remove {
+            step: 2,
+            expected_revision: 0,
+        });
+        let applied = res.expect("remove should apply");
+        assert_eq!(applied.step, 2);
+        assert_eq!(p.actions.len(), 2);
+        assert_eq!(p.actions[0].tool_name, "bash");
+        assert_eq!(p.actions[1].tool_name, "write_file");
+        assert_eq!(p.actions[1].step, 2, "must be renumbered to 2");
+    }
+
+    #[test]
+    fn amend_on_empty_plan_returns_empty_error() {
+        let mut p = ActionPlan::new();
+        let res = p.apply_amendment(PlanAmendment::Remove {
+            step: 1,
+            expected_revision: 0,
+        });
+        assert!(matches!(res, Err(AmendError::EmptyPlan)));
+    }
+
+    #[test]
+    fn amend_serde_roundtrip_for_all_variants() {
+        for v in [
+            PlanAmendment::Replace {
+                step: 1,
+                args: serde_json::json!({"k": "v"}),
+                description: "d".into(),
+                expected_revision: 0,
+            },
+            PlanAmendment::Insert {
+                after_step: 0,
+                tool_name: "t".into(),
+                args: serde_json::json!({}),
+                description: "d".into(),
+                expected_plan_revision: 0,
+            },
+            PlanAmendment::Remove {
+                step: 1,
+                expected_revision: 0,
+            },
+        ] {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: PlanAmendment = serde_json::from_str(&json).unwrap();
+            assert_eq!(v, back);
+        }
+    }
+
+    #[test]
+    fn agent_event_plan_pending_serde_roundtrip() {
+        let ev = caduceus_core::AgentEvent::PlanStepPending {
+            step: 2,
+            revision: 0,
+            plan_revision: 5,
+            tool_name: "bash".into(),
+            description: "ls -la".into(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"PlanStepPending\""));
+        let back: caduceus_core::AgentEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            caduceus_core::AgentEvent::PlanStepPending {
+                step, revision, plan_revision, tool_name, description,
+            } => {
+                assert_eq!(step, 2);
+                assert_eq!(revision, 0);
+                assert_eq!(plan_revision, 5);
+                assert_eq!(tool_name, "bash");
+                assert_eq!(description, "ls -la");
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn agent_event_plan_amended_serde_roundtrip() {
+        let ev = caduceus_core::AgentEvent::PlanAmended {
+            kind: "replace".into(),
+            step: 2,
+            ok: false,
+            reason: "stale revision".into(),
+            plan_revision: 7,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: caduceus_core::AgentEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            caduceus_core::AgentEvent::PlanAmended {
+                kind, step, ok, reason, plan_revision,
+            } => {
+                assert_eq!(kind, "replace");
+                assert_eq!(step, 2);
+                assert!(!ok);
+                assert_eq!(reason, "stale revision");
+                assert_eq!(plan_revision, 7);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
     }
 }

@@ -13,6 +13,8 @@ use std::sync::Arc;
 use tracing::warn;
 
 pub mod mock;
+pub mod retry_adapter;
+pub mod taper;
 
 // Re-export StopReason from core — canonical definition lives in caduceus_core
 pub use caduceus_core::StopReason;
@@ -31,6 +33,22 @@ pub struct Message {
     /// Tool result (populated when role = "tool").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result: Option<ToolResult>,
+    /// P13.4 (G‑R4.3) — provider prompt‑caching hint. When `true`,
+    /// adapters that support explicit cache breakpoints (Anthropic
+    /// `cache_control: ephemeral`) MUST attach the breakpoint to this
+    /// message's last content block. Adapters with implicit prefix
+    /// caching (OpenAI ≥1024‑token prefix) MUST treat this as a noop;
+    /// Gemini also noop. The harness sets this on the most recent
+    /// stable message before a new user turn so the long prefix is
+    /// reused across turns. Defaults to `false` to preserve byte‑for‑
+    /// byte wire compatibility on every existing call site.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cache_breakpoint: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -70,6 +88,7 @@ impl Message {
             content_blocks: Some(vec![MessageContentBlock::text(content)]),
             tool_calls: Vec::new(),
             tool_result: None,
+            cache_breakpoint: false,
         }
     }
 
@@ -81,6 +100,7 @@ impl Message {
             content_blocks: Some(vec![MessageContentBlock::text(content)]),
             tool_calls: Vec::new(),
             tool_result: None,
+            cache_breakpoint: false,
         }
     }
 
@@ -92,6 +112,7 @@ impl Message {
             content_blocks: Some(vec![MessageContentBlock::text(content)]),
             tool_calls: Vec::new(),
             tool_result: None,
+            cache_breakpoint: false,
         }
     }
 
@@ -117,6 +138,14 @@ impl Message {
             .map(MessageContentBlock::text_value)
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    /// P13.4 (G‑R4.3) — builder helper: mark this message as a
+    /// provider cache breakpoint. See [`Message::cache_breakpoint`]
+    /// for adapter behaviour.
+    pub fn with_cache_breakpoint(mut self) -> Self {
+        self.cache_breakpoint = true;
+        self
     }
 }
 
@@ -217,6 +246,105 @@ pub struct ChatRequest {
     /// Tool definitions available for the LLM to call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolSpec>,
+    /// Opt-in: request token logprobs (gap G10 / P3.2). When `Some(n)`,
+    /// providers that support logprobs (currently: OpenAI-compatible)
+    /// will request `n` top alternatives per token AND return a
+    /// [`LogprobsSummary`] in [`ChatResponse::logprobs`]. Providers that
+    /// do NOT support logprobs (Anthropic, mock) silently ignore this
+    /// flag — callers must treat the absence of `logprobs` in the
+    /// response as "unsupported", NOT as "high confidence".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<u8>,
+}
+
+/// UX-friendly confidence bucket derived from token logprobs (G10 / P3.2).
+///
+/// Buckets are calibrated on `min_token_p` (the worst single-token
+/// probability in the response): a chain is only as strong as its weakest
+/// link, and rendering the *minimum* prevents the average from masking a
+/// single very-uncertain token. Thresholds:
+/// - `High`: min_p ≥ 0.85
+/// - `Medium`: 0.50 ≤ min_p < 0.85
+/// - `Low`: min_p < 0.50
+///
+/// These mirror Glassman/Amershi UX consensus on three-bucket calibrated
+/// trust signals in human-AI interaction (2024). They are deliberately
+/// coarse — finer-grained calibration requires per-model rescaling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    High,
+    Medium,
+    Low,
+}
+
+impl Confidence {
+    /// Bucket a single probability into [`Confidence`]. Hard-clamps so
+    /// NaN / out-of-range values don't escape — defensive against
+    /// provider parsers returning garbage. NaN/sub-zero/None map to
+    /// `Low` (conservative).
+    pub fn from_min_p(min_p: f32) -> Self {
+        if !min_p.is_finite() || min_p < 0.5 {
+            Confidence::Low
+        } else if min_p < 0.85 {
+            Confidence::Medium
+        } else {
+            Confidence::High
+        }
+    }
+}
+
+/// Aggregated logprobs telemetry (gap G10 / P3.2).
+///
+/// We do NOT ship the per-token vector through to the UI — it can be
+/// many KB per response and clutters the event bus. Instead we ship a
+/// small summary that's enough to render a "confidence dot" plus a
+/// detail tooltip. Per-token data, when needed, can still be fetched
+/// from the provider directly via debug logging.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LogprobsSummary {
+    /// How many tokens were measured.
+    pub n_tokens: u32,
+    /// Mean probability across all tokens (`exp(logprob)` averaged).
+    pub mean_token_p: f32,
+    /// Minimum single-token probability — the weakest link.
+    pub min_token_p: f32,
+    /// Three-bucket UX classification driven by `min_token_p`.
+    pub confidence: Confidence,
+}
+
+impl LogprobsSummary {
+    /// Build a summary from a slice of per-token probabilities.
+    /// Returns `None` for an empty slice — the caller should treat that
+    /// as "no confidence info available" (NOT as low confidence).
+    /// Non-finite values (NaN/inf) are silently dropped before
+    /// aggregation; a slice consisting entirely of garbage returns
+    /// `None`.
+    pub fn from_token_probs(probs: &[f32]) -> Option<Self> {
+        let mut sum = 0.0_f64;
+        let mut min = f32::INFINITY;
+        let mut count: u32 = 0;
+        for &p in probs {
+            if !p.is_finite() || p < 0.0 || p > 1.0 {
+                continue;
+            }
+            sum += p as f64;
+            if p < min {
+                min = p;
+            }
+            count += 1;
+        }
+        if count == 0 {
+            return None;
+        }
+        let mean = (sum / count as f64) as f32;
+        Some(Self {
+            n_tokens: count,
+            mean_token_p: mean,
+            min_token_p: min,
+            confidence: Confidence::from_min_p(min),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +358,11 @@ pub struct ChatResponse {
     /// Tool calls requested by the LLM (when stop_reason = ToolUse).
     #[serde(default)]
     pub tool_calls: Vec<ToolUse>,
+    /// Logprobs summary when the request asked for them AND the
+    /// provider supports them. (G10 / P3.2). `None` MUST be treated as
+    /// "unsupported / not requested", not as "low confidence".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<LogprobsSummary>,
 }
 
 // StopReason is re-exported from caduceus_core — canonical definition lives there.
@@ -582,6 +715,7 @@ fn parse_anthropic_chat_response(body: &str) -> Result<ChatResponse> {
         cache_creation_tokens: resp.usage.cache_creation_input_tokens,
         stop_reason,
         tool_calls,
+        logprobs: None,
     })
 }
 
@@ -684,7 +818,7 @@ impl AnthropicAdapter {
             .iter()
             .filter(|m| m.role != "system")
             .map(|m| {
-                if m.role == "tool" {
+                let value = if m.role == "tool" {
                     // Tool result → Anthropic uses role "user" with tool_result content block
                     let tool_use_id = m
                         .tool_result
@@ -725,6 +859,27 @@ impl AnthropicAdapter {
                         "role": m.role,
                         "content": content_blocks,
                     })
+                };
+                // P13.4 (G‑R4.3) — when this message is a cache
+                // breakpoint, stamp `cache_control: ephemeral` onto
+                // its LAST content block. Anthropic caches the prefix
+                // up to and INCLUDING the breakpointed block; reusing
+                // that prefix on the next turn returns
+                // `usage.cache_read_input_tokens > 0`.
+                if m.cache_breakpoint {
+                    let mut value = value;
+                    if let Some(arr) = value
+                        .get_mut("content")
+                        .and_then(|c| c.as_array_mut())
+                    {
+                        if let Some(last) = arr.last_mut() {
+                            last["cache_control"] =
+                                serde_json::json!({"type": "ephemeral"});
+                        }
+                    }
+                    value
+                } else {
+                    value
                 }
             })
             .collect();
@@ -925,6 +1080,21 @@ struct OpenAiResponse {
 struct OpenAiChoice {
     message: Option<OpenAiMessage>,
     finish_reason: Option<String>,
+    #[serde(default)]
+    logprobs: Option<OpenAiLogprobs>,
+}
+
+/// OpenAI response shape:
+/// `{"logprobs": {"content": [{"token": "...", "logprob": -0.1, "top_logprobs": [...]}]}}`
+#[derive(Debug, Deserialize)]
+struct OpenAiLogprobs {
+    #[serde(default)]
+    content: Vec<OpenAiTokenLogprob>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiTokenLogprob {
+    logprob: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1052,6 +1222,19 @@ fn parse_openai_chat_response(body: &str) -> Result<ChatResponse> {
         })
         .unwrap_or_default();
 
+    // Aggregate per-token logprobs into a summary if the response carries
+    // them (gap G10 / P3.2). We deliberately drop the raw token vector —
+    // the summary is what crosses the event bus, the raw data stays in
+    // provider logs for debugging.
+    let logprobs = choice.logprobs.as_ref().and_then(|lp| {
+        let probs: Vec<f32> = lp
+            .content
+            .iter()
+            .map(|tok| tok.logprob.exp() as f32)
+            .collect();
+        LogprobsSummary::from_token_probs(&probs)
+    });
+
     Ok(ChatResponse {
         content,
         input_tokens,
@@ -1060,6 +1243,7 @@ fn parse_openai_chat_response(body: &str) -> Result<ChatResponse> {
         cache_creation_tokens: 0,
         stop_reason,
         tool_calls,
+        logprobs,
     })
 }
 
@@ -1237,6 +1421,18 @@ fn build_openai_request_body(
 
     if let Some(temp) = request.temperature {
         body["temperature"] = serde_json::json!(temp);
+    }
+
+    // Opt-in token logprobs (gap G10 / P3.2). When the caller sets
+    // `request.logprobs = Some(N)` we ask OpenAI to return the per-token
+    // logprob for the chosen token plus N alternates. N=0 still gives us
+    // the chosen token's logprob, which is all the confidence summary
+    // needs. Anthropic / mock providers ignore this field.
+    if let Some(top_n) = request.logprobs {
+        body["logprobs"] = serde_json::json!(true);
+        if top_n > 0 {
+            body["top_logprobs"] = serde_json::json!(top_n);
+        }
     }
 
     if stream {
@@ -1589,6 +1785,7 @@ where
             tool_choice: None,
             response_format: None,
             tools: vec![],
+            logprobs: None,
         };
 
         match provider_id.0.as_str() {
@@ -2336,6 +2533,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             tools: vec![],
+            logprobs: None,
         };
 
         let body = adapter.build_request_body(&request, false);
@@ -2345,6 +2543,78 @@ mod tests {
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["stream"], false);
         assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    // ── P13.4 — provider prompt‑caching breakpoint ───────────────────
+
+    #[test]
+    fn p13_4_anthropic_emits_cache_control_when_breakpoint_set() {
+        let adapter = AnthropicAdapter::new("test-key");
+        let request = ChatRequest {
+            model: ModelId::new("claude-sonnet-4-5"),
+            messages: vec![
+                Message::user("first turn — long stable prefix").with_cache_breakpoint(),
+                Message::user("second turn — fresh"),
+            ],
+            system: None,
+            max_tokens: 1024,
+            temperature: None,
+            thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
+            tools: vec![],
+            logprobs: None,
+        };
+        let body = adapter.build_request_body(&request, false);
+        let msgs = body["messages"].as_array().unwrap();
+        // (1) The breakpointed message gets cache_control on its last block.
+        let m0_last = msgs[0]["content"].as_array().unwrap().last().unwrap();
+        assert_eq!(
+            m0_last["cache_control"]["type"], "ephemeral",
+            "breakpoint must stamp ephemeral cache_control on last block"
+        );
+        // (2) The non‑breakpointed message has NO cache_control.
+        let m1_last = msgs[1]["content"].as_array().unwrap().last().unwrap();
+        assert!(
+            m1_last.get("cache_control").is_none(),
+            "non‑breakpoint messages must remain pristine"
+        );
+    }
+
+    #[test]
+    fn p13_4_anthropic_breakpoint_works_on_tool_result_block() {
+        // Breakpointing a tool result must put cache_control on the
+        // tool_result block (Anthropic's prefix‑caching needs the
+        // marker on whichever block ends the cached prefix).
+        let adapter = AnthropicAdapter::new("test-key");
+        let mut tool_msg = Message {
+            role: "tool".into(),
+            content: "stable tool output".into(),
+            content_blocks: None,
+            tool_calls: vec![],
+            tool_result: Some(
+                caduceus_core::ToolResult::success("stable tool output")
+                    .with_tool_use_id("tc_abc"),
+            ),
+            cache_breakpoint: false,
+        };
+        tool_msg.cache_breakpoint = true;
+        let request = ChatRequest {
+            model: ModelId::new("claude-sonnet-4-5"),
+            messages: vec![tool_msg],
+            system: None,
+            max_tokens: 1024,
+            temperature: None,
+            thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
+            tools: vec![],
+            logprobs: None,
+        };
+        let body = adapter.build_request_body(&request, false);
+        let block = &body["messages"][0]["content"][0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["cache_control"]["type"], "ephemeral");
     }
 
     #[test]
@@ -2373,6 +2643,7 @@ mod tests {
             content_blocks: None,
             tool_calls: vec![],
             tool_result: Some(ToolResult::success("file contents here").with_tool_use_id("tc_123")),
+            cache_breakpoint: false,
         };
 
         let request = ChatRequest {
@@ -2390,6 +2661,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             tools: vec![tool_spec],
+            logprobs: None,
         };
 
         let body = adapter.build_request_body(&request, false);
@@ -2437,6 +2709,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             tools: vec![],
+            logprobs: None,
         };
 
         let body = adapter.build_request_body(&request, true);
@@ -2515,6 +2788,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             tools: vec![],
+            logprobs: None,
         };
 
         let body = adapter.build_request_body(&request, true);
@@ -2614,6 +2888,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             tools: vec![],
+            logprobs: None,
         };
         assert!(req.thinking_mode);
         let json = serde_json::to_string(&req).unwrap();
@@ -2650,6 +2925,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             tools: vec![],
+            logprobs: None,
         };
 
         let body = adapter.build_request_body(&request, true);
@@ -2678,6 +2954,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             tools: vec![],
+            logprobs: None,
         };
 
         let resp = adapter.chat(request).await.unwrap();
@@ -2771,6 +3048,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             tools: vec![],
+            logprobs: None,
         };
         let body = adapter.build_request_body(&request, false);
         let content = &body["messages"][0]["content"];
@@ -2797,6 +3075,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             tools: vec![],
+            logprobs: None,
         };
         let body = build_openai_request_body(&request, false, true);
         let content = &body["messages"][0]["content"];
@@ -2846,6 +3125,7 @@ mod tests {
             tool_choice: Some(ToolChoice::Required),
             response_format: None,
             tools: vec![],
+            logprobs: None,
         };
         let body = adapter.build_request_body(&request, false);
         assert_eq!(body["tool_choice"]["type"], "any");
@@ -2860,6 +3140,7 @@ mod tests {
             tool_choice: Some(ToolChoice::Specific("my_tool".into())),
             response_format: None,
             tools: vec![],
+            logprobs: None,
         };
         let body2 = adapter.build_request_body(&request2, false);
         assert_eq!(body2["tool_choice"]["type"], "tool");
@@ -2878,6 +3159,7 @@ mod tests {
             tool_choice: Some(ToolChoice::Required),
             response_format: None,
             tools: vec![],
+            logprobs: None,
         };
         let body = build_openai_request_body(&request, false, true);
         assert_eq!(body["tool_choice"], "required");
@@ -2892,6 +3174,7 @@ mod tests {
             tool_choice: Some(ToolChoice::Specific("my_func".into())),
             response_format: None,
             tools: vec![],
+            logprobs: None,
         };
         let body2 = build_openai_request_body(&request2, false, true);
         assert_eq!(body2["tool_choice"]["type"], "function");
@@ -2912,6 +3195,7 @@ mod tests {
             tool_choice: None,
             response_format: Some(ResponseFormat::JsonObject),
             tools: vec![],
+            logprobs: None,
         };
         let body = build_openai_request_body(&request, false, true);
         assert_eq!(body["response_format"]["type"], "json_object");
@@ -2930,6 +3214,7 @@ mod tests {
             cache_creation_tokens: 0,
             stop_reason: StopReason::EndTurn,
             tool_calls: vec![],
+            logprobs: None,
         };
 
         let mock = MockLlmAdapter::new(vec![success_response.clone()]);
@@ -2943,6 +3228,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             tools: vec![],
+            logprobs: None,
         };
 
         let response = mock.chat(request).await.unwrap();
@@ -2965,6 +3251,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             tools: vec![],
+            logprobs: None,
         };
 
         let result = mock.chat(request).await;
@@ -3000,6 +3287,7 @@ mod tests {
             cache_creation_tokens: 0,
             stop_reason: StopReason::EndTurn,
             tool_calls: vec![],
+            logprobs: None,
         };
 
         let mock = MockLlmAdapter::new(vec![empty_response]);
@@ -3013,6 +3301,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             tools: vec![],
+            logprobs: None,
         };
 
         let response = mock.chat(request).await.unwrap();
@@ -3280,5 +3569,125 @@ mod tests {
     fn test_extract_partial_json_completely_broken() {
         // Not recoverable
         assert!(ToolFallbackExtractor::extract_partial_json("not json at all :::").is_none());
+    }
+
+    // ── G10 / P3.2 — logprobs → confidence ────────────────────────────────────
+
+    #[test]
+    fn confidence_thresholds_are_correct() {
+        // Boundaries: ≥0.85 High, [0.5, 0.85) Medium, <0.5 Low.
+        assert_eq!(Confidence::from_min_p(0.95), Confidence::High);
+        assert_eq!(Confidence::from_min_p(0.85), Confidence::High);
+        assert_eq!(Confidence::from_min_p(0.8499), Confidence::Medium);
+        assert_eq!(Confidence::from_min_p(0.5), Confidence::Medium);
+        assert_eq!(Confidence::from_min_p(0.4999), Confidence::Low);
+        assert_eq!(Confidence::from_min_p(0.0), Confidence::Low);
+        // NaN / out-of-range degrade conservatively to Low, never panic.
+        assert_eq!(Confidence::from_min_p(f32::NAN), Confidence::Low);
+        assert_eq!(Confidence::from_min_p(-0.5), Confidence::Low);
+        assert_eq!(Confidence::from_min_p(f32::INFINITY), Confidence::Low);
+    }
+
+    #[test]
+    fn logprobs_summary_drops_nan_and_inf() {
+        // Mix of valid + garbage; summary should reflect only the valid ones.
+        let probs = [0.9, f32::NAN, 0.7, f32::INFINITY, -0.1, 0.95];
+        let s = LogprobsSummary::from_token_probs(&probs).expect("some valid tokens");
+        assert_eq!(s.n_tokens, 3);
+        assert!((s.min_token_p - 0.7).abs() < 1e-6);
+        let expected_mean = (0.9_f32 + 0.7 + 0.95) / 3.0;
+        assert!((s.mean_token_p - expected_mean).abs() < 1e-6);
+        assert_eq!(s.confidence, Confidence::Medium);
+    }
+
+    #[test]
+    fn logprobs_summary_empty_returns_none() {
+        assert!(LogprobsSummary::from_token_probs(&[]).is_none());
+        // All garbage also returns None — no info available, NOT "low".
+        assert!(LogprobsSummary::from_token_probs(&[f32::NAN, -1.0, 2.0]).is_none());
+    }
+
+    #[test]
+    fn openai_request_body_includes_logprobs_when_requested() {
+        let req = ChatRequest {
+            model: ModelId::new("gpt-4"),
+            messages: vec![],
+            system: None,
+            tools: vec![],
+            tool_choice: None,
+            response_format: None,
+            max_tokens: 100,
+            temperature: None,
+            logprobs: Some(3),
+            thinking_mode: false,
+        };
+        let body = build_openai_request_body(&req, false, true);
+        assert_eq!(body["logprobs"], serde_json::json!(true));
+        assert_eq!(body["top_logprobs"], serde_json::json!(3));
+
+        let req_no = ChatRequest {
+            logprobs: None,
+            ..req.clone()
+        };
+        let body_no = build_openai_request_body(&req_no, false, true);
+        assert!(body_no.get("logprobs").is_none());
+        assert!(body_no.get("top_logprobs").is_none());
+
+        // top_n=0 => request logprobs but no alternates
+        let req_zero = ChatRequest {
+            logprobs: Some(0),
+            ..req
+        };
+        let body_zero = build_openai_request_body(&req_zero, false, true);
+        assert_eq!(body_zero["logprobs"], serde_json::json!(true));
+        assert!(body_zero.get("top_logprobs").is_none());
+    }
+
+    #[test]
+    fn openai_chat_parses_logprobs_summary() {
+        // logprob = ln(p), so ln(0.9) ≈ -0.10536, ln(0.7) ≈ -0.35667
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {"content": "hi"},
+                "finish_reason": "stop",
+                "logprobs": {
+                    "content": [
+                        {"token": "h",  "logprob": -0.10536_f64.ln().exp().ln()},
+                        {"token": "i",  "logprob": (0.7_f64).ln()},
+                    ]
+                }
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+        });
+        // The first logprob entry computes weirdly; use plain ln values:
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {"content": "hi"},
+                "finish_reason": "stop",
+                "logprobs": {
+                    "content": [
+                        {"token": "h", "logprob": (0.9_f64).ln()},
+                        {"token": "i", "logprob": (0.7_f64).ln()},
+                    ]
+                }
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+        });
+        let resp = parse_openai_chat_response(&body.to_string()).unwrap();
+        let lp = resp.logprobs.expect("summary populated");
+        assert_eq!(lp.n_tokens, 2);
+        assert!((lp.min_token_p - 0.7).abs() < 1e-4);
+        assert!((lp.mean_token_p - 0.8).abs() < 1e-4);
+        assert_eq!(lp.confidence, Confidence::Medium);
+    }
+
+    #[test]
+    fn openai_chat_without_logprobs_returns_none() {
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+        let resp = parse_openai_chat_response(&body.to_string()).unwrap();
+        assert!(resp.logprobs.is_none(), "absence ≠ low confidence");
     }
 }

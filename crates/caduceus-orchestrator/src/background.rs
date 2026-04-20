@@ -62,11 +62,35 @@ struct AgentHandle {
 
 // ── Manager ────────────────────────────────────────────────────────────────────
 
+/// A user-facing notification published when a background agent
+/// reaches a terminal state (Completed / Failed / Cancelled). Gap G15
+/// / P3.4. Subscribed by the bridge → toast in agent panel UI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackgroundNotification {
+    pub agent_id: String,
+    pub task_description: String,
+    /// Terminal status string ("completed" / "failed" / "cancelled")
+    /// — kept as a free-form snake_case string so a future status
+    /// addition doesn't break consumers.
+    pub kind: String,
+    /// Detail message for non-success terminal states; empty on
+    /// completion-with-no-extra-info.
+    pub detail: String,
+    /// Wall-clock seconds since epoch.
+    pub at_secs: u64,
+}
+
 /// Manages background agent lifecycle.
 pub struct BackgroundAgentManager {
     agents: Arc<RwLock<HashMap<String, BackgroundAgent>>>,
     handles: Arc<RwLock<HashMap<String, AgentHandle>>>,
     persist_path: Option<std::path::PathBuf>,
+    /// Broadcast channel for terminal-state notifications. Capacity 64
+    /// is enough that a UI that briefly stalls won't lose messages,
+    /// but small enough that a never-subscribed manager doesn't pin
+    /// memory. Lagged subscribers get `RecvError::Lagged` and resync
+    /// from `list()`.
+    notifications: tokio::sync::broadcast::Sender<BackgroundNotification>,
 }
 
 impl BackgroundAgentManager {
@@ -91,12 +115,35 @@ impl BackgroundAgentManager {
             agents: Arc::new(RwLock::new(agents)),
             handles: Arc::new(RwLock::new(HashMap::new())),
             persist_path,
+            notifications: tokio::sync::broadcast::channel(64).0,
         }
     }
 
     /// Create an in-memory-only manager (no persistence).
     pub fn in_memory() -> Self {
         Self::new(None)
+    }
+
+    /// Subscribe to terminal-state notifications. Each subscriber gets
+    /// its own queue; lagged consumers see `RecvError::Lagged` and
+    /// should resync from `list()`. (Gap G15 / P3.4.)
+    pub fn subscribe_notifications(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<BackgroundNotification> {
+        self.notifications.subscribe()
+    }
+
+    fn publish(&self, n: BackgroundNotification) {
+        // `send` only errs when no receivers exist — that is the
+        // normal case when no UI is attached, so we drop silently.
+        let _ = self.notifications.send(n);
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
     }
 
     /// Start a new background agent task.
@@ -120,6 +167,8 @@ impl BackgroundAgentManager {
         let agents_ref = self.agents.clone();
         let agent_id = id.clone();
         let persist = self.persist_path.clone();
+        let notif_tx = self.notifications.clone();
+        let task_for_notif = task_description.clone();
 
         let join_handle = tokio::spawn(async move {
             // Simulated agent work loop
@@ -133,6 +182,14 @@ impl BackgroundAgentManager {
                     if let Some(ref path) = persist {
                         let _ = Self::save_to_db(path, &map);
                     }
+                    drop(map);
+                    let _ = notif_tx.send(BackgroundNotification {
+                        agent_id: agent_id.clone(),
+                        task_description: task_for_notif.clone(),
+                        kind: "cancelled".into(),
+                        detail: String::new(),
+                        at_secs: Self::now_secs(),
+                    });
                     return;
                 }
 
@@ -151,18 +208,24 @@ impl BackgroundAgentManager {
                 // For the stub, complete after a configurable number of ticks.
                 // Real implementation would drive an AgentHarness here.
                 if ticks >= 50 {
+                    let detail = format!("Task completed after {ticks} ticks");
                     let snapshot = {
                         let mut map = agents_ref.write().await;
                         if let Some(a) = map.get_mut(&agent_id) {
-                            a.status = BackgroundStatus::Completed(format!(
-                                "Task completed after {ticks} ticks"
-                            ));
+                            a.status = BackgroundStatus::Completed(detail.clone());
                         }
                         persist.as_ref().map(|_| map.clone())
                     };
                     if let (Some(ref path), Some(snapshot)) = (&persist, snapshot) {
                         let _ = Self::save_to_db(path, &snapshot);
                     }
+                    let _ = notif_tx.send(BackgroundNotification {
+                        agent_id: agent_id.clone(),
+                        task_description: task_for_notif.clone(),
+                        kind: "completed".into(),
+                        detail,
+                        at_secs: Self::now_secs(),
+                    });
                     return;
                 }
             }
@@ -296,6 +359,23 @@ impl BackgroundAgentManager {
         if let Some((path, snapshot)) = snapshot_path {
             let _ = Self::save_to_db(&path, &snapshot);
         }
+        // Snapshot the description for the notification before
+        // dropping the lock; if the agent vanished mid-cancel, fall
+        // back to empty.
+        let task_desc = {
+            let agents = self.agents.read().await;
+            agents
+                .get(id)
+                .map(|a| a.task_description.clone())
+                .unwrap_or_default()
+        };
+        self.publish(BackgroundNotification {
+            agent_id: id.to_string(),
+            task_description: task_desc,
+            kind: "cancelled".into(),
+            detail: String::new(),
+            at_secs: Self::now_secs(),
+        });
         Ok(())
     }
 
@@ -758,5 +838,69 @@ mod tests {
         )
         .await;
         assert!(result.is_ok(), "concurrent pause/resume deadlocked");
+    }
+
+    // ── G15 / P3.4 — completion notifications ────────────────────────────────
+
+    #[tokio::test]
+    async fn cancel_publishes_notification() {
+        let mgr = BackgroundAgentManager::in_memory();
+        let mut rx = mgr.subscribe_notifications();
+        let id = mgr.start("test cancel".into()).await.unwrap();
+        mgr.cancel(&id).await.unwrap();
+
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("notification timed out")
+            .expect("recv ok");
+        assert_eq!(n.agent_id, id);
+        assert_eq!(n.kind, "cancelled");
+        assert_eq!(n.task_description, "test cancel");
+    }
+
+    #[tokio::test]
+    async fn no_subscriber_is_not_an_error() {
+        // Manager with zero subscribers must still complete its
+        // lifecycle without panicking on the silent broadcast send.
+        let mgr = BackgroundAgentManager::in_memory();
+        let id = mgr.start("no listener".into()).await.unwrap();
+        // Cancel triggers a publish — no-op since nobody listens.
+        mgr.cancel(&id).await.unwrap();
+        let agent = mgr.status(&id).await.unwrap();
+        assert_eq!(agent.status, BackgroundStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn multiple_subscribers_each_get_notification() {
+        let mgr = BackgroundAgentManager::in_memory();
+        let mut rx1 = mgr.subscribe_notifications();
+        let mut rx2 = mgr.subscribe_notifications();
+        let id = mgr.start("fanout".into()).await.unwrap();
+        mgr.cancel(&id).await.unwrap();
+
+        let n1 = tokio::time::timeout(std::time::Duration::from_secs(1), rx1.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let n2 = tokio::time::timeout(std::time::Duration::from_secs(1), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n1, n2);
+        assert_eq!(n1.kind, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn notification_serde_roundtrip() {
+        let n = BackgroundNotification {
+            agent_id: "abc".into(),
+            task_description: "task".into(),
+            kind: "completed".into(),
+            detail: "done in 50 ticks".into(),
+            at_secs: 12345,
+        };
+        let json = serde_json::to_string(&n).unwrap();
+        let back: BackgroundNotification = serde_json::from_str(&json).unwrap();
+        assert_eq!(n, back);
     }
 }

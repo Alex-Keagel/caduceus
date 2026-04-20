@@ -8,19 +8,26 @@
 //! - [`registry`] — MCP public registry client for discovery and install
 
 pub mod client;
+pub mod descriptor;
 pub mod error;
 pub mod manager;
 pub mod permissions;
 pub mod registry;
+pub mod resource_keys;
+pub mod mcp_tool_bridge;
 pub mod types;
 
 pub use client::McpClient;
-pub use error::{McpError, Result};
+pub use descriptor::{
+    DescriptorChange, DescriptorFingerprint, DescriptorIssue, DescriptorSanitiser,
+    DescriptorSnapshot, IssueKind, IssueSeverity, SanitiseConfig, VetReport,
+};
+pub use error::{McpError, McpErrorKind, Result};
 pub use manager::McpServerManager;
 pub use registry::McpRegistryClient;
 pub use types::{
     McpPackage, McpRegistryEntry, McpResource, McpServerConfig, McpToolDef, McpTransport,
-    PackageRuntime, ServerStatus,
+    PackageRuntime, ServerStatus, TrustTier,
 };
 
 // ── Feature #178: MCP Security Scanner ────────────────────────────────────

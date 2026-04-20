@@ -1238,6 +1238,10 @@ fn session_from_row(row: SessionRow) -> Result<SessionState> {
         turn_count: transpose_u32(Some(row.turn_count))?.unwrap_or_default(),
         created_at: parse_timestamp(&row.created_at)?,
         updated_at: parse_timestamp(&row.updated_at)?,
+        // P7.1 — step counter is runtime-only; restored sessions
+        // start fresh at 0. Replays drive progression deterministically
+        // via the recorded `StepStarted` events.
+        step_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
 }
 
@@ -1303,6 +1307,8 @@ fn session_phase_to_str(phase: SessionPhase) -> &'static str {
         SessionPhase::Idle => "idle",
         SessionPhase::Running => "running",
         SessionPhase::AwaitingPermission => "awaiting_permission",
+        SessionPhase::Verifying => "verifying",
+        SessionPhase::TestGating => "test_gating",
         SessionPhase::Cancelling => "cancelling",
         SessionPhase::Completed => "completed",
         SessionPhase::Error => "error",
@@ -1314,6 +1320,8 @@ fn session_phase_from_str(value: &str) -> Result<SessionPhase> {
         "idle" => Ok(SessionPhase::Idle),
         "running" => Ok(SessionPhase::Running),
         "awaiting_permission" => Ok(SessionPhase::AwaitingPermission),
+        "verifying" => Ok(SessionPhase::Verifying),
+        "test_gating" => Ok(SessionPhase::TestGating),
         "cancelling" => Ok(SessionPhase::Cancelling),
         "completed" => Ok(SessionPhase::Completed),
         "error" => Ok(SessionPhase::Error),

@@ -181,6 +181,11 @@ fn build_config_for_package(
             env: pkg.env.clone(),
         },
         auto_start: true,
+        // Registry-installed packages → Verified tier (P11.3).
+        // The package was at least listed in the public registry and
+        // resolved through `runtime` validation; that's a step above
+        // the sideloaded `Untrusted` default.
+        trust_tier: crate::types::TrustTier::Verified,
     })
 }
 

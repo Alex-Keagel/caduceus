@@ -1,8 +1,17 @@
 use async_trait::async_trait;
-use caduceus_core::{CaduceusError, Result, ToolResult, ToolSpec};
+use caduceus_core::{CaduceusError, Result, ToolKind, ToolResult, ToolSpec};
 use caduceus_runtime::{BashSandbox, ExecRequest, FileOps};
 
 pub mod lsp;
+pub mod speculative;
+pub mod tool_lint;
+pub mod tool_retrieval;
+pub use speculative::{SpecKey, SpeculativeCache};
+pub use tool_lint::{lint as lint_tool_args, LintError};
+pub use tool_retrieval::{
+    rank as rank_tools, render_digest, tool_search_spec, ToolDescriptor, ToolHit,
+    DEFAULT_DIGEST_THRESHOLD,
+};
 
 use futures::FutureExt;
 use glob::glob;
@@ -23,6 +32,58 @@ use tokio::task::JoinSet;
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     async fn call(&self, input: Value) -> Result<ToolResult>;
+
+    /// Side-effect class for the parallel dispatcher (gap G20).
+    /// Default is [`ToolKind::Destructive`] — the safest assumption,
+    /// which forces the whole batch to sequential execution if any
+    /// participating tool has not opted in to a weaker class.
+    fn kind(&self) -> ToolKind {
+        ToolKind::Destructive
+    }
+
+    /// P13.10 (G‑R6.2 / G‑R9) — per‑invocation side‑effect class.
+    /// Lets a normally‑destructive tool downgrade itself when the
+    /// caller passes flags like `dry_run: true`, `read_only: true`,
+    /// or otherwise indicates it will not mutate state.
+    ///
+    /// The dispatcher prefers this over [`Tool::kind`] when scheduling.
+    /// Default delegates to [`Tool::kind`], so existing tools keep
+    /// their static classification with zero change.
+    ///
+    /// Implementors MUST be conservative: if there's any chance the
+    /// arguments WILL mutate state, return `Destructive`. Lying about
+    /// idempotency here breaks the dispatcher's safety guarantee.
+    fn resource_kind(&self, _input: &Value) -> ToolKind {
+        self.kind()
+    }
+
+    /// Resource keys this tool will touch given the supplied input.
+    /// Two tasks whose key-sets overlap will serialise against one
+    /// another even when both are weaker than `Destructive`.
+    ///
+    /// Returning an empty `Vec` means "global resource" — the
+    /// dispatcher treats the tool as touching everything and will
+    /// serialise it against every other task.
+    ///
+    /// Default: `vec![]` (global). Tools that can cheaply identify
+    /// their target (e.g. a filesystem path argument) should override
+    /// this so the dispatcher can parallelise across distinct
+    /// resources.
+    fn resource_keys(&self, _input: &Value) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// P13.9 (G‑R6.4) — lint + repair tool args against the tool's
+    /// declared `input_schema` BEFORE [`Tool::call`]. Default impl
+    /// delegates to [`tool_lint::lint`] using `self.spec().input_schema`.
+    /// On `Ok`, callers should use the returned (possibly‑repaired)
+    /// payload. On `Err`, surface the [`tool_lint::LintError`] back to
+    /// the LLM so it can resubmit corrected arguments.
+    ///
+    /// Cite: Yang et al., *SWE‑agent*, NeurIPS 2024 (arXiv:2405.15793).
+    fn lint(&self, input: &Value) -> std::result::Result<Value, tool_lint::LintError> {
+        tool_lint::lint(input, &self.spec().input_schema)
+    }
 }
 
 #[derive(Clone)]
@@ -52,6 +113,24 @@ impl ToolRegistry {
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         self.tools.insert(tool.spec().name.clone(), tool);
+    }
+
+    /// P13.7 (G‑R3.1) — remove a tool by name. Returns `true` when a
+    /// tool was actually removed. Used by the MCP hot‑reload path so a
+    /// drift event that drops a tool from a server immediately stops
+    /// the LLM from being able to call it. Idempotent: removing an
+    /// unknown tool is a no‑op (`false`).
+    pub fn remove(&mut self, name: &str) -> bool {
+        self.tools.remove(name).is_some()
+    }
+
+    /// P13.7 (G‑R3.1) — sorted list of currently‑registered tool
+    /// names. Used by the MCP hot‑reload diff to compute which tools
+    /// to add vs. remove on each refresh tick.
+    pub fn names(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.tools.keys().cloned().collect();
+        out.sort();
+        out
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -171,6 +250,174 @@ impl ToolRegistry {
             })
             .collect()
     }
+
+    /// Resource-aware parallel dispatcher (gap G20).
+    ///
+    /// Schedules a batch with three layered safety rules:
+    ///
+    /// 1. **Destructive batch downgrade.** If *any* task in the batch
+    ///    is classified [`ToolKind::Destructive`], the whole batch
+    ///    runs sequentially in submission order. Mixing a destructive
+    ///    edit with anything else is unsafe to parallelise without a
+    ///    full call-graph (which we don't have).
+    /// 2. **Per-resource serialisation.** Otherwise each task acquires
+    ///    a `Mutex` for every resource key it declares before running.
+    ///    Tasks touching disjoint resources run concurrently up to
+    ///    `concurrency_limit`; tasks sharing a key serialise.
+    /// 3. **Empty-key fallback.** A task that returns an empty
+    ///    `resource_keys()` is treated as touching a sentinel
+    ///    `__global__` key so it serialises against every other task.
+    ///    This is conservative: tools should override
+    ///    [`Tool::resource_keys`] to opt out.
+    ///
+    /// The lock map itself is short-lived (one batch). Lock keys are
+    /// derived from the tool's own `resource_keys(&input)` call so
+    /// the dispatcher does not need tool-specific knowledge.
+    pub async fn execute_parallel_locked(
+        &self,
+        tasks: Vec<(String, Value)>,
+        concurrency_limit: usize,
+    ) -> Vec<Result<ToolResult>> {
+        const GLOBAL_KEY: &str = "__global__";
+        let limit = concurrency_limit.max(1);
+
+        // Resolve per-task metadata once. Sequential fallback decision
+        // depends on knowing every kind upfront.
+        let mut resolved: Vec<(usize, String, Value, ToolKind, Vec<String>)> =
+            Vec::with_capacity(tasks.len());
+        let mut any_destructive = false;
+        for (idx, (name, input)) in tasks.into_iter().enumerate() {
+            let (kind, keys) = match self.get(&name) {
+                Some(t) => {
+                    let mut keys = t.resource_keys(&input);
+                    if keys.is_empty() {
+                        keys.push(GLOBAL_KEY.into());
+                    } else {
+                        // Deduplicate so a tool that returns the same
+                        // key twice doesn't deadlock against itself.
+                        let mut seen = HashSet::new();
+                        keys.retain(|k| seen.insert(k.clone()));
+                    }
+                    (t.resource_kind(&input), keys)
+                }
+                // Unknown tool: harmless to put through but treat as
+                // global+destructive so the error path is sequential.
+                None => (ToolKind::Destructive, vec![GLOBAL_KEY.into()]),
+            };
+            if kind == ToolKind::Destructive {
+                any_destructive = true;
+            }
+            resolved.push((idx, name, input, kind, keys));
+        }
+
+        // Sequential fallback when any task is destructive.
+        if any_destructive {
+            let mut out: Vec<Option<Result<ToolResult>>> =
+                std::iter::repeat_with(|| None).take(resolved.len()).collect();
+            for (idx, name, input, _kind, _keys) in resolved {
+                let result = match self.get(&name) {
+                    Some(t) => t.call(input).await,
+                    None => Err(CaduceusError::Tool {
+                        tool: name.clone(),
+                        message: format!("Unknown tool: {name}"),
+                    }),
+                };
+                out[idx] = Some(result);
+            }
+            return out
+                .into_iter()
+                .map(|slot| {
+                    slot.unwrap_or_else(|| {
+                        Err(CaduceusError::Tool {
+                            tool: "parallel-locked".into(),
+                            message: "sequential fallback result missing".into(),
+                        })
+                    })
+                })
+                .collect();
+        }
+
+        // Concurrent path: per-resource Mutex map + global concurrency
+        // semaphore. Locks are acquired in deterministic key order
+        // (sorted ascending) so two tasks holding {A,B} and {B,A}
+        // can never deadlock.
+        let semaphore = Arc::new(Semaphore::new(limit));
+        let lock_map: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mut join_set = JoinSet::new();
+
+        for (idx, name, input, _kind, mut keys) in resolved {
+            keys.sort(); // deterministic order to prevent ABBA deadlock
+            let tool = self.get(&name);
+            let semaphore = semaphore.clone();
+            let lock_map = lock_map.clone();
+            join_set.spawn(async move {
+                // Acquire shared per-resource locks first (they may
+                // queue), THEN the concurrency permit, so a queued
+                // task doesn't burn a permit while waiting on a lock
+                // held by another in-flight task.
+                let mut held = Vec::with_capacity(keys.len());
+                for key in &keys {
+                    let mu = {
+                        let mut map = lock_map.lock().await;
+                        map.entry(key.clone())
+                            .or_insert_with(|| Arc::new(Mutex::new(())))
+                            .clone()
+                    };
+                    // owned guard kept alive for the call duration
+                    let guard = mu.lock_owned().await;
+                    held.push(guard);
+                }
+                let permit = semaphore.acquire_owned().await.map_err(|err| {
+                    CaduceusError::Tool {
+                        tool: name.clone(),
+                        message: format!("failed to acquire parallel execution permit: {err}"),
+                    }
+                });
+                let result = match permit {
+                    Ok(_p) => match tool {
+                        Some(t) => t.call(input).await,
+                        None => Err(CaduceusError::Tool {
+                            tool: name.clone(),
+                            message: format!("Unknown tool: {name}"),
+                        }),
+                    },
+                    Err(err) => Err(err),
+                };
+                drop(held);
+                (idx, result)
+            });
+        }
+
+        let total = join_set.len();
+        let mut results: Vec<Option<Result<ToolResult>>> =
+            std::iter::repeat_with(|| None).take(total).collect();
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok((idx, result)) => results[idx] = Some(result),
+                Err(err) => {
+                    let message = format!("parallel-locked tool task failed: {err}");
+                    if let Some(slot) = results.iter_mut().find(|slot| slot.is_none()) {
+                        *slot = Some(Err(CaduceusError::Tool {
+                            tool: "parallel-locked".into(),
+                            message,
+                        }));
+                    }
+                }
+            }
+        }
+        results
+            .into_iter()
+            .map(|r| {
+                r.unwrap_or_else(|| {
+                    Err(CaduceusError::Tool {
+                        tool: "parallel-locked".into(),
+                        message: "result missing".into(),
+                    })
+                })
+            })
+            .collect()
+    }
 }
 
 impl Default for ToolRegistry {
@@ -195,6 +442,30 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 fn canonical_or_self(path: PathBuf) -> PathBuf {
     std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+/// Extract a normalised path-string key from a tool's `input` JSON
+/// for use as a [`Tool::resource_keys`] entry. Returns `None` if the
+/// input has no usable `path` field. We intentionally do NOT
+/// canonicalise here — the dispatcher only uses these strings for
+/// equality, and a sync canonicalise on every emit would block the
+/// async runtime. Two tools that disagree on the spelling of a path
+/// will simply not share a lock; that just degrades parallelism, not
+/// correctness, since the per-resource lock is a *safety net* not the
+/// primary correctness guarantee.
+fn path_resource_key(input: &Value) -> Option<String> {
+    input
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            // Normalise away `./` and `..` segments so `./foo` and
+            // `foo` share a key. Leave absolute/relative distinction
+            // intact; tools that mix the two on the same target are
+            // already in trouble.
+            let p = Path::new(s);
+            normalize_path(p).to_string_lossy().to_string()
+        })
+        .filter(|s| !s.is_empty())
 }
 
 fn validate_input_object(input: Value) -> std::result::Result<Map<String, Value>, String> {
@@ -535,6 +806,14 @@ impl Tool for ReadFileTool {
         }
     }
 
+    fn kind(&self) -> ToolKind {
+        ToolKind::ReadOnly
+    }
+
+    fn resource_keys(&self, input: &Value) -> Vec<String> {
+        path_resource_key(input).into_iter().collect()
+    }
+
     async fn call(&self, input: Value) -> Result<ToolResult> {
         let parsed: ReadFileInput = match serde_json::from_value::<ReadFileInput>(input) {
             Ok(v) if !v.path.trim().is_empty() => v,
@@ -610,6 +889,18 @@ impl Tool for WriteFileTool {
             }),
             required_capability: Some("fs_write".into()),
         }
+    }
+
+    fn kind(&self) -> ToolKind {
+        // Idempotent: writing the same content twice is a no-op
+        // (modulo mtime). Conservative — could be ReadOnly-equivalent
+        // for pure overwrites, but Idempotent forces serialisation
+        // against any other write to the same path.
+        ToolKind::Idempotent
+    }
+
+    fn resource_keys(&self, input: &Value) -> Vec<String> {
+        path_resource_key(input).into_iter().collect()
     }
 
     async fn call(&self, input: Value) -> Result<ToolResult> {
@@ -1090,6 +1381,10 @@ impl Tool for GlobSearchTool {
         }
     }
 
+    fn kind(&self) -> ToolKind {
+        ToolKind::ReadOnly
+    }
+
     async fn call(&self, input: Value) -> Result<ToolResult> {
         let parsed: GlobSearchInput = match serde_json::from_value::<GlobSearchInput>(input) {
             Ok(v) if !v.pattern.trim().is_empty() => v,
@@ -1192,6 +1487,10 @@ impl Tool for GrepSearchTool {
             }),
             required_capability: Some("fs_read".into()),
         }
+    }
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::ReadOnly
     }
 
     async fn call(&self, input: Value) -> Result<ToolResult> {
@@ -1306,6 +1605,14 @@ impl Tool for ListFilesTool {
         }
     }
 
+    fn kind(&self) -> ToolKind {
+        ToolKind::ReadOnly
+    }
+
+    fn resource_keys(&self, input: &Value) -> Vec<String> {
+        path_resource_key(input).into_iter().collect()
+    }
+
     async fn call(&self, input: Value) -> Result<ToolResult> {
         let parsed: ListFilesInput = match serde_json::from_value::<ListFilesInput>(input) {
             Ok(v) => v,
@@ -1412,6 +1719,10 @@ impl Tool for GitStatusTool {
         }
     }
 
+    fn kind(&self) -> ToolKind {
+        ToolKind::ReadOnly
+    }
+
     async fn call(&self, input: Value) -> Result<ToolResult> {
         if !input.is_object() {
             return Ok(tool_error("input must be a JSON object"));
@@ -1471,6 +1782,10 @@ impl Tool for GitDiffTool {
             }),
             required_capability: Some("process_exec".into()),
         }
+    }
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::ReadOnly
     }
 
     async fn call(&self, input: Value) -> Result<ToolResult> {
@@ -2119,6 +2434,11 @@ impl Tool for SleepTool {
             }),
             required_capability: None,
         }
+    }
+
+    fn kind(&self) -> ToolKind {
+        // Pure wait — no state mutation anywhere.
+        ToolKind::ReadOnly
     }
 
     async fn call(&self, input: Value) -> Result<ToolResult> {
@@ -5789,6 +6109,354 @@ mod tests {
             .iter()
             .all(|result| result.as_ref().is_ok_and(|tool| !tool.is_error)));
         assert!(peak.load(std::sync::atomic::Ordering::SeqCst) <= 2);
+    }
+
+    // ── G20: ToolKind + per-resource locking dispatcher ─────────────
+
+    /// Configurable test tool that records the resource-key arg it
+    /// is called with so we can observe interleaving order. `kind`
+    /// and `resource_keys` are produced from the input.
+    #[derive(Debug)]
+    struct ConfigurableTool {
+        name: String,
+        kind: ToolKind,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak_per_key: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    }
+
+    #[async_trait]
+    impl Tool for ConfigurableTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.clone(),
+                description: "configurable test tool".into(),
+                input_schema: json!({"type": "object"}),
+                required_capability: None,
+            }
+        }
+        fn kind(&self) -> ToolKind {
+            self.kind
+        }
+        fn resource_keys(&self, input: &Value) -> Vec<String> {
+            input
+                .get("key")
+                .and_then(|v| v.as_str())
+                .map(|s| vec![s.to_string()])
+                .unwrap_or_default()
+        }
+        async fn call(&self, input: Value) -> Result<ToolResult> {
+            let key = input
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("__none__")
+                .to_string();
+            self.active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Track concurrent count per resource key.
+            {
+                let mut map = self.peak_per_key.lock().unwrap();
+                let n = map.entry(key.clone()).or_insert(0);
+                let live = self.active.load(std::sync::atomic::Ordering::SeqCst);
+                if live > *n {
+                    *n = live;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult::success(key))
+        }
+    }
+
+    #[tokio::test]
+    async fn locked_dispatcher_parallelises_disjoint_resources() {
+        // Two ReadOnly tasks on different resource keys MUST run
+        // concurrently (peak active >= 2 with concurrency limit 4).
+        let mut registry = ToolRegistry::new();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        registry.register(Arc::new(ConfigurableTool {
+            name: "ro".into(),
+            kind: ToolKind::ReadOnly,
+            active: active.clone(),
+            peak_per_key: peak.clone(),
+        }));
+        let start = std::time::Instant::now();
+        let results = registry
+            .execute_parallel_locked(
+                vec![
+                    ("ro".into(), json!({"key": "fileA"})),
+                    ("ro".into(), json!({"key": "fileB"})),
+                    ("ro".into(), json!({"key": "fileC"})),
+                ],
+                4,
+            )
+            .await;
+        let elapsed = start.elapsed();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.as_ref().is_ok_and(|t| !t.is_error)));
+        // Three 40ms sleeps in parallel ≈ 40ms; sequential would be ≥120ms.
+        assert!(
+            elapsed < Duration::from_millis(110),
+            "disjoint ReadOnly tasks must run in parallel; elapsed {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn locked_dispatcher_serialises_same_resource() {
+        // Three Idempotent tasks on the SAME resource key must serialise.
+        let mut registry = ToolRegistry::new();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        registry.register(Arc::new(ConfigurableTool {
+            name: "idem".into(),
+            kind: ToolKind::Idempotent,
+            active: active.clone(),
+            peak_per_key: peak.clone(),
+        }));
+        let results = registry
+            .execute_parallel_locked(
+                vec![
+                    ("idem".into(), json!({"key": "shared"})),
+                    ("idem".into(), json!({"key": "shared"})),
+                    ("idem".into(), json!({"key": "shared"})),
+                ],
+                4,
+            )
+            .await;
+        assert_eq!(results.len(), 3);
+        let peak_for_shared =
+            peak.lock().unwrap().get("shared").copied().unwrap_or(0);
+        assert_eq!(
+            peak_for_shared, 1,
+            "same-resource tasks must never run concurrently; saw peak={peak_for_shared}"
+        );
+    }
+
+    #[tokio::test]
+    async fn locked_dispatcher_destructive_forces_sequential() {
+        // A Destructive task in the batch downgrades the WHOLE batch
+        // to sequential, even for ReadOnly tasks on disjoint keys.
+        let mut registry = ToolRegistry::new();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        registry.register(Arc::new(ConfigurableTool {
+            name: "ro".into(),
+            kind: ToolKind::ReadOnly,
+            active: active.clone(),
+            peak_per_key: peak.clone(),
+        }));
+        registry.register(Arc::new(ConfigurableTool {
+            name: "destroy".into(),
+            kind: ToolKind::Destructive,
+            active: active.clone(),
+            peak_per_key: peak.clone(),
+        }));
+        let start = std::time::Instant::now();
+        let results = registry
+            .execute_parallel_locked(
+                vec![
+                    ("ro".into(), json!({"key": "a"})),
+                    ("destroy".into(), json!({"key": "b"})),
+                    ("ro".into(), json!({"key": "c"})),
+                ],
+                4,
+            )
+            .await;
+        let elapsed = start.elapsed();
+        assert_eq!(results.len(), 3);
+        // 3 × 40ms sequential ≈ 120ms; if it parallelised we'd see ~40ms.
+        assert!(
+            elapsed >= Duration::from_millis(110),
+            "destructive batch must serialise; elapsed {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn locked_dispatcher_unknown_tool_does_not_block_others() {
+        // An unknown tool name returns an error per-task without
+        // blocking the rest.
+        let mut registry = ToolRegistry::new();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        registry.register(Arc::new(ConfigurableTool {
+            name: "ro".into(),
+            kind: ToolKind::ReadOnly,
+            active,
+            peak_per_key: peak,
+        }));
+        let results = registry
+            .execute_parallel_locked(
+                vec![
+                    ("ro".into(), json!({"key": "a"})),
+                    ("bogus".into(), json!({})),
+                ],
+                4,
+            )
+            .await;
+        assert_eq!(results.len(), 2);
+        // Order preserved by submission idx.
+        assert!(results[0].as_ref().is_ok_and(|t| !t.is_error));
+        assert!(results[1].is_err(), "unknown tool must error");
+    }
+
+    #[tokio::test]
+    async fn locked_dispatcher_preserves_submission_order() {
+        // Result vec order must match input order, even when tasks
+        // complete out-of-order due to concurrent execution.
+        let mut registry = ToolRegistry::new();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        registry.register(Arc::new(ConfigurableTool {
+            name: "ro".into(),
+            kind: ToolKind::ReadOnly,
+            active,
+            peak_per_key: peak,
+        }));
+        let results = registry
+            .execute_parallel_locked(
+                vec![
+                    ("ro".into(), json!({"key": "first"})),
+                    ("ro".into(), json!({"key": "second"})),
+                    ("ro".into(), json!({"key": "third"})),
+                ],
+                4,
+            )
+            .await;
+        assert_eq!(
+            results[0].as_ref().unwrap().content,
+            "first",
+            "result ordering must follow submission order"
+        );
+        assert_eq!(results[1].as_ref().unwrap().content, "second");
+        assert_eq!(results[2].as_ref().unwrap().content, "third");
+    }
+
+    // ── P13.10 — per-invocation Destructive override ─────────────────
+
+    /// Test tool that is statically Destructive but downgrades to
+    /// ReadOnly when the input contains `dry_run: true`.
+    struct DryRunCapableTool {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl Tool for DryRunCapableTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "dryrun_writer".into(),
+                description: "writer that supports --dry-run".into(),
+                input_schema: json!({"type": "object"}),
+                required_capability: None,
+            }
+        }
+        fn kind(&self) -> ToolKind {
+            ToolKind::Destructive
+        }
+        fn resource_kind(&self, input: &Value) -> ToolKind {
+            if input.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false) {
+                ToolKind::ReadOnly
+            } else {
+                ToolKind::Destructive
+            }
+        }
+        fn resource_keys(&self, input: &Value) -> Vec<String> {
+            input
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| vec![s.to_string()])
+                .unwrap_or_default()
+        }
+        async fn call(&self, input: Value) -> Result<ToolResult> {
+            self.active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            {
+                let live = self.active.load(std::sync::atomic::Ordering::SeqCst);
+                let mut p = self.peak.lock().unwrap();
+                if live > *p {
+                    *p = live;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            Ok(ToolResult::success(path))
+        }
+    }
+
+    #[tokio::test]
+    async fn p13_10_dry_run_invocations_parallelise_across_disjoint_paths() {
+        // Two invocations of a normally-Destructive tool, both with
+        // `dry_run: true` on disjoint paths, MUST run concurrently.
+        let mut registry = ToolRegistry::new();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::Mutex::new(0_usize));
+        registry.register(Arc::new(DryRunCapableTool {
+            active: active.clone(),
+            peak: peak.clone(),
+        }));
+        let start = std::time::Instant::now();
+        let results = registry
+            .execute_parallel_locked(
+                vec![
+                    ("dryrun_writer".into(), json!({"path": "a", "dry_run": true})),
+                    ("dryrun_writer".into(), json!({"path": "b", "dry_run": true})),
+                ],
+                4,
+            )
+            .await;
+        let elapsed = start.elapsed();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].as_ref().is_ok());
+        assert!(results[1].as_ref().is_ok());
+        let observed_peak = *peak.lock().unwrap();
+        assert!(
+            observed_peak >= 2,
+            "dry-run downgrade must let dispatcher run them concurrently; peak={observed_peak}"
+        );
+        // Wall-clock sanity: parallel ≈ 40ms, sequential ≈ 80ms.
+        assert!(
+            elapsed < Duration::from_millis(70),
+            "dry-run pair must NOT serialise; elapsed {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn p13_10_real_writes_still_serialise_when_mixed_with_dry_run() {
+        // One real write + one dry-run: the real write makes the
+        // batch destructive, so everything serialises (correct safety
+        // posture — never let a real write race with anything).
+        let mut registry = ToolRegistry::new();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::Mutex::new(0_usize));
+        registry.register(Arc::new(DryRunCapableTool {
+            active: active.clone(),
+            peak: peak.clone(),
+        }));
+        let start = std::time::Instant::now();
+        let _ = registry
+            .execute_parallel_locked(
+                vec![
+                    ("dryrun_writer".into(), json!({"path": "a", "dry_run": true})),
+                    ("dryrun_writer".into(), json!({"path": "b"})), // real write
+                ],
+                4,
+            )
+            .await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(75),
+            "any real-write invocation must force batch sequential; elapsed {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn tool_kind_default_is_destructive_for_safety() {
+        // Failing safe: unknown / unannotated tools must default to
+        // the most restrictive class so the dispatcher serialises them.
+        assert_eq!(ToolKind::default(), ToolKind::Destructive);
     }
 
     #[tokio::test]

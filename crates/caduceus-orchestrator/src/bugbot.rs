@@ -243,6 +243,7 @@ impl BugBot {
             tool_choice: None,
             tools: vec![],
             response_format: None,
+            logprobs: None,
         };
 
         self.provider.chat(request).await.ok().map(|r| r.content)
@@ -259,6 +260,7 @@ impl BugBot {
             tool_choice: None,
             tools: vec![],
             response_format: None,
+            logprobs: None,
         };
 
         let response = self.provider.chat(request).await?;
@@ -365,6 +367,7 @@ mod tests {
             cache_creation_tokens: 0,
             stop_reason: StopReason::EndTurn,
             tool_calls: vec![],
+                logprobs: None,
         }]))
     }
 

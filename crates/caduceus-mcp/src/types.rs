@@ -25,6 +25,40 @@ pub enum McpTransport {
 
 // ── Server Config ──────────────────────────────────────────────────────────────
 
+/// Provenance / trust tier of an MCP server (P11.3).
+///
+/// Drives policy decisions across the runtime — most importantly the
+/// `DescriptorSanitiser` thresholds (untrusted servers get a far
+/// tighter byte budget on `description` and `inputSchema`, since these
+/// strings are read by the LLM every turn and are the headline
+/// MCPTox 2025 (arXiv:2508.14925) injection surface).
+///
+/// Tiers, narrowest → widest:
+/// * `Trusted` — first-party, signed-by-us. Sanitiser still runs but
+///   uses default thresholds. This is the only tier allowed to expose
+///   long descriptions intended for human reading.
+/// * `Verified` — pulled from the public MCP registry, schema-vetted at
+///   install time. Same byte budgets as `Trusted` but warnings are
+///   surfaced more aggressively.
+/// * `Untrusted` — sideloaded / user-pasted config / unknown
+///   provenance. Sanitiser uses *strict* thresholds and refuses any
+///   server that even *warns* on confusables or invisibles.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum TrustTier {
+    Trusted,
+    Verified,
+    Untrusted,
+}
+
+impl Default for TrustTier {
+    /// Fail closed: an MCP config that omits the field is treated as
+    /// untrusted. Operators must opt in to higher tiers explicitly.
+    fn default() -> Self {
+        TrustTier::Untrusted
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
     /// Unique identifier for this server instance.
@@ -39,6 +73,11 @@ pub struct McpServerConfig {
     /// Whether this server should be started automatically.
     #[serde(default = "default_true")]
     pub auto_start: bool,
+    /// Provenance / trust tier (P11.3). Defaults to `Untrusted` —
+    /// configs that don't set it explicitly are treated as the
+    /// strictest tier so the operator must opt in to wider budgets.
+    #[serde(default)]
+    pub trust_tier: TrustTier,
 }
 
 fn default_true() -> bool {
@@ -62,6 +101,7 @@ impl McpServerConfig {
                 env: HashMap::new(),
             },
             auto_start: true,
+            trust_tier: TrustTier::default(),
         }
     }
 
@@ -75,6 +115,7 @@ impl McpServerConfig {
                 headers: HashMap::new(),
             },
             auto_start: true,
+            trust_tier: TrustTier::default(),
         }
     }
 }

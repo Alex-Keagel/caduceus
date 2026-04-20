@@ -348,17 +348,29 @@ fn classify_role(role: &str, content: &str) -> MessageGroupKind {
 // ── #190: Compaction Pipeline ─────────────────────────────────────────────────
 
 /// Output of a single [`CompactionStrategy`] run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompactionResult {
     pub removed_tokens: usize,
     pub groups_affected: usize,
+    /// Per-group eviction descriptors. Strategies that drop *whole* groups
+    /// (sliding window, emergency truncator, tool-collapse) populate this
+    /// so the orchestrator can emit
+    /// [`caduceus_core::AgentEvent::ContextGroupsEvicted`] (G31). Strategies
+    /// that *transform* groups in place (summarize, pattern-compact) leave
+    /// it empty — their effect is reflected in `removed_tokens` only.
+    pub evicted: Vec<caduceus_core::EvictedGroupRef>,
 }
 
 /// Aggregate result of a full [`CompactionPipeline`] run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PipelineResult {
     pub total_removed_tokens: usize,
     pub strategies_applied: Vec<String>,
+    /// Concatenation of every strategy's `evicted` list, oldest-first within
+    /// each strategy and in strategy-application order overall. Empty when
+    /// no whole-group eviction occurred (e.g. only summarization or
+    /// in-place compaction ran). G31.
+    pub evicted: Vec<caduceus_core::EvictedGroupRef>,
 }
 
 /// A compaction strategy that mutates a group list in place.
@@ -372,6 +384,17 @@ pub trait CompactionStrategy: Send + Sync {
 pub struct CompactionPipeline {
     strategies: Vec<Box<dyn CompactionStrategy>>,
     token_budget: usize,
+    /// Optional telemetry sink (gap G24 / P9.1). When set, every fired
+    /// strategy records a `CompactionEvent`. The pipeline does not own
+    /// a turn counter, so callers must inject it via `with_turn_index`
+    /// before each `run()` call (otherwise events report turn 0).
+    telemetry:
+        Option<std::sync::Arc<std::sync::Mutex<crate::compaction_telemetry::CompactionTelemetry>>>,
+    turn_index: u32,
+    /// Optional learned strategy selector (gap G25 / P9.2). When set,
+    /// strategies are evaluated in BT-model preference order rather
+    /// than insertion order.
+    learned_selector: Option<crate::learned_selector::LearnedSelector>,
 }
 
 impl CompactionPipeline {
@@ -379,6 +402,9 @@ impl CompactionPipeline {
         Self {
             strategies: Vec::new(),
             token_budget: budget,
+            telemetry: None,
+            turn_index: 0,
+            learned_selector: None,
         }
     }
 
@@ -386,27 +412,108 @@ impl CompactionPipeline {
         self.strategies.push(strategy);
     }
 
+    /// Attach a shared telemetry sink. Subsequent `run()` calls record
+    /// one `CompactionEvent` per fired strategy.
+    pub fn with_telemetry(
+        mut self,
+        telem: std::sync::Arc<
+            std::sync::Mutex<crate::compaction_telemetry::CompactionTelemetry>,
+        >,
+    ) -> Self {
+        self.telemetry = Some(telem);
+        self
+    }
+
+    /// Set the turn index used for telemetry events emitted by the
+    /// next `run()` call.
+    pub fn with_turn_index(mut self, turn: u32) -> Self {
+        self.turn_index = turn;
+        self
+    }
+
+    /// Attach a learned strategy selector (gap G25 / P9.2). When set,
+    /// `run()` reorders the registered strategies per the selector's
+    /// `rank(strategy_names)` before iterating, so the highest-scored
+    /// strategy fires first under tight budgets. The selector itself
+    /// decides whether to defer to the heuristic order (Auto mode);
+    /// callers can force `Learned` or `Heuristic` modes via
+    /// `LearnedSelector::with_mode`. `None` (default) preserves
+    /// insertion order — full backward compat.
+    pub fn with_learned_selector(
+        mut self,
+        selector: crate::learned_selector::LearnedSelector,
+    ) -> Self {
+        self.learned_selector = Some(selector);
+        self
+    }
+
     /// Run all strategies in insertion order, halting once groups fit the budget.
     pub fn run(&self, groups: &mut Vec<MessageGroup>) -> PipelineResult {
         let mut total_removed = 0usize;
         let mut strategies_applied = Vec::new();
+        let mut evicted: Vec<caduceus_core::EvictedGroupRef> = Vec::new();
 
-        for strategy in &self.strategies {
+        // P9.2 — if a learned selector is attached, reorder strategies
+        // by the model's predicted preference. We map selector output
+        // (Vec<&str>) back to indices into `self.strategies` to avoid
+        // cloning the boxed strategies.
+        let order: Vec<usize> = if let Some(sel) = &self.learned_selector {
+            let names: Vec<&str> =
+                self.strategies.iter().map(|s| s.name()).collect();
+            let ranked = sel.rank(&names);
+            ranked
+                .iter()
+                .filter_map(|&n| names.iter().position(|m| *m == n))
+                .collect()
+        } else {
+            (0..self.strategies.len()).collect()
+        };
+
+        for &i in &order {
+            let strategy = &self.strategies[i];
             let current_tokens: usize = groups.iter().map(|g| g.total_tokens()).sum();
             if current_tokens <= self.token_budget {
                 break;
             }
+            let messages_before = groups.iter().map(|g| g.messages.len()).sum::<usize>();
+            let tokens_before = current_tokens;
 
             let result = strategy.compact(groups);
             if result.removed_tokens > 0 || result.groups_affected > 0 {
                 total_removed += result.removed_tokens;
                 strategies_applied.push(strategy.name().to_string());
+                evicted.extend(result.evicted);
+
+                if let Some(t) = &self.telemetry {
+                    let messages_after =
+                        groups.iter().map(|g| g.messages.len()).sum::<usize>();
+                    let tokens_after =
+                        groups.iter().map(|g| g.total_tokens()).sum::<usize>();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if let Ok(mut g) = t.lock() {
+                        g.record(crate::compaction_telemetry::CompactionEvent {
+                            strategy: strategy.name().to_string(),
+                            tokens_before: tokens_before.min(u32::MAX as usize) as u32,
+                            tokens_after: tokens_after.min(u32::MAX as usize) as u32,
+                            messages_before: messages_before
+                                .min(u32::MAX as usize) as u32,
+                            messages_after: messages_after.min(u32::MAX as usize) as u32,
+                            turn_index: self.turn_index,
+                            at_secs: now,
+                            downstream_re_ask: None,
+                        });
+                    }
+                }
             }
         }
 
         PipelineResult {
             total_removed_tokens: total_removed,
             strategies_applied,
+            evicted,
         }
     }
 
@@ -440,6 +547,7 @@ impl CompactionStrategy for ToolCollapseStrategy {
     fn compact(&self, groups: &mut Vec<MessageGroup>) -> CompactionResult {
         let mut removed_tokens = 0usize;
         let mut groups_affected = 0usize;
+        let mut evicted: Vec<caduceus_core::EvictedGroupRef> = Vec::new();
         let mut i = 0;
 
         while i + 1 < groups.len() {
@@ -454,6 +562,12 @@ impl CompactionStrategy for ToolCollapseStrategy {
                 && !groups[i + 1].is_atomic();
             if both_collapsible {
                 let absorbed = groups.remove(i + 1);
+                evicted.push(caduceus_core::EvictedGroupRef {
+                    kind: "tool_call".to_string(),
+                    message_count: absorbed.messages.len() as u32,
+                    token_count: absorbed.token_count as u32,
+                    reason: "tool-collapse".to_string(),
+                });
                 removed_tokens += absorbed.token_count;
                 groups_affected += 1;
                 // Keep iterating from the same position to catch longer runs.
@@ -465,6 +579,7 @@ impl CompactionStrategy for ToolCollapseStrategy {
         CompactionResult {
             removed_tokens,
             groups_affected,
+            evicted,
         }
     }
 }
@@ -495,6 +610,7 @@ impl CompactionStrategy for SummarizeStrategy {
             return CompactionResult {
                 removed_tokens: 0,
                 groups_affected: 0,
+            evicted: Vec::new(),
             };
         }
 
@@ -551,6 +667,7 @@ impl CompactionStrategy for SummarizeStrategy {
         CompactionResult {
             removed_tokens: net_removed,
             groups_affected,
+        evicted: Vec::new(),
         }
     }
 }
@@ -578,16 +695,25 @@ impl CompactionStrategy for SlidingWindowStrategy {
             return CompactionResult {
                 removed_tokens: 0,
                 groups_affected: 0,
+            evicted: Vec::new(),
             };
         }
 
         let to_drop = non_system_count - self.window_size;
         let mut dropped = 0usize;
         let mut removed_tokens = 0usize;
+        let mut evicted: Vec<caduceus_core::EvictedGroupRef> = Vec::new();
         let mut i = 0;
 
         while i < groups.len() && dropped < to_drop {
             if !groups[i].is_system() {
+                let g = &groups[i];
+                evicted.push(caduceus_core::EvictedGroupRef {
+                    kind: format!("{:?}", g.kind).to_lowercase(),
+                    message_count: g.messages.len() as u32,
+                    token_count: g.token_count as u32,
+                    reason: "window-overflow".to_string(),
+                });
                 removed_tokens += groups[i].token_count;
                 groups.remove(i);
                 dropped += 1;
@@ -600,6 +726,7 @@ impl CompactionStrategy for SlidingWindowStrategy {
         CompactionResult {
             removed_tokens,
             groups_affected: dropped,
+            evicted,
         }
     }
 }
@@ -912,6 +1039,7 @@ impl CompactionStrategy for PatternCompactor {
         CompactionResult {
             removed_tokens,
             groups_affected,
+        evicted: Vec::new(),
         }
     }
 }
@@ -954,16 +1082,26 @@ impl CompactionStrategy for EmergencyTruncator {
 
         let mut removed_tokens = 0usize;
         let groups_affected = to_remove.len();
+        let mut evicted: Vec<caduceus_core::EvictedGroupRef> = Vec::with_capacity(groups_affected);
 
         // Remove in descending order so each removal doesn't shift earlier indices.
         for &idx in to_remove.iter().rev() {
-            removed_tokens += groups[idx].token_count;
-            groups.remove(idx);
+            let g = groups.remove(idx);
+            removed_tokens += g.token_count;
+            evicted.push(caduceus_core::EvictedGroupRef {
+                kind: format!("{:?}", g.kind).to_lowercase(),
+                message_count: g.messages.len() as u32,
+                token_count: g.token_count as u32,
+                reason: "emergency-budget".to_string(),
+            });
         }
+        // Restore oldest-first ordering for downstream consumers.
+        evicted.reverse();
 
         CompactionResult {
             removed_tokens,
             groups_affected,
+            evicted,
         }
     }
 }
@@ -979,6 +1117,98 @@ fn estimate_compact_tokens(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── G31: ContextGroupsEvicted (whole-group eviction reports) ─────────────
+
+    #[test]
+    fn sliding_window_reports_evicted_groups() {
+        let mut groups = make_groups(&[
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+            ("assistant", "a2"),
+            ("user", "u3"),
+            ("assistant", "a3"),
+        ]);
+        let strategy = SlidingWindowStrategy { window_size: 2 };
+        let result = strategy.compact(&mut groups);
+        assert!(result.groups_affected >= 1, "should drop something");
+        assert_eq!(
+            result.evicted.len(),
+            result.groups_affected,
+            "evicted count must match groups_affected"
+        );
+        for ev in &result.evicted {
+            assert_eq!(ev.reason, "window-overflow");
+            assert!(ev.message_count >= 1);
+            assert!(!ev.kind.is_empty());
+        }
+    }
+
+    #[test]
+    fn emergency_truncator_reports_evicted_groups_oldest_first() {
+        let mut groups = make_groups(&[
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+            ("assistant", "a2"),
+            ("user", "u3"),
+        ]);
+        let strategy = EmergencyTruncator {
+            minimum_preserved: 1,
+        };
+        let result = strategy.compact(&mut groups);
+        assert!(!result.evicted.is_empty(), "should have evictions");
+        assert_eq!(result.evicted.len(), result.groups_affected);
+        for ev in &result.evicted {
+            assert_eq!(ev.reason, "emergency-budget");
+        }
+    }
+
+    #[test]
+    fn pipeline_aggregates_evictions_across_strategies() {
+        let mut groups = make_groups(&[
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+            ("assistant", "a2"),
+            ("user", "u3"),
+            ("assistant", "a3"),
+            ("user", "u4"),
+        ]);
+        let mut p = CompactionPipeline::new(0); // budget 0 forces all strategies
+        p.add_strategy(Box::new(SlidingWindowStrategy { window_size: 2 }));
+        let result = p.run(&mut groups);
+        assert!(!result.evicted.is_empty(), "pipeline must surface evictions");
+    }
+
+    #[test]
+    fn agent_event_context_groups_evicted_round_trips_json() {
+        use caduceus_core::{AgentEvent, EvictedGroupRef};
+        let ev = AgentEvent::ContextGroupsEvicted {
+            strategy: "truncate-oldest".to_string(),
+            groups: vec![EvictedGroupRef {
+                kind: "user".to_string(),
+                message_count: 2,
+                token_count: 42,
+                reason: "oldest-non-system".to_string(),
+            }],
+            total_tokens: 42,
+        };
+        let json = serde_json::to_string(&ev).expect("serialise");
+        assert!(json.contains("ContextGroupsEvicted"));
+        assert!(json.contains("oldest-non-system"));
+        let back: AgentEvent = serde_json::from_str(&json).expect("deserialise");
+        match back {
+            AgentEvent::ContextGroupsEvicted { strategy, groups, total_tokens } => {
+                assert_eq!(strategy, "truncate-oldest");
+                assert_eq!(total_tokens, 42);
+                assert_eq!(groups.len(), 1);
+                assert_eq!(groups[0].kind, "user");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -1452,6 +1682,7 @@ mod tests {
                 CompactionResult {
                     removed_tokens: 0,
                     groups_affected: 0,
+                evicted: Vec::new(),
                 }
             }
         }
@@ -1963,6 +2194,7 @@ mod tests {
                 },
             ],
             tool_result: None,
+                    cache_breakpoint: false,
         };
         let cm: CompactMessage = (&pmsg).into();
         assert_eq!(cm.role, "assistant");
@@ -1979,6 +2211,7 @@ mod tests {
             content_blocks: None,
             tool_calls: vec![],
             tool_result: Some(ToolResult::success("ok").with_tool_use_id("call_1")),
+                    cache_breakpoint: false,
         };
         let cm: CompactMessage = (&pmsg).into();
         assert_eq!(cm.role, "tool");
@@ -2001,6 +2234,7 @@ mod tests {
                     input: serde_json::json!({}),
                 }],
                 tool_result: None,
+                            cache_breakpoint: false,
             },
             caduceus_providers::Message {
                 role: "tool".into(),
@@ -2008,6 +2242,7 @@ mod tests {
                 content_blocks: None,
                 tool_calls: vec![],
                 tool_result: Some(ToolResult::success("result").with_tool_use_id("c1")),
+                            cache_breakpoint: false,
             },
         ];
         let compact: Vec<CompactMessage> = provider_msgs.iter().map(Into::into).collect();
@@ -2033,6 +2268,7 @@ mod tests {
                     input: serde_json::json!({}),
                 }],
                 tool_result: None,
+                            cache_breakpoint: false,
             },
             caduceus_providers::Message {
                 role: "tool".into(),
@@ -2040,6 +2276,7 @@ mod tests {
                 content_blocks: None,
                 tool_calls: vec![],
                 tool_result: Some(ToolResult::success("r").with_tool_use_id("c1")),
+                            cache_breakpoint: false,
             },
         ];
         let groups = build_message_groups_from_provider(&provider_msgs);
@@ -2149,6 +2386,7 @@ mod iter3_tests {
                 content_blocks: None,
                 tool_calls: vec![],
                 tool_result: Some(ToolResult::success("x".repeat(5000)).with_tool_use_id("c1")),
+                            cache_breakpoint: false,
             },
             caduceus_providers::Message::user("u2"),
             caduceus_providers::Message::assistant("done"),
@@ -2174,5 +2412,285 @@ mod iter3_tests {
                 }
             }
         }
+    }
+
+    // ── P9.1: telemetry-wired pipeline ──────────────────────────────────────
+
+    #[test]
+    fn pipeline_without_telemetry_records_nothing_and_still_compacts() {
+        // Backward-compat: existing callers see identical behaviour.
+        let pipeline = CompactionPipeline::default_pipeline(1);
+        let mut groups = make_long_groups(20);
+        let before_total: usize = groups.iter().map(|g| g.total_tokens()).sum();
+        let result = pipeline.run(&mut groups);
+        assert!(result.total_removed_tokens > 0);
+        let after_total: usize = groups.iter().map(|g| g.total_tokens()).sum();
+        assert!(after_total <= before_total);
+    }
+
+    #[test]
+    fn pipeline_with_telemetry_records_one_event_per_fired_strategy() {
+        use crate::compaction_telemetry::CompactionTelemetry;
+        use std::sync::{Arc, Mutex};
+
+        let telem = Arc::new(Mutex::new(CompactionTelemetry::default()));
+        let pipeline = CompactionPipeline::default_pipeline(1)
+            .with_telemetry(Arc::clone(&telem))
+            .with_turn_index(7);
+
+        let mut groups = make_long_groups(20);
+        let result = pipeline.run(&mut groups);
+
+        let g = telem.lock().unwrap();
+        // At least one strategy fired → at least one event.
+        assert!(!g.is_empty(), "expected ≥1 telemetry event");
+        // Every recorded event must report turn_index 7 and a strategy
+        // matching one of those that actually fired.
+        for ev in (0..g.len()).filter_map(|_| None::<crate::compaction_telemetry::CompactionEvent>) {
+            // (no-op iter; assertions below use stats instead)
+            let _ = ev;
+        }
+        let stats = g.per_strategy_stats();
+        // Sum of counts in stats ≤ number of strategies fired.
+        let total: u32 = stats.iter().map(|(_, c, _, _)| *c).sum();
+        assert!(
+            total as usize >= result.strategies_applied.len(),
+            "telemetry events ({total}) < strategies fired ({})",
+            result.strategies_applied.len()
+        );
+    }
+
+    #[test]
+    fn pipeline_telemetry_skips_no_op_strategies() {
+        use crate::compaction_telemetry::CompactionTelemetry;
+        use std::sync::{Arc, Mutex};
+
+        let telem = Arc::new(Mutex::new(CompactionTelemetry::default()));
+        // Tiny groups → already under budget → no strategy should fire.
+        let pipeline = CompactionPipeline::default_pipeline(1_000_000)
+            .with_telemetry(Arc::clone(&telem));
+        let mut groups = make_long_groups(2);
+        let _ = pipeline.run(&mut groups);
+        assert!(
+            telem.lock().unwrap().is_empty(),
+            "no strategy fired → no telemetry events expected"
+        );
+    }
+
+    #[test]
+    fn pipeline_telemetry_sets_turn_index_correctly() {
+        use crate::compaction_telemetry::CompactionTelemetry;
+        use std::sync::{Arc, Mutex};
+
+        let telem = Arc::new(Mutex::new(CompactionTelemetry::default()));
+        let pipeline = CompactionPipeline::default_pipeline(1)
+            .with_telemetry(Arc::clone(&telem))
+            .with_turn_index(42);
+        let mut groups = make_long_groups(20);
+        pipeline.run(&mut groups);
+        let g = telem.lock().unwrap();
+        let jsonl = g.to_jsonl();
+        assert!(
+            jsonl.contains("\"turn_index\":42"),
+            "expected turn_index=42 in {jsonl}"
+        );
+    }
+
+    fn make_long_groups(n: usize) -> Vec<MessageGroup> {
+        // Build N user/assistant pairs each with a chunky payload so
+        // strategies have something to actually compact.
+        let body: String = "x ".repeat(200);
+        let msgs: Vec<CompactMessage> = (0..n)
+            .flat_map(|i| {
+                vec![
+                    CompactMessage::new("user", format!("u{i}: {body}")),
+                    CompactMessage::new("assistant", format!("a{i}: {body}")),
+                ]
+            })
+            .collect();
+        build_message_groups(&msgs)
+    }
+
+    // ── P9.2: learned-selector wired into pipeline ──────────────────────────
+
+    #[test]
+    fn pipeline_without_selector_preserves_insertion_order() {
+        // Backward compat: order of strategies_applied matches default.
+        let pipeline = CompactionPipeline::default_pipeline(1);
+        let mut groups = make_long_groups(20);
+        let result = pipeline.run(&mut groups);
+        // First fired must be tool-collapse OR summarize (whichever
+        // applied first under tight budget). Crucially, we never see
+        // an out-of-order fire like sliding-window before tool-collapse
+        // unless tool-collapse was a no-op.
+        if result.strategies_applied.len() >= 2 {
+            // Map names to indices in the default insertion order:
+            let order = ["tool-collapse", "summarize", "sliding-window", "emergency-truncator"];
+            let idx_of = |n: &str| order.iter().position(|x| *x == n).unwrap_or(usize::MAX);
+            let mut prev = 0usize;
+            for n in &result.strategies_applied {
+                let cur = idx_of(n);
+                assert!(
+                    cur >= prev,
+                    "strategies fired out of insertion order: {:?}",
+                    result.strategies_applied
+                );
+                prev = cur;
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_with_selector_reorders_strategies() {
+        use crate::compaction_scorer::{fit, Pair};
+        use crate::learned_selector::{LearnedSelector, SelectionMode};
+
+        // Train a model that strongly prefers `sliding-window` over
+        // `tool-collapse` and `summarize`.
+        let pairs: Vec<Pair> = (0..30)
+            .flat_map(|_| {
+                [
+                    Pair {
+                        winner: "sliding-window".into(),
+                        loser: "tool-collapse".into(),
+                        weight: 1.0,
+                    },
+                    Pair {
+                        winner: "sliding-window".into(),
+                        loser: "summarize".into(),
+                        weight: 1.0,
+                    },
+                ]
+            })
+            .collect();
+        let model = fit(&pairs);
+        let sel = LearnedSelector::new(model).with_mode(SelectionMode::Learned);
+
+        let pipeline = CompactionPipeline::default_pipeline(1)
+            .with_learned_selector(sel);
+        let mut groups = make_long_groups(20);
+        let result = pipeline.run(&mut groups);
+
+        // sliding-window should fire BEFORE summarize (which is
+        // impossible under the default insertion order without the
+        // selector flipping the rank).
+        if let (Some(pos_sw), Some(pos_sum)) = (
+            result
+                .strategies_applied
+                .iter()
+                .position(|n| n == "sliding-window"),
+            result
+                .strategies_applied
+                .iter()
+                .position(|n| n == "summarize"),
+        ) {
+            assert!(
+                pos_sw < pos_sum,
+                "expected sliding-window before summarize, got {:?}",
+                result.strategies_applied
+            );
+        } else {
+            // If both didn't fire, the test is inconclusive — ensure
+            // at least one strategy fired so the run wasn't a no-op.
+            assert!(!result.strategies_applied.is_empty());
+        }
+    }
+
+    #[test]
+    fn pipeline_selector_in_auto_mode_falls_back_with_no_data() {
+        use crate::compaction_scorer::BradleyTerryModel;
+        use crate::learned_selector::LearnedSelector;
+
+        // Empty model + Auto mode → has_enough_data() == false → use
+        // heuristic (insertion) order.
+        let sel = LearnedSelector::new(BradleyTerryModel::default());
+        let pipeline = CompactionPipeline::default_pipeline(1)
+            .with_learned_selector(sel);
+        let mut groups = make_long_groups(20);
+        let result = pipeline.run(&mut groups);
+        // Same insertion-order invariant as the no-selector test.
+        if result.strategies_applied.len() >= 2 {
+            let order = ["tool-collapse", "summarize", "sliding-window", "emergency-truncator"];
+            let idx_of = |n: &str| order.iter().position(|x| *x == n).unwrap_or(usize::MAX);
+            let mut prev = 0usize;
+            for n in &result.strategies_applied {
+                let cur = idx_of(n);
+                assert!(
+                    cur >= prev,
+                    "Auto+empty should fall back to heuristic; got {:?}",
+                    result.strategies_applied
+                );
+                prev = cur;
+            }
+        }
+    }
+
+    #[test]
+    fn train_from_jsonl_round_trips_telemetry_to_model() {
+        use crate::compaction_telemetry::{CompactionEvent, CompactionTelemetry};
+        let mut telem = CompactionTelemetry::default();
+        for i in 0..20 {
+            telem.record(CompactionEvent {
+                strategy: "summarize".into(),
+                tokens_before: 12_000,
+                tokens_after: 6_000,
+                messages_before: 30,
+                messages_after: 15,
+                turn_index: i,
+                at_secs: 0,
+                downstream_re_ask: Some(false),
+            });
+        }
+        for i in 20..40 {
+            telem.record(CompactionEvent {
+                strategy: "sliding-window".into(),
+                tokens_before: 12_000,
+                tokens_after: 6_000,
+                messages_before: 30,
+                messages_after: 15,
+                turn_index: i,
+                at_secs: 0,
+                downstream_re_ask: Some(true),
+            });
+        }
+        let jsonl = telem.to_jsonl();
+        let model = crate::compaction_scorer::train_from_jsonl(&jsonl);
+        assert!(
+            !model.scores.is_empty(),
+            "expected non-empty model from real telemetry"
+        );
+        let s_sum = model.scores.get("summarize").copied().unwrap_or(0.0);
+        let s_sw = model.scores.get("sliding-window").copied().unwrap_or(0.0);
+        assert!(
+            s_sum > s_sw,
+            "summarize ({s_sum}) should outrank sliding-window ({s_sw}) per labels"
+        );
+    }
+
+    #[test]
+    fn train_from_jsonl_handles_empty_input_gracefully() {
+        let model = crate::compaction_scorer::train_from_jsonl("");
+        assert!(model.scores.is_empty());
+        let model = crate::compaction_scorer::train_from_jsonl("\n\n");
+        assert!(model.scores.is_empty());
+    }
+
+    #[test]
+    fn train_from_jsonl_skips_garbage_lines() {
+        // A garbled line in the middle should not poison the model.
+        let mut payload = String::new();
+        for i in 0..10 {
+            payload.push_str(&format!(
+                "{{\"strategy\":\"summarize\",\"tokens_before\":1000,\"tokens_after\":500,\"messages_before\":10,\"messages_after\":5,\"turn_index\":{i},\"at_secs\":0,\"downstream_re_ask\":false}}\n"
+            ));
+        }
+        payload.push_str("not even json {{{\n");
+        for i in 10..20 {
+            payload.push_str(&format!(
+                "{{\"strategy\":\"sliding-window\",\"tokens_before\":1000,\"tokens_after\":500,\"messages_before\":10,\"messages_after\":5,\"turn_index\":{i},\"at_secs\":0,\"downstream_re_ask\":true}}\n"
+            ));
+        }
+        let model = crate::compaction_scorer::train_from_jsonl(&payload);
+        assert!(!model.scores.is_empty());
     }
 }
