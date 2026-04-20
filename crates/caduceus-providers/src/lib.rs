@@ -868,13 +868,9 @@ impl AnthropicAdapter {
                 // `usage.cache_read_input_tokens > 0`.
                 if m.cache_breakpoint {
                     let mut value = value;
-                    if let Some(arr) = value
-                        .get_mut("content")
-                        .and_then(|c| c.as_array_mut())
-                    {
+                    if let Some(arr) = value.get_mut("content").and_then(|c| c.as_array_mut()) {
                         if let Some(last) = arr.last_mut() {
-                            last["cache_control"] =
-                                serde_json::json!({"type": "ephemeral"});
+                            last["cache_control"] = serde_json::json!({"type": "ephemeral"});
                         }
                     }
                     value
@@ -2593,8 +2589,7 @@ mod tests {
             content_blocks: None,
             tool_calls: vec![],
             tool_result: Some(
-                caduceus_core::ToolResult::success("stable tool output")
-                    .with_tool_use_id("tc_abc"),
+                caduceus_core::ToolResult::success("stable tool output").with_tool_use_id("tc_abc"),
             ),
             cache_breakpoint: false,
         };

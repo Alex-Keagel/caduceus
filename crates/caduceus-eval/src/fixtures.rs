@@ -57,7 +57,12 @@ impl EvalTask for EchoTask {
 /// renames will break diffing across commits — keep them.
 pub fn bundled_tasks() -> Vec<Box<dyn EvalTask>> {
     vec![
-        Box::new(EchoTask::new("baseline-01-greet", "say hello", "Hello!", true)),
+        Box::new(EchoTask::new(
+            "baseline-01-greet",
+            "say hello",
+            "Hello!",
+            true,
+        )),
         Box::new(EchoTask::new(
             "baseline-02-arithmetic",
             "what is 2+2?",

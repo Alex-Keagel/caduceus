@@ -27,8 +27,9 @@ use serde_json::Value;
 /// Field names — in priority order — that are treated as identifying
 /// the resource a tool will touch. Order matters only for documentation
 /// purposes; all matching keys are emitted.
-pub const RESOURCE_FIELDS: &[&str] =
-    &["path", "file", "filename", "filepath", "uri", "url", "resource"];
+pub const RESOURCE_FIELDS: &[&str] = &[
+    "path", "file", "filename", "filepath", "uri", "url", "resource",
+];
 
 /// Extract a deduplicated, deterministically-ordered list of resource
 /// keys from the JSON input the model passed to an MCP tool.
@@ -174,7 +175,11 @@ mod tests {
             "src//foo.rs",
             "src\\foo.rs",
         ] {
-            assert_eq!(extract(&json!({"path": v})), canon, "input '{v}' must canon");
+            assert_eq!(
+                extract(&json!({"path": v})),
+                canon,
+                "input '{v}' must canon"
+            );
         }
     }
 

@@ -93,23 +93,11 @@ pub struct Symbol {
 pub trait LspProvider: Send + Sync {
     fn language(&self) -> &str;
 
-    async fn definition(
-        &self,
-        file: &Path,
-        position: Position,
-    ) -> Result<Vec<Location>, LspError>;
+    async fn definition(&self, file: &Path, position: Position) -> Result<Vec<Location>, LspError>;
 
-    async fn references(
-        &self,
-        file: &Path,
-        position: Position,
-    ) -> Result<Vec<Location>, LspError>;
+    async fn references(&self, file: &Path, position: Position) -> Result<Vec<Location>, LspError>;
 
-    async fn hover(
-        &self,
-        file: &Path,
-        position: Position,
-    ) -> Result<Option<String>, LspError>;
+    async fn hover(&self, file: &Path, position: Position) -> Result<Option<String>, LspError>;
 
     async fn document_symbols(&self, file: &Path) -> Result<Vec<Symbol>, LspError>;
 
@@ -138,7 +126,9 @@ impl LspManager {
     pub fn new() -> Self {
         let mut state = ManagerState::default();
         for (ext, lang) in DEFAULT_EXTENSIONS {
-            state.extensions.insert((*ext).to_string(), (*lang).to_string());
+            state
+                .extensions
+                .insert((*ext).to_string(), (*lang).to_string());
         }
         Self {
             state: Arc::new(RwLock::new(state)),
@@ -147,8 +137,10 @@ impl LspManager {
 
     pub async fn register_extension(&self, ext: &str, language: &str) {
         let mut s = self.state.write().await;
-        s.extensions
-            .insert(ext.trim_start_matches('.').to_lowercase(), language.to_string());
+        s.extensions.insert(
+            ext.trim_start_matches('.').to_lowercase(),
+            language.to_string(),
+        );
     }
 
     pub async fn install_provider(&self, language: &str, provider: Arc<dyn LspProvider>) {
@@ -214,11 +206,7 @@ impl LspManager {
         self.resolve(file).await?.references(file, position).await
     }
 
-    pub async fn hover(
-        &self,
-        file: &Path,
-        position: Position,
-    ) -> Result<Option<String>, LspError> {
+    pub async fn hover(&self, file: &Path, position: Position) -> Result<Option<String>, LspError> {
         self.resolve(file).await?.hover(file, position).await
     }
 
@@ -405,10 +393,7 @@ mod tests {
         mgr.register_extension("rs", "mydsl").await;
         let p = Arc::new(MockProvider::new("mydsl"));
         mgr.install_provider("mydsl", p.clone()).await;
-        let _ = mgr
-            .hover(Path::new("foo.rs"), pos(0, 0))
-            .await
-            .unwrap();
+        let _ = mgr.hover(Path::new("foo.rs"), pos(0, 0)).await.unwrap();
         assert_eq!(p.calls.lock().unwrap().as_slice(), ["hover"]);
     }
 
@@ -468,9 +453,12 @@ mod tests {
     #[tokio::test]
     async fn languages_lists_installed_providers_sorted() {
         let mgr = LspManager::new();
-        mgr.install_provider("rust", Arc::new(MockProvider::new("rust"))).await;
-        mgr.install_provider("python", Arc::new(MockProvider::new("python"))).await;
-        mgr.install_provider("go", Arc::new(MockProvider::new("go"))).await;
+        mgr.install_provider("rust", Arc::new(MockProvider::new("rust")))
+            .await;
+        mgr.install_provider("python", Arc::new(MockProvider::new("python")))
+            .await;
+        mgr.install_provider("go", Arc::new(MockProvider::new("go")))
+            .await;
         let langs = mgr.languages().await;
         assert_eq!(langs, vec!["go", "python", "rust"]);
     }
@@ -508,10 +496,7 @@ mod tests {
         let p = Arc::new(MockProvider::new("rust"));
         mgr.install_provider("rust", p.clone()).await;
         // Provider installed via mgr should be visible via mgr2.
-        let _ = mgr2
-            .definition(Path::new("a.rs"), pos(0, 0))
-            .await
-            .unwrap();
+        let _ = mgr2.definition(Path::new("a.rs"), pos(0, 0)).await.unwrap();
         assert_eq!(p.calls.lock().unwrap().as_slice(), ["definition"]);
     }
 

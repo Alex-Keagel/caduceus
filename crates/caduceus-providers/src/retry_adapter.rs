@@ -158,8 +158,9 @@ impl LlmAdapter for RetryAdapter {
         let mut last_err: Option<CaduceusError> = None;
 
         // Iterate primary then each backup in order.
-        let chain: Vec<&Arc<dyn LlmAdapter>> =
-            std::iter::once(&self.primary).chain(self.backups.iter()).collect();
+        let chain: Vec<&Arc<dyn LlmAdapter>> = std::iter::once(&self.primary)
+            .chain(self.backups.iter())
+            .collect();
 
         for (chain_idx, adapter) in chain.iter().enumerate() {
             let attempts = self.policy.max_attempts.max(1);
@@ -249,16 +250,16 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop()
-                .map(|r| r.map_err(|e| match e {
-                    CaduceusError::RateLimited { retry_after_secs } => {
-                        CaduceusError::RateLimited { retry_after_secs }
-                    }
-                    CaduceusError::Provider(s) => CaduceusError::Provider(s),
-                    other => CaduceusError::Provider(format!("{other}")),
-                }))
-                .unwrap_or_else(|| {
-                    Err(CaduceusError::Provider("ScriptedAdapter exhausted".into()))
+                .map(|r| {
+                    r.map_err(|e| match e {
+                        CaduceusError::RateLimited { retry_after_secs } => {
+                            CaduceusError::RateLimited { retry_after_secs }
+                        }
+                        CaduceusError::Provider(s) => CaduceusError::Provider(s),
+                        other => CaduceusError::Provider(format!("{other}")),
+                    })
                 })
+                .unwrap_or_else(|| Err(CaduceusError::Provider("ScriptedAdapter exhausted".into())))
         }
         async fn stream(&self, _req: ChatRequest) -> Result<StreamResult> {
             unimplemented!("streaming not used in retry tests")
@@ -336,8 +337,12 @@ mod tests {
             "primary",
             vec![
                 Ok(ok_response("ok")), // 3rd attempt
-                Err(CaduceusError::RateLimited { retry_after_secs: 0 }), // 2nd
-                Err(CaduceusError::RateLimited { retry_after_secs: 0 }), // 1st
+                Err(CaduceusError::RateLimited {
+                    retry_after_secs: 0,
+                }), // 2nd
+                Err(CaduceusError::RateLimited {
+                    retry_after_secs: 0,
+                }), // 1st
             ],
         ));
         let retry = RetryAdapter::new(adapter.clone()).with_policy(fast_policy());
@@ -352,12 +357,21 @@ mod tests {
         let primary = Arc::new(ScriptedAdapter::new(
             "primary",
             vec![
-                Err(CaduceusError::RateLimited { retry_after_secs: 0 }),
-                Err(CaduceusError::RateLimited { retry_after_secs: 0 }),
-                Err(CaduceusError::RateLimited { retry_after_secs: 0 }),
+                Err(CaduceusError::RateLimited {
+                    retry_after_secs: 0,
+                }),
+                Err(CaduceusError::RateLimited {
+                    retry_after_secs: 0,
+                }),
+                Err(CaduceusError::RateLimited {
+                    retry_after_secs: 0,
+                }),
             ],
         ));
-        let backup = Arc::new(ScriptedAdapter::new("backup", vec![Ok(ok_response("backup-ok"))]));
+        let backup = Arc::new(ScriptedAdapter::new(
+            "backup",
+            vec![Ok(ok_response("backup-ok"))],
+        ));
         let hook_calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let hook_calls_inner = hook_calls.clone();
         let retry = RetryAdapter::new(primary.clone())
@@ -411,7 +425,10 @@ mod tests {
             .with_failover(backup.clone());
         let err = retry.chat(req()).await.unwrap_err();
         let s = format!("{err}");
-        assert!(s.contains("backup down"), "must surface LAST error, got: {s}");
+        assert!(
+            s.contains("backup down"),
+            "must surface LAST error, got: {s}"
+        );
     }
 
     #[test]

@@ -775,8 +775,9 @@ impl Coordinator {
                     let agents = self.agents.clone();
                     let all_tools = self.available_tools.clone();
 
-                    let handle =
-                        tokio::spawn(async move { run_task(task, ctx, prov, model, agents, all_tools).await });
+                    let handle = tokio::spawn(async move {
+                        run_task(task, ctx, prov, model, agents, all_tools).await
+                    });
                     handles.push((task_id.clone(), handle));
                 }
             }
@@ -850,7 +851,13 @@ impl Coordinator {
                 // Fall through to plain synthesis below.
             } else {
                 return self
-                    .critique_and_merge(goal, provider, critic_model, critic_temperature, leaf_count)
+                    .critique_and_merge(
+                        goal,
+                        provider,
+                        critic_model,
+                        critic_temperature,
+                        leaf_count,
+                    )
                     .await;
             }
         }
@@ -1048,15 +1055,19 @@ async fn run_task(
         if cfg.tools.is_empty() {
             vec![] // No tools — text-only agent
         } else {
-            available_tools.iter()
+            available_tools
+                .iter()
                 .filter(|spec| cfg.tools.iter().any(|t| spec.name == *t))
                 .cloned()
                 .collect()
         }
     } else {
         // Default: read-only tools
-        available_tools.iter()
-            .filter(|spec| ["grep", "read_file", "list_directory", "find_path"].contains(&spec.name.as_str()))
+        available_tools
+            .iter()
+            .filter(|spec| {
+                ["grep", "read_file", "list_directory", "find_path"].contains(&spec.name.as_str())
+            })
             .cloned()
             .collect()
     };
@@ -1082,7 +1093,12 @@ async fn run_task(
                 final_response = r.content.clone();
 
                 // If the response indicates completion (no tool use), stop
-                if matches!(r.stop_reason, caduceus_core::StopReason::EndTurn | caduceus_core::StopReason::StopSequence | caduceus_core::StopReason::MaxTokens) {
+                if matches!(
+                    r.stop_reason,
+                    caduceus_core::StopReason::EndTurn
+                        | caduceus_core::StopReason::StopSequence
+                        | caduceus_core::StopReason::MaxTokens
+                ) {
                     break;
                 }
 
@@ -2427,10 +2443,7 @@ impl MessageBus {
     }
 
     pub fn publish(&mut self, message: BusMessage) {
-        let queue = self
-            .channels
-            .entry(message.channel.clone())
-            .or_default();
+        let queue = self.channels.entry(message.channel.clone()).or_default();
         queue.push_back(message.clone());
         // Sliding-window eviction: drop oldest until under cap.
         while queue.len() > Self::MAX_MESSAGES_PER_CHANNEL {
@@ -3624,7 +3637,10 @@ Here is the task plan:
         let visible = bus.read("alice", "fire-hose");
         assert_eq!(visible.len(), cap, "should be sliding-window capped");
         // Oldest should have been evicted; newest preserved.
-        assert_eq!(visible.last().unwrap().content, format!("m{}", cap as u64 + 49));
+        assert_eq!(
+            visible.last().unwrap().content,
+            format!("m{}", cap as u64 + 49)
+        );
         assert_ne!(visible.first().unwrap().content, "m0");
     }
 
@@ -3865,8 +3881,7 @@ Here is the task plan:
 
     #[test]
     fn parse_critique_response_extracts_json_from_prose() {
-        let raw =
-            "Sure, here's the result:\n{\"merged\":\"y\",\"conflicts\":[]}\nHope that helps!";
+        let raw = "Sure, here's the result:\n{\"merged\":\"y\",\"conflicts\":[]}\nHope that helps!";
         let c = parse_critique_response(raw);
         assert_eq!(c.merged, "y");
     }
@@ -3925,14 +3940,15 @@ Here is the task plan:
 
     #[test]
     fn coordinator_with_merge_strategy_critique_stores_strategy() {
-        let c = Coordinator::new(vec![make_agent("a")]).with_merge_strategy(
-            MergeStrategy::Critique {
+        let c =
+            Coordinator::new(vec![make_agent("a")]).with_merge_strategy(MergeStrategy::Critique {
                 critic_model: ModelId::new("critic-m"),
                 critic_temperature: None,
-            },
-        );
+            });
         match c.merge_strategy {
-            MergeStrategy::Critique { ref critic_model, .. } => {
+            MergeStrategy::Critique {
+                ref critic_model, ..
+            } => {
                 assert_eq!(critic_model.0, "critic-m");
             }
             _ => panic!("expected Critique strategy"),
@@ -3960,7 +3976,8 @@ Here is the task plan:
 
         let ctx = SharedContext::new();
         ctx.write("leaf1", "result one").await;
-        ctx.write("leaf2", "result two with different timestamp").await;
+        ctx.write("leaf2", "result two with different timestamp")
+            .await;
 
         let coord = Coordinator::new(vec![make_agent("a")])
             .with_context(ctx)
@@ -4003,7 +4020,7 @@ Here is the task plan:
             cache_creation_tokens: 0,
             stop_reason: caduceus_core::StopReason::EndTurn,
             tool_calls: vec![],
-                logprobs: None,
+            logprobs: None,
         }]));
 
         let ctx = SharedContext::new();
@@ -4219,15 +4236,14 @@ Here is the task plan:
         use caduceus_providers::ChatResponse;
 
         let provider = Arc::new(MockLlmAdapter::new(vec![ChatResponse {
-            content: r#"{"merged":"m","conflicts":[{"between":["a","b"],"note":"n"}]}"#
-                .to_string(),
+            content: r#"{"merged":"m","conflicts":[{"between":["a","b"],"note":"n"}]}"#.to_string(),
             input_tokens: 11,
             output_tokens: 22,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             stop_reason: caduceus_core::StopReason::EndTurn,
             tool_calls: vec![],
-                logprobs: None,
+            logprobs: None,
         }]));
 
         let ctx = SharedContext::new();
@@ -4296,7 +4312,7 @@ Here is the task plan:
             cache_creation_tokens: 0,
             stop_reason: caduceus_core::StopReason::EndTurn,
             tool_calls: vec![],
-                logprobs: None,
+            logprobs: None,
         }]));
 
         let ctx = SharedContext::new();
@@ -4357,7 +4373,7 @@ Here is the task plan:
             cache_creation_tokens: 0,
             stop_reason: caduceus_core::StopReason::EndTurn,
             tool_calls: vec![],
-                logprobs: None,
+            logprobs: None,
         }]));
 
         let ctx = SharedContext::new();
@@ -4393,7 +4409,7 @@ Here is the task plan:
             cache_creation_tokens: 0,
             stop_reason: caduceus_core::StopReason::EndTurn,
             tool_calls: vec![],
-                logprobs: None,
+            logprobs: None,
         }]));
 
         let ctx = SharedContext::new();
@@ -4463,11 +4479,13 @@ Here is the task plan:
         // Three distinct keys → no collisions.
         assert!(!ctx.had_collisions().await);
         assert_eq!(
-            ctx.read_at(&ContextKey::branched("rollout-1", "summary")).await,
+            ctx.read_at(&ContextKey::branched("rollout-1", "summary"))
+                .await,
             Some("a".into())
         );
         assert_eq!(
-            ctx.read_at(&ContextKey::branched("rollout-2", "summary")).await,
+            ctx.read_at(&ContextKey::branched("rollout-2", "summary"))
+                .await,
             Some("b".into())
         );
         assert_eq!(ctx.read("summary").await, Some("root".into()));
@@ -4610,12 +4628,12 @@ Here is the task plan:
         let bb = BroadcastBus::new();
         let mut rx = bb.subscribe("alerts");
         bb.publish(crate::broadcast_bus::BusMessage {
-                from: "x".into(),
-                content: "hi".into(),
-                timestamp: 0,
-                channel: "alerts".into(),
-            })
-            .expect("delivered");
+            from: "x".into(),
+            content: "hi".into(),
+            timestamp: 0,
+            channel: "alerts".into(),
+        })
+        .expect("delivered");
         let m = rx.recv().await.expect("delivered");
         assert_eq!(m.content, "hi");
     }
@@ -4628,12 +4646,12 @@ Here is the task plan:
         let mut a = bb.subscribe("ch");
         let mut b = bb.subscribe("ch");
         bb.publish(crate::broadcast_bus::BusMessage {
-                from: "p".into(),
-                content: "fan".into(),
-                timestamp: 0,
-                channel: "ch".into(),
-            })
-            .expect("delivered");
+            from: "p".into(),
+            content: "fan".into(),
+            timestamp: 0,
+            channel: "ch".into(),
+        })
+        .expect("delivered");
         assert_eq!(a.recv().await.unwrap().content, "fan");
         assert_eq!(b.recv().await.unwrap().content, "fan");
     }
@@ -4665,12 +4683,12 @@ Here is the task plan:
         let mut a = bb.subscribe("ch_a");
         let mut b = bb.subscribe("ch_b");
         bb.publish(crate::broadcast_bus::BusMessage {
-                from: "p".into(),
-                content: "to_a".into(),
-                timestamp: 0,
-                channel: "ch_a".into(),
-            })
-            .expect("delivered");
+            from: "p".into(),
+            content: "to_a".into(),
+            timestamp: 0,
+            channel: "ch_a".into(),
+        })
+        .expect("delivered");
         assert_eq!(a.recv().await.unwrap().content, "to_a");
         // ch_b receiver must NOT receive ch_a's message — non-blocking
         // try_recv should yield Empty.
@@ -4689,4 +4707,3 @@ Here is the task plan:
         assert!(bus.broadcast().is_none());
     }
 }
-

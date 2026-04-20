@@ -120,10 +120,7 @@ impl LearnedSelector {
     /// Pick the top strategy and report the score margin over the
     /// runner-up. `margin` is 0 when only one candidate is given.
     /// Useful for UI confidence badges.
-    pub fn select_with_confidence<'a>(
-        &self,
-        candidates: &[&'a str],
-    ) -> Option<(&'a str, f64)> {
+    pub fn select_with_confidence<'a>(&self, candidates: &[&'a str]) -> Option<(&'a str, f64)> {
         let ranked = self.rank(candidates);
         match ranked.as_slice() {
             [] => None,
@@ -232,8 +229,8 @@ mod tests {
 
     #[test]
     fn equal_scores_preserve_input_order() {
-        let s = LearnedSelector::new(BradleyTerryModel::default())
-            .with_mode(SelectionMode::Learned);
+        let s =
+            LearnedSelector::new(BradleyTerryModel::default()).with_mode(SelectionMode::Learned);
         // All unknown → all get fallback 0 → input order preserved.
         assert_eq!(s.rank(&["X", "Y", "Z"]), vec!["X", "Y", "Z"]);
         assert_eq!(s.rank(&["Z", "Y", "X"]), vec!["Z", "Y", "X"]);

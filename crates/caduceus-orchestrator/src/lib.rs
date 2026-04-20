@@ -2,7 +2,6 @@ pub mod automations;
 pub mod background;
 pub mod branching_planner;
 pub mod branching_planner_llm;
-pub mod reflexion;
 pub mod broadcast_bus;
 pub mod bugbot;
 pub mod checkpoint;
@@ -13,10 +12,8 @@ pub mod compaction_telemetry;
 pub mod context;
 pub mod context_fold;
 pub mod critic;
-pub mod hygiene;
-pub mod notifications;
-mod pairing;
 pub mod headless;
+pub mod hygiene;
 pub mod instructions;
 pub mod kanban;
 pub mod learned_selector;
@@ -24,6 +21,9 @@ pub mod memories;
 pub mod memory_blocks;
 pub mod mentions;
 pub mod modes;
+pub mod notifications;
+mod pairing;
+pub mod reflexion;
 pub mod rollout_prm;
 pub mod self_consistency;
 pub mod snapshot;
@@ -37,13 +37,13 @@ pub use headless::{
 pub use modes::{AgentPersona, PersonaRegistry};
 #[allow(deprecated)]
 pub use workers::{
-    BusMessage, Complexity, ConflictNote, ContextReference, CritiqueOutput, DagTask,
-    DagTaskStatus, DecomposedTask, JitContextLoader, MergeStrategy, MessageBus,
-    MultiRepoWorkspace, NotificationChannel, NotificationRoute, NotificationRouter,
-    NotificationSeverity, Plugin, PluginAgent, PluginCapability, PluginCapabilityManager,
-    PluginCommand, PluginDefinedTool, PluginExtensions, PluginSkill, PluginSystem,
-    PluginToolRegistry, RefType, RepoEntry, SchedulerStrategy, SharedMemory, SharedMemoryEntry,
-    TaskDag, TaskDecomposer, TaskScheduler, TeamAgent, TeamOrchestrator,
+    BusMessage, Complexity, ConflictNote, ContextReference, CritiqueOutput, DagTask, DagTaskStatus,
+    DecomposedTask, JitContextLoader, MergeStrategy, MessageBus, MultiRepoWorkspace,
+    NotificationChannel, NotificationRoute, NotificationRouter, NotificationSeverity, Plugin,
+    PluginAgent, PluginCapability, PluginCapabilityManager, PluginCommand, PluginDefinedTool,
+    PluginExtensions, PluginSkill, PluginSystem, PluginToolRegistry, RefType, RepoEntry,
+    SchedulerStrategy, SharedMemory, SharedMemoryEntry, TaskDag, TaskDecomposer, TaskScheduler,
+    TeamAgent, TeamOrchestrator,
 };
 
 use caduceus_core::{
@@ -648,10 +648,7 @@ impl ContextAssembler {
         // Walk units newest-first, stop when next unit doesn't fit.
         let mut included_units: Vec<(usize, usize)> = Vec::new();
         for &(start, end) in units.iter().rev() {
-            let unit_cost: u32 = messages[start..end]
-                .iter()
-                .map(Self::message_tokens)
-                .sum();
+            let unit_cost: u32 = messages[start..end].iter().map(Self::message_tokens).sum();
             if budget_used + unit_cost > available {
                 // Stop on first non-fitting unit so chronological order is
                 // preserved (we never want a gap in the middle of history).
@@ -673,10 +670,7 @@ impl ContextAssembler {
         // tool-role (only possible if the history itself was malformed and
         // started with one), drop it. pair_aware_units emits orphans as
         // size-1 units so this fallback only ever triggers on bad input.
-        while result
-            .get(1)
-            .is_some_and(|m| m.role == "tool")
-        {
+        while result.get(1).is_some_and(|m| m.role == "tool") {
             result.remove(1);
         }
 
@@ -781,9 +775,7 @@ impl AgentEventEmitter {
     pub fn without_retention(tx: mpsc::Sender<AgentEvent>) -> Self {
         Self {
             tx,
-            retention: Arc::new(std::sync::Mutex::new(
-                std::collections::VecDeque::new(),
-            )),
+            retention: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             retention_cap: 0,
             dropped_since_last: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
@@ -944,10 +936,7 @@ impl AgentEventEmitter {
     /// Emit a per-turn token-logprob summary (gap G10 / P3.2).
     /// Called once after `provider.chat()` returns when the response
     /// carried logprobs.
-    pub async fn emit_token_logprob_summary(
-        &self,
-        summary: &caduceus_providers::LogprobsSummary,
-    ) {
+    pub async fn emit_token_logprob_summary(&self, summary: &caduceus_providers::LogprobsSummary) {
         self.emit(AgentEvent::TokenLogprobSummary {
             n_tokens: summary.n_tokens,
             min_token_p: summary.min_token_p,
@@ -1237,10 +1226,7 @@ pub struct TestGateConfig {
 }
 
 impl TestGateConfig {
-    pub fn new(
-        command: Vec<String>,
-        working_dir: impl Into<std::path::PathBuf>,
-    ) -> Self {
+    pub fn new(command: Vec<String>, working_dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
             command,
             working_dir: working_dir.into(),
@@ -1292,7 +1278,8 @@ impl TestGateOutcome {
             TestGateOutcome::Fail { code, tail } => format!(
                 "❌ project tests FAILED (exit {}; verification gate)\n\
                  ─── last output ───\n{}",
-                code.map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+                code.map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into()),
                 tail
             ),
             TestGateOutcome::SpawnError(msg) => format!(
@@ -1304,8 +1291,7 @@ impl TestGateOutcome {
                 seconds
             ),
             TestGateOutcome::Cancelled => {
-                "⏸ project tests cancelled by user (verification gate)"
-                    .to_string()
+                "⏸ project tests cancelled by user (verification gate)".to_string()
             }
         }
     }
@@ -1402,10 +1388,7 @@ impl AgentHarness {
     /// Replace the default tool-output sanitiser. Production callers should
     /// generally rely on the default; tests use this to exercise the
     /// truncation path without 100 KiB fixtures.
-    pub fn with_output_sanitizer(
-        mut self,
-        sanitizer: caduceus_core::ToolOutputSanitizer,
-    ) -> Self {
+    pub fn with_output_sanitizer(mut self, sanitizer: caduceus_core::ToolOutputSanitizer) -> Self {
         self.output_sanitizer = sanitizer;
         self
     }
@@ -1479,10 +1462,8 @@ impl AgentHarness {
     pub async fn revert_checkpoint(
         &self,
         id: crate::checkpoint::CheckpointId,
-    ) -> std::result::Result<
-        Vec<crate::checkpoint::FileSnapshot>,
-        crate::checkpoint::CheckpointError,
-    > {
+    ) -> std::result::Result<Vec<crate::checkpoint::FileSnapshot>, crate::checkpoint::CheckpointError>
+    {
         let Some(store) = self.checkpoint_store.as_ref() else {
             // No store attached — surface as Unknown so callers handle
             // both "no-store" and "bad-id" identically (closed-fail).
@@ -1636,9 +1617,7 @@ impl AgentHarness {
         self
     }
 
-    pub fn reflexion(
-        &self,
-    ) -> Option<&Arc<std::sync::Mutex<crate::reflexion::ReflexionMemory>>> {
+    pub fn reflexion(&self) -> Option<&Arc<std::sync::Mutex<crate::reflexion::ReflexionMemory>>> {
         self.reflexion.as_ref()
     }
 
@@ -1664,17 +1643,16 @@ impl AgentHarness {
         outcome: &crate::reflexion::AttemptOutcome,
     ) -> Option<crate::reflexion::Reflection> {
         let m = self.reflexion.as_ref()?;
-        m.lock().unwrap().record_outcome(reflector, task_tag, outcome)
+        m.lock()
+            .unwrap()
+            .record_outcome(reflector, task_tag, outcome)
     }
 
     /// P12.3 — attach a Tree-of-Thoughts planner config. Callers
     /// then invoke [`plan_with_tot`] with their own expander/scorer
     /// (typically wrapping an LLM call). When unset, [`plan_with_tot`]
     /// uses [`crate::branching_planner::PlannerConfig::default`].
-    pub fn with_tot_config(
-        mut self,
-        cfg: crate::branching_planner::PlannerConfig,
-    ) -> Self {
+    pub fn with_tot_config(mut self, cfg: crate::branching_planner::PlannerConfig) -> Self {
         self.tot_config = Some(cfg);
         self
     }
@@ -1858,10 +1836,7 @@ impl AgentHarness {
     /// combined with `VerificationStrategy::PrmWeightedVote { samples }`,
     /// each rollout ballot is scored by this verifier and the winner is
     /// chosen by PRM-weighted plurality.
-    pub fn with_step_verifier(
-        mut self,
-        verifier: Arc<dyn caduceus_core::StepVerifier>,
-    ) -> Self {
+    pub fn with_step_verifier(mut self, verifier: Arc<dyn caduceus_core::StepVerifier>) -> Self {
         self.step_verifier = Some(verifier);
         self
     }
@@ -2065,14 +2040,9 @@ impl AgentHarness {
     /// We only update `context_limit` and `reserved_output`. The
     /// `used_input` / `used_output` counters are preserved so a
     /// mid-session switch doesn't reset spending.
-    async fn apply_model_budget_for_turn(
-        &self,
-        state: &mut SessionState,
-        model_id: &str,
-    ) -> bool {
+    async fn apply_model_budget_for_turn(&self, state: &mut SessionState, model_id: &str) -> bool {
         let (ctx, reserved) = caduceus_core::TokenBudget::model_spec(model_id);
-        if state.token_budget.context_limit == ctx
-            && state.token_budget.reserved_output == reserved
+        if state.token_budget.context_limit == ctx && state.token_budget.reserved_output == reserved
         {
             return false;
         }
@@ -2145,11 +2115,7 @@ impl AgentHarness {
                         })
                         .await;
                     }
-                    let annotated = format!(
-                        "{}\n\n{}",
-                        original_final,
-                        outcome.annotation()
-                    );
+                    let annotated = format!("{}\n\n{}", original_final, outcome.annotation());
                     return Some(annotated);
                 }
                 // No config wired → TestGated is a no-op. Logged so a
@@ -2250,12 +2216,8 @@ impl AgentHarness {
                 }
                 Err(e) => {
                     if let Some(ref em) = self.emitter {
-                        em.emit_error(format!(
-                            "verification rollout {} failed: {}",
-                            i + 1,
-                            e
-                        ))
-                        .await;
+                        em.emit_error(format!("verification rollout {} failed: {}", i + 1, e))
+                            .await;
                     }
                 }
             }
@@ -2280,8 +2242,7 @@ impl AgentHarness {
             // No verifier wired → fall back to plain plurality with a
             // diagnostic so the misconfiguration is observable.
             if let Some(ref verifier) = self.step_verifier {
-                let mut weighted: Vec<(String, f32)> =
-                    Vec::with_capacity(ballots.len());
+                let mut weighted: Vec<(String, f32)> = Vec::with_capacity(ballots.len());
                 for (idx, b) in ballots.iter().enumerate() {
                     let view = caduceus_core::StepView {
                         step_id: idx as u64,
@@ -2376,9 +2337,7 @@ impl AgentHarness {
     /// do NOT touch session state here.
     async fn run_test_gate(&self, cfg: &TestGateConfig) -> TestGateOutcome {
         if cfg.command.is_empty() {
-            return TestGateOutcome::SpawnError(
-                "test_gate_config.command is empty".into(),
-            );
+            return TestGateOutcome::SpawnError("test_gate_config.command is empty".into());
         }
         let program = &cfg.command[0];
         let args = &cfg.command[1..];
@@ -2404,7 +2363,8 @@ impl AgentHarness {
             .unwrap_or(false)
         {
             let outcome = TestGateOutcome::Cancelled;
-            self.emit_test_gate_complete(&outcome, started.elapsed()).await;
+            self.emit_test_gate_complete(&outcome, started.elapsed())
+                .await;
             return outcome;
         }
 
@@ -2426,11 +2386,10 @@ impl AgentHarness {
         let child = match spawn_result {
             Ok(c) => c,
             Err(e) => {
-                let outcome = TestGateOutcome::SpawnError(format!(
-                    "failed to spawn `{}`: {}",
-                    program, e
-                ));
-                self.emit_test_gate_complete(&outcome, started.elapsed()).await;
+                let outcome =
+                    TestGateOutcome::SpawnError(format!("failed to spawn `{}`: {}", program, e));
+                self.emit_test_gate_complete(&outcome, started.elapsed())
+                    .await;
                 return outcome;
             }
         };
@@ -2451,9 +2410,7 @@ impl AgentHarness {
         let cancel_poll_fut = async move {
             if let Some(token) = cancel_token {
                 let mut ticker = tokio::time::interval(Duration::from_millis(100));
-                ticker.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Skip,
-                );
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 // Skip the first immediate tick so we don't "cancel"
                 // before doing any work on a token that the caller
                 // already-cleared just before this run.
@@ -2485,7 +2442,8 @@ impl AgentHarness {
             },
         };
 
-        self.emit_test_gate_complete(&outcome, started.elapsed()).await;
+        self.emit_test_gate_complete(&outcome, started.elapsed())
+            .await;
         outcome
     }
 
@@ -2507,10 +2465,7 @@ impl AgentHarness {
     /// Convert raw process output into a `TestGateOutcome`. Pulled out
     /// of [`run_test_gate`] so the main fn body stays readable now that
     /// it has the cancel/timeout `select!`.
-    fn classify_test_output(
-        output: std::process::Output,
-        tail_bytes: usize,
-    ) -> TestGateOutcome {
+    fn classify_test_output(output: std::process::Output, tail_bytes: usize) -> TestGateOutcome {
         let status = output.status;
         let mut combined = String::new();
         // stdout first (success summaries), then stderr (failure detail)
@@ -2855,7 +2810,8 @@ impl AgentHarness {
             };
             if usage_pct > 85.0 && history.len() > 10 {
                 let before = history.len() as u32;
-                let tokens_before_u = state.token_budget.used_input + state.token_budget.used_output;
+                let tokens_before_u =
+                    state.token_budget.used_input + state.token_budget.used_output;
                 let evicted = history.truncate_oldest_with_report(history.len() / 2);
                 let after = history.len() as u32;
                 if let Some(ref em) = self.emitter {
@@ -2943,9 +2899,10 @@ impl AgentHarness {
                                         })
                                         .await;
                                     }
-                                    history.append(caduceus_providers::Message::user(
-                                        format!("[Critic feedback] {}", feedback),
-                                    ));
+                                    history.append(caduceus_providers::Message::user(format!(
+                                        "[Critic feedback] {}",
+                                        feedback
+                                    )));
                                     critic_iters += 1;
                                     final_text.clear();
                                     continue;
@@ -3103,11 +3060,9 @@ impl AgentHarness {
                             // in a multi-tool turn.
                             let outcome = if let Some(ref rx) = self.approval_rx {
                                 let mut rx_guard = rx.lock().await;
-                                let waited = std::time::Duration::from_secs(
-                                    self.approval_timeout_secs,
-                                );
-                                let first =
-                                    tokio::time::timeout(waited, rx_guard.recv()).await;
+                                let waited =
+                                    std::time::Duration::from_secs(self.approval_timeout_secs);
+                                let first = tokio::time::timeout(waited, rx_guard.recv()).await;
                                 match first {
                                     Ok(Some((id, approved))) if id == req_id => {
                                         if approved {
@@ -3145,9 +3100,7 @@ impl AgentHarness {
                                         let mut last_seen = stale_id.clone();
                                         for _ in 0..8 {
                                             match rx_guard.try_recv() {
-                                                Ok((next_id, approved))
-                                                    if next_id == req_id =>
-                                                {
+                                                Ok((next_id, approved)) if next_id == req_id => {
                                                     found = Some(approved);
                                                     break;
                                                 }
@@ -3159,12 +3112,10 @@ impl AgentHarness {
                                                         "drained stale approval reply"
                                                     );
                                                     if let Some(ref em) = self.emitter {
-                                                        em.emit(
-                                                            AgentEvent::DrainedStaleApproval {
-                                                                expected: req_id.clone(),
-                                                                drained: next_id.clone(),
-                                                            },
-                                                        )
+                                                        em.emit(AgentEvent::DrainedStaleApproval {
+                                                            expected: req_id.clone(),
+                                                            drained: next_id.clone(),
+                                                        })
                                                         .await;
                                                     }
                                                     last_seen = next_id;
@@ -3202,10 +3153,8 @@ impl AgentHarness {
                                 })
                                 .await;
                                 // P10.4 — analytics-friendly companion with latency.
-                                let latency_ms = prompted_at
-                                    .elapsed()
-                                    .as_millis()
-                                    .min(u32::MAX as u128) as u32;
+                                let latency_ms =
+                                    prompted_at.elapsed().as_millis().min(u32::MAX as u128) as u32;
                                 em.emit(AgentEvent::ApprovalDecided {
                                     tool: tool_use.name.clone(),
                                     decision: caduceus_core::ApprovalDecision::from_outcome(
@@ -3263,10 +3212,7 @@ impl AgentHarness {
                         let tools = self.tools.clone_registry();
                         let name = name.clone();
                         let input = input.clone();
-                        let timeout = overrides
-                            .get(&name)
-                            .copied()
-                            .unwrap_or(global_timeout);
+                        let timeout = overrides.get(&name).copied().unwrap_or(global_timeout);
                         let cancel_token = cancel_token_for_tools.clone();
                         let spec_cache = spec_cache.clone();
                         join_set.spawn(async move {
@@ -3336,8 +3282,10 @@ impl AgentHarness {
                     }
 
                     // Collect results in submission order
-                    let mut results: std::collections::HashMap<usize, (String, bool, std::time::Duration)> =
-                        std::collections::HashMap::new();
+                    let mut results: std::collections::HashMap<
+                        usize,
+                        (String, bool, std::time::Duration),
+                    > = std::collections::HashMap::new();
                     while let Some(join_result) = join_set.join_next().await {
                         if let Ok((idx, name, applied_timeout, outcome, elapsed)) = join_result {
                             let (content, is_error) = match outcome {
@@ -3350,9 +3298,7 @@ impl AgentHarness {
                                         em.emit(AgentEvent::ToolTimedOut {
                                             tool: name.clone(),
                                             timeout_secs: applied_timeout.as_secs(),
-                                            elapsed_ms: elapsed
-                                                .as_millis()
-                                                .min(u64::MAX as u128)
+                                            elapsed_ms: elapsed.as_millis().min(u64::MAX as u128)
                                                 as u64,
                                         })
                                         .await;
@@ -3374,17 +3320,12 @@ impl AgentHarness {
                                     if let Some(ref em) = self.emitter {
                                         em.emit(AgentEvent::ToolCancelled {
                                             tool: name.clone(),
-                                            elapsed_ms: elapsed
-                                                .as_millis()
-                                                .min(u64::MAX as u128)
+                                            elapsed_ms: elapsed.as_millis().min(u64::MAX as u128)
                                                 as u64,
                                         })
                                         .await;
                                     }
-                                    (
-                                        format!("Tool '{}' cancelled by user", name),
-                                        true,
-                                    )
+                                    (format!("Tool '{}' cancelled by user", name), true)
                                 }
                             };
                             results.insert(idx, (content, is_error, elapsed));
@@ -3397,10 +3338,7 @@ impl AgentHarness {
                             tool_count: approved_count,
                             ok_count,
                             error_count,
-                            duration_ms: batch_started
-                                .elapsed()
-                                .as_millis()
-                                .min(u64::MAX as u128)
+                            duration_ms: batch_started.elapsed().as_millis().min(u64::MAX as u128)
                                 as u64,
                         })
                         .await;
@@ -3416,13 +3354,11 @@ impl AgentHarness {
                             // next round, which is hostile UX.
                             (reason.skip_message(), true, std::time::Duration::ZERO)
                         } else {
-                            results
-                                .remove(&idx)
-                                .unwrap_or((
-                                    "Tool execution failed".to_string(),
-                                    true,
-                                    std::time::Duration::ZERO,
-                                ))
+                            results.remove(&idx).unwrap_or((
+                                "Tool execution failed".to_string(),
+                                true,
+                                std::time::Duration::ZERO,
+                            ))
                         };
 
                         // Sanitise raw tool output before it enters model
@@ -3454,10 +3390,7 @@ impl AgentHarness {
                         // what actually enters context, NOT the original
                         // (possibly truncated) tool payload.
                         if skip.is_none() {
-                            budget_usage.record(
-                                elapsed.as_secs(),
-                                result_content.len() as u64,
-                            );
+                            budget_usage.record(elapsed.as_secs(), result_content.len() as u64);
                         }
 
                         // Permission skips (denied / timed-out / channel-closed /
@@ -3536,11 +3469,8 @@ impl AgentHarness {
                                     // (e.g. a 1 MB stack trace echoed
                                     // back into context) can't blow
                                     // the budget.
-                                    let trimmed: String =
-                                        r.lesson.chars().take(512).collect();
-                                    folded_content.push_str(
-                                        "\n\n[Reflexion lesson: ",
-                                    );
+                                    let trimmed: String = r.lesson.chars().take(512).collect();
+                                    folded_content.push_str("\n\n[Reflexion lesson: ");
                                     folded_content.push_str(&trimmed);
                                     folded_content.push(']');
                                     if let Some(ref em) = self.emitter {
@@ -3588,11 +3518,8 @@ impl AgentHarness {
                     // semantics: emit TurnComplete (already implicit via the
                     // earlier emission path was skipped), bubble up.
                     if let Some(ref em) = self.emitter {
-                        em.emit_turn_complete(
-                            StopReason::Error,
-                            TokenUsage::default(),
-                        )
-                        .await;
+                        em.emit_turn_complete(StopReason::Error, TokenUsage::default())
+                            .await;
                     }
                     return Err(CaduceusError::Provider(
                         "Provider reported StopReason::Error in successful response".into(),
@@ -3604,11 +3531,8 @@ impl AgentHarness {
                     // here means a provider mis-mapped its stop signal.
                     // Treat as a provider contract violation.
                     if let Some(ref em) = self.emitter {
-                        em.emit_turn_complete(
-                            StopReason::Error,
-                            TokenUsage::default(),
-                        )
-                        .await;
+                        em.emit_turn_complete(StopReason::Error, TokenUsage::default())
+                            .await;
                     }
                     return Err(CaduceusError::Provider(
                         "Provider returned StopReason::BudgetExceeded; this variant is reserved for orchestrator-side TurnBudget enforcement".into(),
@@ -4371,7 +4295,11 @@ mod tests {
 
     // ── P0-9: tool_use ↔ tool_result must stay co-located ───────────────────
 
-    fn assistant_with_tool_call(text: &str, tool_id: &str, tool_name: &str) -> caduceus_providers::Message {
+    fn assistant_with_tool_call(
+        text: &str,
+        tool_id: &str,
+        tool_name: &str,
+    ) -> caduceus_providers::Message {
         let mut m = caduceus_providers::Message::assistant(text);
         m.tool_calls.push(caduceus_core::ToolUse {
             id: tool_id.into(),
@@ -4475,10 +4403,7 @@ mod tests {
                     .unwrap_or("");
                 let prev_assistant_has_id = i > 0
                     && msgs[i - 1].role == "assistant"
-                    && msgs[i - 1]
-                        .tool_calls
-                        .iter()
-                        .any(|tc| tc.id == tool_id);
+                    && msgs[i - 1].tool_calls.iter().any(|tc| tc.id == tool_id);
                 assert!(
                     prev_assistant_has_id,
                     "orphan tool_result at index {i} (id={tool_id}) — pair was split"
@@ -4487,9 +4412,8 @@ mod tests {
         }
         // Final assistant must always survive truncation.
         assert!(
-            msgs.iter().any(|m| m.role == "assistant"
-                && m.tool_calls.is_empty()
-                && m.content == "final"),
+            msgs.iter()
+                .any(|m| m.role == "assistant" && m.tool_calls.is_empty() && m.content == "final"),
             "final assistant message was dropped"
         );
     }
@@ -5123,13 +5047,9 @@ mod tests {
             make_chat_response("first response"),
             make_chat_response("second response"),
         ]));
-        let harness = AgentHarness::new(
-            adapter,
-            caduceus_tools::ToolRegistry::new(),
-            4096,
-            "system",
-        )
-        .with_cancellation_token(token.clone());
+        let harness =
+            AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+                .with_cancellation_token(token.clone());
 
         // First run cancels mid-flight (simulate by cancelling before start).
         token.cancel();
@@ -5319,7 +5239,7 @@ mod tests {
                 name: "read_file".into(),
                 input: serde_json::json!({"path": "test.txt"}),
             }],
-                logprobs: None,
+            logprobs: None,
         };
         let final_response = make_chat_response("Done reading the file.");
 
@@ -5359,7 +5279,7 @@ mod tests {
                     name: "nonexistent_tool".into(),
                     input: serde_json::json!({}),
                 }],
-                    logprobs: None,
+                logprobs: None,
             });
         }
         let adapter = Arc::new(MockLlmAdapter::new(responses));
@@ -5389,8 +5309,8 @@ mod tests {
             cache_creation_tokens: 0,
             stop_reason: StopReason::ToolUse,
             tool_calls: vec![], // empty!,
-                logprobs: None,
-            };
+            logprobs: None,
+        };
         let adapter = Arc::new(MockLlmAdapter::new(vec![response]));
         let registry = caduceus_tools::ToolRegistry::new();
 
@@ -5438,7 +5358,7 @@ mod tests {
                 name: "read_file".into(),
                 input: serde_json::json!({"path": "nonexistent_file_xyz.txt"}),
             }],
-                logprobs: None,
+            logprobs: None,
         };
         let final_response = make_chat_response("File not found.");
 
@@ -5531,7 +5451,7 @@ mod tests {
                 name: "read_file".into(),
                 input: serde_json::json!({"path": "hello.txt"}),
             }],
-                logprobs: None,
+            logprobs: None,
         };
         let final_response = ChatResponse {
             content: "The file contains: world".to_string(),
@@ -5541,7 +5461,7 @@ mod tests {
             cache_creation_tokens: 0,
             stop_reason: StopReason::EndTurn,
             tool_calls: vec![],
-                logprobs: None,
+            logprobs: None,
         };
 
         let adapter = Arc::new(MockLlmAdapter::new(vec![tool_response, final_response]));
@@ -5693,7 +5613,7 @@ mod tests {
                 name: "read_file".into(),
                 input: serde_json::json!({"path": "hello.txt"}),
             }],
-                logprobs: None,
+            logprobs: None,
         };
         let final_response = make_chat_response("Here is the file content.");
 
@@ -5735,7 +5655,7 @@ mod tests {
                     name: "nonexistent_tool".into(),
                     input: serde_json::json!({}),
                 }],
-                    logprobs: None,
+                logprobs: None,
             })
             .collect();
 
@@ -5775,7 +5695,7 @@ mod tests {
                 name: "read_file".into(),
                 input: serde_json::json!({"path": "test.txt"}),
             }],
-                logprobs: None,
+            logprobs: None,
         };
         let final_response = make_chat_response("Done!");
 
@@ -5927,7 +5847,7 @@ mod tests {
                 name: "write_file".into(),
                 input: serde_json::json!({"path": "out.txt", "content": "data"}),
             }],
-                logprobs: None,
+            logprobs: None,
         };
         let final_response = make_chat_response("Acknowledged.");
         let adapter = Arc::new(MockLlmAdapter::new(vec![tool_response, final_response]));
@@ -6093,9 +6013,7 @@ mod tests {
     async fn approval_drained_stale_messages_are_emitted_as_events() {
         let (_adapter, harness, tx, _dir) = approval_test_setup();
         let (emitter, mut rx) = AgentEventEmitter::channel(64);
-        let harness = harness
-            .with_approval_timeout_secs(5)
-            .with_emitter(emitter);
+        let harness = harness.with_approval_timeout_secs(5).with_emitter(emitter);
 
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -6114,7 +6032,11 @@ mod tests {
         // Drain the event channel and collect every DrainedStaleApproval.
         let mut drained = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            if let AgentEvent::DrainedStaleApproval { expected, drained: d } = ev {
+            if let AgentEvent::DrainedStaleApproval {
+                expected,
+                drained: d,
+            } = ev
+            {
                 drained.push((expected, d));
             }
         }
@@ -6135,9 +6057,7 @@ mod tests {
     async fn approval_no_stale_drain_event_on_clean_match() {
         let (_adapter, harness, tx, _dir) = approval_test_setup();
         let (emitter, mut rx) = AgentEventEmitter::channel(64);
-        let harness = harness
-            .with_approval_timeout_secs(5)
-            .with_emitter(emitter);
+        let harness = harness.with_approval_timeout_secs(5).with_emitter(emitter);
 
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -6395,7 +6315,7 @@ mod tests {
                     name: "write_file".into(),
                     input: serde_json::json!({"path": "x", "content": "y"}),
                 }],
-                    logprobs: None,
+                logprobs: None,
             });
         }
         responses.push(make_chat_response("All denied — done."));
@@ -6453,7 +6373,7 @@ mod tests {
                 name: "read_file".into(),
                 input: serde_json::json!({"path": "malicious.txt"}),
             }],
-                logprobs: None,
+            logprobs: None,
         };
         let final_resp = make_chat_response("Refused; output flagged.");
         let adapter = Arc::new(MockLlmAdapter::new(vec![tool_resp, final_resp]));
@@ -6511,7 +6431,7 @@ mod tests {
                 name: "read_file".into(),
                 input: serde_json::json!({"path": "big.txt"}),
             }],
-                logprobs: None,
+            logprobs: None,
         };
         let final_resp = make_chat_response("done");
         let adapter = Arc::new(MockLlmAdapter::new(vec![tool_resp, final_resp]));
@@ -6541,7 +6461,9 @@ mod tests {
             tool_msg.content.len()
         );
         assert!(
-            tool_msg.content.contains("output truncated by ToolOutputSanitizer"),
+            tool_msg
+                .content
+                .contains("output truncated by ToolOutputSanitizer"),
             "expected truncation sentinel"
         );
     }
@@ -6565,7 +6487,7 @@ mod tests {
                     name: "read_file".into(),
                     input: serde_json::json!({"path": "x.txt"}),
                 }],
-                    logprobs: None,
+                logprobs: None,
             });
         }
         // Append a never-reached final response to prove we DON'T fall
@@ -6578,11 +6500,12 @@ mod tests {
         let mut registry = caduceus_tools::ToolRegistry::new();
         registry.register(Arc::new(caduceus_tools::ReadFileTool::new(dir.path())));
 
-        let harness = AgentHarness::new(adapter, registry, 200_000, "test")
-            .with_turn_budget(caduceus_core::TurnBudget {
+        let harness = AgentHarness::new(adapter, registry, 200_000, "test").with_turn_budget(
+            caduceus_core::TurnBudget {
                 max_tool_calls: 3,
                 ..caduceus_core::TurnBudget::unlimited()
-            });
+            },
+        );
 
         let mut state = make_session();
         let mut history = ConversationHistory::new();
@@ -6595,7 +6518,10 @@ mod tests {
             result.contains("Turn budget exceeded"),
             "expected budget message, got: {result}"
         );
-        assert!(result.contains("max_tool_calls"), "message must name the limit");
+        assert!(
+            result.contains("max_tool_calls"),
+            "message must name the limit"
+        );
         assert_ne!(result, "never reached", "should not have fallen through");
     }
 
@@ -6621,7 +6547,7 @@ mod tests {
                     name: "read_file".into(),
                     input: serde_json::json!({"path": "payload.txt"}),
                 }],
-                    logprobs: None,
+                logprobs: None,
             });
         }
         responses.push(make_chat_response("never reached"));
@@ -6630,11 +6556,12 @@ mod tests {
         let mut registry = caduceus_tools::ToolRegistry::new();
         registry.register(Arc::new(caduceus_tools::ReadFileTool::new(dir.path())));
 
-        let harness = AgentHarness::new(adapter, registry, 200_000, "test")
-            .with_turn_budget(caduceus_core::TurnBudget {
+        let harness = AgentHarness::new(adapter, registry, 200_000, "test").with_turn_budget(
+            caduceus_core::TurnBudget {
                 max_total_bytes_read: 1500,
                 ..caduceus_core::TurnBudget::unlimited()
-            });
+            },
+        );
 
         let mut state = make_session();
         let mut history = ConversationHistory::new();
@@ -6668,7 +6595,7 @@ mod tests {
                     name: "write_file".into(),
                     input: serde_json::json!({"path": "x", "content": "y"}),
                 }],
-                    logprobs: None,
+                logprobs: None,
             });
         }
         responses.push(make_chat_response("All denied — done."));
@@ -6720,10 +6647,7 @@ mod tests {
         let snap = em.replay();
         assert_eq!(snap.len(), 3);
         match (&snap[0], &snap[2]) {
-            (
-                AgentEvent::Error { message: m1 },
-                AgentEvent::Error { message: m3 },
-            ) => {
+            (AgentEvent::Error { message: m1 }, AgentEvent::Error { message: m3 }) => {
                 assert_eq!(m1, "first");
                 assert_eq!(m3, "third");
             }
@@ -6806,7 +6730,11 @@ mod tests {
         em.emit_error("a").await;
         em.emit_error("b").await;
         let snap = handle.replay();
-        assert_eq!(snap.len(), 2, "clone must observe events emitted by original");
+        assert_eq!(
+            snap.len(),
+            2,
+            "clone must observe events emitted by original"
+        );
     }
 
     #[tokio::test]
@@ -6819,7 +6747,9 @@ mod tests {
         let harness =
             AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
                 .with_emitter(em);
-        let handle = harness.emitter().expect("emitter must be exposed via accessor");
+        let handle = harness
+            .emitter()
+            .expect("emitter must be exposed via accessor");
         let mut state = make_session();
         let mut history = ConversationHistory::new();
         let _ = harness.run(&mut state, &mut history, "hi").await.unwrap();
@@ -6923,13 +6853,15 @@ mod tests {
         em.emit_error("b").await; // dropped
         let _ = rx.try_recv(); // make room
         em.emit_error("c").await; // triggers overflow notice
-        // Drain channel so recovery emit can complete its inner try_send.
+                                  // Drain channel so recovery emit can complete its inner try_send.
         while rx.try_recv().is_ok() {}
         let snap = em.replay();
-        let saw_overflow = snap.iter().any(|e| matches!(
-            e,
-            AgentEvent::EventBufferOverflow { dropped_since_last } if *dropped_since_last >= 1
-        ));
+        let saw_overflow = snap.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::EventBufferOverflow { dropped_since_last } if *dropped_since_last >= 1
+            )
+        });
         assert!(
             saw_overflow,
             "retention ring must contain EventBufferOverflow marker after recovery; got {snap:?}"
@@ -6967,10 +6899,7 @@ mod tests {
                 .with_verification_strategy(caduceus_core::VerificationStrategy::Off);
         let mut state = make_session();
         let mut history = ConversationHistory::new();
-        let result = harness
-            .run(&mut state, &mut history, "hi")
-            .await
-            .unwrap();
+        let result = harness.run(&mut state, &mut history, "hi").await.unwrap();
         assert_eq!(result, "loop answer");
     }
 
@@ -7055,13 +6984,14 @@ mod tests {
             make_chat_response("bad"),
             make_chat_response("good"),
         ]));
-        let verifier: Arc<dyn caduceus_core::StepVerifier> =
-            Arc::new(PinVerifier { prefer: "good".into() });
+        let verifier: Arc<dyn caduceus_core::StepVerifier> = Arc::new(PinVerifier {
+            prefer: "good".into(),
+        });
         let harness =
             AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-                .with_verification_strategy(
-                    caduceus_core::VerificationStrategy::PrmWeightedVote { samples: 3 },
-                )
+                .with_verification_strategy(caduceus_core::VerificationStrategy::PrmWeightedVote {
+                    samples: 3,
+                })
                 .with_step_verifier(verifier);
         let mut state = make_session();
         let mut history = ConversationHistory::new();
@@ -7084,9 +7014,9 @@ mod tests {
         ]));
         let harness =
             AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-                .with_verification_strategy(
-                    caduceus_core::VerificationStrategy::PrmWeightedVote { samples: 2 },
-                );
+                .with_verification_strategy(caduceus_core::VerificationStrategy::PrmWeightedVote {
+                    samples: 2,
+                });
         let mut state = make_session();
         let mut history = ConversationHistory::new();
         let result = harness.run(&mut state, &mut history, "x").await.unwrap();
@@ -7106,10 +7036,7 @@ mod tests {
                 });
         let mut state = make_session();
         let mut history = ConversationHistory::new();
-        let result = harness
-            .run(&mut state, &mut history, "hi")
-            .await
-            .unwrap();
+        let result = harness.run(&mut state, &mut history, "hi").await.unwrap();
         assert_eq!(result, "only");
     }
 
@@ -7224,7 +7151,10 @@ mod tests {
                 }
             }
         }
-        assert!(saw_label, "expected VerificationStarted with cisc_weighted_vote label");
+        assert!(
+            saw_label,
+            "expected VerificationStarted with cisc_weighted_vote label"
+        );
     }
 
     #[tokio::test]
@@ -7252,10 +7182,7 @@ mod tests {
                 .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated {
                     samples: 1,
                 })
-                .with_test_gate_config(TestGateConfig::new(
-                    vec!["true".to_string()],
-                    dir.path(),
-                ));
+                .with_test_gate_config(TestGateConfig::new(vec!["true".to_string()], dir.path()));
         let mut state = make_session();
         let mut history = ConversationHistory::new();
         let result = harness.run(&mut state, &mut history, "hi").await.unwrap();
@@ -7273,10 +7200,7 @@ mod tests {
                 .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated {
                     samples: 1,
                 })
-                .with_test_gate_config(TestGateConfig::new(
-                    vec!["false".to_string()],
-                    dir.path(),
-                ));
+                .with_test_gate_config(TestGateConfig::new(vec!["false".to_string()], dir.path()));
         let mut state = make_session();
         let mut history = ConversationHistory::new();
         let result = harness.run(&mut state, &mut history, "hi").await.unwrap();
@@ -7315,11 +7239,8 @@ mod tests {
                     samples: 1,
                 })
                 .with_test_gate_config(
-                    TestGateConfig::new(
-                        vec!["sleep".to_string(), "60".to_string()],
-                        dir.path(),
-                    )
-                    .with_timeout(std::time::Duration::from_millis(200)),
+                    TestGateConfig::new(vec!["sleep".to_string(), "60".to_string()], dir.path())
+                        .with_timeout(std::time::Duration::from_millis(200)),
                 );
         let mut state = make_session();
         let mut history = ConversationHistory::new();
@@ -7399,17 +7320,15 @@ mod tests {
     async fn test_gate_emits_started_and_completed_events_on_pass() {
         let dir = tempfile::tempdir().unwrap();
         let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("done")]));
-        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64); let emitter = AgentEventEmitter::without_retention(tx);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let emitter = AgentEventEmitter::without_retention(tx);
         let harness =
             AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
                 .with_emitter(emitter)
                 .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated {
                     samples: 1,
                 })
-                .with_test_gate_config(TestGateConfig::new(
-                    vec!["true".to_string()],
-                    dir.path(),
-                ));
+                .with_test_gate_config(TestGateConfig::new(vec!["true".to_string()], dir.path()));
         let mut state = make_session();
         let mut history = ConversationHistory::new();
         let _ = harness.run(&mut state, &mut history, "hi").await.unwrap();
@@ -7425,20 +7344,25 @@ mod tests {
         });
         let completed = events.iter().find_map(|e| match e {
             AgentEvent::TestGateCompleted {
-                outcome,
-                exit_code,
-                ..
+                outcome, exit_code, ..
             } => Some((outcome.clone(), *exit_code)),
             _ => None,
         });
-        let verif_started = events.iter().any(|e| matches!(
-            e,
-            AgentEvent::VerificationStarted { strategy, .. } if strategy == "test_gated"
-        ));
-        let verif_done = events.iter().any(|e| matches!(
-            e,
-            AgentEvent::VerificationCompleted { cancelled: false, .. }
-        ));
+        let verif_started = events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::VerificationStarted { strategy, .. } if strategy == "test_gated"
+            )
+        });
+        let verif_done = events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::VerificationCompleted {
+                    cancelled: false,
+                    ..
+                }
+            )
+        });
         assert!(verif_started, "VerificationStarted missing");
         assert!(verif_done, "VerificationCompleted missing");
         let (cmd, _) = started.expect("TestGateStarted missing");
@@ -7452,7 +7376,8 @@ mod tests {
     async fn test_gate_cancellation_short_circuits_before_spawn() {
         let dir = tempfile::tempdir().unwrap();
         let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("done")]));
-        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64); let emitter = AgentEventEmitter::without_retention(tx);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let emitter = AgentEventEmitter::without_retention(tx);
         let token = caduceus_core::CancellationToken::new();
         // Pre-cancel the token. Verification's TestGated branch should
         // still call run_test_gate, which then short-circuits to
@@ -7466,11 +7391,8 @@ mod tests {
                     samples: 1,
                 })
                 .with_test_gate_config(
-                    TestGateConfig::new(
-                        vec!["sleep".to_string(), "60".to_string()],
-                        dir.path(),
-                    )
-                    .with_timeout(Duration::from_secs(120)),
+                    TestGateConfig::new(vec!["sleep".to_string(), "60".to_string()], dir.path())
+                        .with_timeout(Duration::from_secs(120)),
                 )
                 .with_cancellation_token(token);
         let mut state = make_session();
@@ -7529,13 +7451,13 @@ mod tests {
                 name: "sleep".to_string(),
                 input: serde_json::json!({"duration_ms": 1}),
             }],
-                logprobs: None,
+            logprobs: None,
         };
         let final_resp = make_chat_response("ok");
         let adapter = Arc::new(MockLlmAdapter::new(vec![tool_use_resp, final_resp]));
-        let (tx, mut rx) = mpsc::channel::<AgentEvent>(128); let emitter = AgentEventEmitter::without_retention(tx);
-        let harness = AgentHarness::new(adapter, registry, 4096, "system")
-            .with_emitter(emitter);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(128);
+        let emitter = AgentEventEmitter::without_retention(tx);
+        let harness = AgentHarness::new(adapter, registry, 4096, "system").with_emitter(emitter);
         let mut state = make_session();
         let mut history = ConversationHistory::new();
         let _ = harness.run(&mut state, &mut history, "go").await.unwrap();
@@ -7560,8 +7482,7 @@ mod tests {
         let (count, parallel) = started.expect("ParallelToolBatchStarted missing");
         assert_eq!(count, 1);
         assert!(!parallel, "single tool not parallelisable");
-        let (count, ok, err) =
-            completed.expect("ParallelToolBatchCompleted missing");
+        let (count, ok, err) = completed.expect("ParallelToolBatchCompleted missing");
         assert_eq!(count, 1);
         assert_eq!(ok + err, 1);
     }
@@ -9510,12 +9431,7 @@ mod feature_tests_259_261 {
 
     fn make_test_harness() -> AgentHarness {
         let provider = caduceus_providers::mock::MockLlmAdapter::new(vec![]);
-        AgentHarness::new(
-            Arc::new(provider),
-            ToolRegistry::new(),
-            8000,
-            "test",
-        )
+        AgentHarness::new(Arc::new(provider), ToolRegistry::new(), 8000, "test")
     }
 
     fn make_test_state(model: &str) -> caduceus_core::SessionState {
@@ -9550,8 +9466,12 @@ mod feature_tests_259_261 {
         let id = {
             let mut g = store.lock().unwrap();
             let id = g.begin_batch(1, "edit_file", 1000);
-            g.record_edit(id, std::path::PathBuf::from("/tmp/p9_4.txt"), Some("orig".into()))
-                .unwrap();
+            g.record_edit(
+                id,
+                std::path::PathBuf::from("/tmp/p9_4.txt"),
+                Some("orig".into()),
+            )
+            .unwrap();
             g.commit(id).unwrap();
             id
         };
@@ -9569,7 +9489,10 @@ mod feature_tests_259_261 {
         // Event must be emitted with ok=true and matching id.
         let mut found = false;
         while let Ok(ev) = rx.try_recv() {
-            if let AgentEvent::CheckpointReverted { id: rid, ok, files, .. } = ev {
+            if let AgentEvent::CheckpointReverted {
+                id: rid, ok, files, ..
+            } = ev
+            {
                 if rid == id.raw() && ok && files == 1 {
                     found = true;
                     break;
@@ -9602,7 +9525,10 @@ mod feature_tests_259_261 {
                 }
             }
         }
-        assert!(found, "CheckpointReverted(ok=false) not emitted for missing store");
+        assert!(
+            found,
+            "CheckpointReverted(ok=false) not emitted for missing store"
+        );
     }
 
     #[tokio::test]
@@ -9686,7 +9612,11 @@ mod feature_tests_259_261 {
         let out = h.fold_tool_result("shell", small.clone());
         assert_eq!(out, small);
         // Store should be empty.
-        assert!(store.lock().unwrap().expand(crate::context_fold::TranscriptId(1)).is_err());
+        assert!(store
+            .lock()
+            .unwrap()
+            .expand(crate::context_fold::TranscriptId(1))
+            .is_err());
     }
 
     #[test]
@@ -9701,8 +9631,7 @@ mod feature_tests_259_261 {
 
         assert_ne!(out, big, "above threshold should be folded");
         // The folded output is JSON containing the subagent name.
-        let parsed: serde_json::Value =
-            serde_json::from_str(&out).expect("folded output is JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("folded output is JSON");
         assert_eq!(parsed["subagent"], "subagent_security");
         assert!(parsed["id"].is_number() || parsed["id"].is_object());
         assert_eq!(parsed["original_chars"], big.len() as u64);
@@ -9799,7 +9728,7 @@ mod feature_tests_259_261 {
             tool_result: Some(
                 caduceus_core::ToolResult::success("OK").with_tool_use_id("call_abc"),
             ),
-                    cache_breakpoint: false,
+            cache_breakpoint: false,
         };
 
         h.sync_memory_blocks("p", "c", &[assistant, tool_msg])
@@ -10050,7 +9979,10 @@ mod feature_tests_259_261 {
             .iter()
             .filter_map(|m| m.tool_result.as_ref())
             .any(|tr| tr.is_error && tr.content.contains("timed out"));
-        assert!(timed_out, "expected a timeout-marked tool_result in history");
+        assert!(
+            timed_out,
+            "expected a timeout-marked tool_result in history"
+        );
     }
 
     #[tokio::test]
@@ -10123,7 +10055,10 @@ mod feature_tests_259_261 {
         assert_eq!(events.len(), 1);
         let (tool, budget_secs, _elapsed) = &events[0];
         assert_eq!(tool, "slow_d");
-        assert_eq!(*budget_secs, 1, "budget should reflect the per-tool override");
+        assert_eq!(
+            *budget_secs, 1,
+            "budget should reflect the per-tool override"
+        );
     }
 
     #[tokio::test]
@@ -10297,8 +10232,8 @@ mod feature_tests_259_261 {
         }));
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
         let emitter = AgentEventEmitter::new(event_tx);
-        let harness = AgentHarness::new(adapter, registry, 4096, "system")
-            .with_emitter(emitter.clone());
+        let harness =
+            AgentHarness::new(adapter, registry, 4096, "system").with_emitter(emitter.clone());
 
         let mut state = p11_2_session();
         let mut history = ConversationHistory::new();
@@ -10364,10 +10299,7 @@ mod feature_tests_259_261 {
         let cache = caduceus_tools::SpeculativeCache::new(std::time::Duration::from_secs(5));
         let key = caduceus_tools::SpecKey::new("slow_cache", &serde_json::json!({}));
         cache.reserve(&key);
-        cache.complete(
-            &key,
-            Ok(caduceus_core::ToolResult::success("from-cache")),
-        );
+        cache.complete(&key, Ok(caduceus_core::ToolResult::success("from-cache")));
         let harness = AgentHarness::new(adapter, registry, 4096, "system")
             .with_speculative_cache(cache.clone());
 
@@ -10404,8 +10336,8 @@ mod feature_tests_259_261 {
             delay: std::time::Duration::from_millis(20),
         }));
         let cache = caduceus_tools::SpeculativeCache::new(std::time::Duration::from_secs(5));
-        let harness = AgentHarness::new(adapter, registry, 4096, "system")
-            .with_speculative_cache(cache);
+        let harness =
+            AgentHarness::new(adapter, registry, 4096, "system").with_speculative_cache(cache);
 
         let mut state = p11_2_session();
         let mut history = ConversationHistory::new();
@@ -10424,10 +10356,7 @@ mod feature_tests_259_261 {
         let cache = caduceus_tools::SpeculativeCache::new(std::time::Duration::from_secs(5));
         let key = caduceus_tools::SpecKey::new("slow_once", &serde_json::json!({}));
         cache.reserve(&key);
-        cache.complete(
-            &key,
-            Ok(caduceus_core::ToolResult::success("from-cache")),
-        );
+        cache.complete(&key, Ok(caduceus_core::ToolResult::success("from-cache")));
         // First take consumes; second take is a miss.
         assert!(cache.take(&key).is_some());
         assert!(cache.take(&key).is_none());
@@ -10442,8 +10371,7 @@ mod feature_tests_259_261 {
         let mem = Arc::new(std::sync::Mutex::new(
             crate::reflexion::ReflexionMemory::new(8),
         ));
-        let h = AgentHarness::new(adapter, registry, 4096, "system")
-            .with_reflexion(mem.clone());
+        let h = AgentHarness::new(adapter, registry, 4096, "system").with_reflexion(mem.clone());
         assert!(h.reflexion().is_some());
     }
 
@@ -10462,8 +10390,7 @@ mod feature_tests_259_261 {
         let mem = Arc::new(std::sync::Mutex::new(
             crate::reflexion::ReflexionMemory::new(8),
         ));
-        let h = AgentHarness::new(adapter, registry, 4096, "system")
-            .with_reflexion(mem.clone());
+        let h = AgentHarness::new(adapter, registry, 4096, "system").with_reflexion(mem.clone());
         let r = crate::reflexion::HeuristicReflector;
         let outcome = crate::reflexion::AttemptOutcome::Failure {
             error: "timeout calling solve()".into(),
@@ -10497,8 +10424,8 @@ mod feature_tests_259_261 {
     #[tokio::test]
     async fn p13_2_failed_tool_inlines_reflexion_lesson() {
         use caduceus_core::{StopReason, ToolUse};
-        use caduceus_providers::ChatResponse;
         use caduceus_providers::mock::MockLlmAdapter;
+        use caduceus_providers::ChatResponse;
         use caduceus_tools::ReadFileTool;
 
         fn final_resp(text: &str) -> ChatResponse {
@@ -10545,8 +10472,8 @@ mod feature_tests_259_261 {
         let mem = Arc::new(std::sync::Mutex::new(
             crate::reflexion::ReflexionMemory::new(8),
         ));
-        let harness = AgentHarness::new(adapter, registry, 200_000, "test")
-            .with_reflexion(mem.clone());
+        let harness =
+            AgentHarness::new(adapter, registry, 200_000, "test").with_reflexion(mem.clone());
 
         let mut state = session();
         let mut history = ConversationHistory::new();
@@ -10573,8 +10500,8 @@ mod feature_tests_259_261 {
     #[tokio::test]
     async fn p13_2_no_reflexion_when_no_memory_attached() {
         use caduceus_core::{StopReason, ToolUse};
-        use caduceus_providers::ChatResponse;
         use caduceus_providers::mock::MockLlmAdapter;
+        use caduceus_providers::ChatResponse;
         use caduceus_tools::ReadFileTool;
 
         fn final_resp(text: &str) -> ChatResponse {
@@ -10611,8 +10538,7 @@ mod feature_tests_259_261 {
             }],
             logprobs: None,
         };
-        let adapter =
-            Arc::new(MockLlmAdapter::new(vec![tool_call, final_resp("done")]));
+        let adapter = Arc::new(MockLlmAdapter::new(vec![tool_call, final_resp("done")]));
         let dir = tempfile::tempdir().unwrap();
         let mut registry = caduceus_tools::ToolRegistry::new();
         registry.register(Arc::new(ReadFileTool::new(dir.path())));
@@ -10706,7 +10632,10 @@ mod feature_tests_259_261 {
         let h = AgentHarness::new(adapter, registry, 4096, "system");
         assert!(h.tot_config().is_none());
         let result = h.plan_with_tot("r".to_string(), TotPathExpander, TotSuffixScorer);
-        assert!(result.best.is_some(), "default config must still produce a plan");
+        assert!(
+            result.best.is_some(),
+            "default config must still produce a plan"
+        );
     }
 
     // ── P13.6 — per‑turn critic loop ─────────────────────────────────
@@ -10714,8 +10643,8 @@ mod feature_tests_259_261 {
     #[tokio::test]
     async fn p13_6_critic_reject_triggers_revision_turn() {
         use caduceus_core::StopReason;
-        use caduceus_providers::ChatResponse;
         use caduceus_providers::mock::MockLlmAdapter;
+        use caduceus_providers::ChatResponse;
 
         fn final_resp(text: &str) -> ChatResponse {
             ChatResponse {
@@ -10781,8 +10710,8 @@ mod feature_tests_259_261 {
     #[tokio::test]
     async fn p13_6_no_critic_no_extra_turn() {
         use caduceus_core::StopReason;
-        use caduceus_providers::ChatResponse;
         use caduceus_providers::mock::MockLlmAdapter;
+        use caduceus_providers::ChatResponse;
 
         fn final_resp(text: &str) -> ChatResponse {
             ChatResponse {
@@ -10826,8 +10755,8 @@ mod feature_tests_259_261 {
     #[tokio::test]
     async fn p13_6_max_iters_bounds_revision_loops() {
         use caduceus_core::StopReason;
-        use caduceus_providers::ChatResponse;
         use caduceus_providers::mock::MockLlmAdapter;
+        use caduceus_providers::ChatResponse;
 
         fn final_resp(text: &str) -> ChatResponse {
             ChatResponse {

@@ -124,10 +124,7 @@ impl From<&caduceus_providers::Message> for CompactMessage {
             out.tool_call_ids = msg.tool_calls.iter().map(|tc| tc.id.clone()).collect();
         }
         if msg.role == "tool" {
-            out.tool_use_id = msg
-                .tool_result
-                .as_ref()
-                .and_then(|r| r.tool_use_id.clone());
+            out.tool_use_id = msg.tool_result.as_ref().and_then(|r| r.tool_use_id.clone());
         }
         out
     }
@@ -416,9 +413,7 @@ impl CompactionPipeline {
     /// one `CompactionEvent` per fired strategy.
     pub fn with_telemetry(
         mut self,
-        telem: std::sync::Arc<
-            std::sync::Mutex<crate::compaction_telemetry::CompactionTelemetry>,
-        >,
+        telem: std::sync::Arc<std::sync::Mutex<crate::compaction_telemetry::CompactionTelemetry>>,
     ) -> Self {
         self.telemetry = Some(telem);
         self
@@ -458,8 +453,7 @@ impl CompactionPipeline {
         // (Vec<&str>) back to indices into `self.strategies` to avoid
         // cloning the boxed strategies.
         let order: Vec<usize> = if let Some(sel) = &self.learned_selector {
-            let names: Vec<&str> =
-                self.strategies.iter().map(|s| s.name()).collect();
+            let names: Vec<&str> = self.strategies.iter().map(|s| s.name()).collect();
             let ranked = sel.rank(&names);
             ranked
                 .iter()
@@ -485,10 +479,8 @@ impl CompactionPipeline {
                 evicted.extend(result.evicted);
 
                 if let Some(t) = &self.telemetry {
-                    let messages_after =
-                        groups.iter().map(|g| g.messages.len()).sum::<usize>();
-                    let tokens_after =
-                        groups.iter().map(|g| g.total_tokens()).sum::<usize>();
+                    let messages_after = groups.iter().map(|g| g.messages.len()).sum::<usize>();
+                    let tokens_after = groups.iter().map(|g| g.total_tokens()).sum::<usize>();
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
@@ -498,8 +490,7 @@ impl CompactionPipeline {
                             strategy: strategy.name().to_string(),
                             tokens_before: tokens_before.min(u32::MAX as usize) as u32,
                             tokens_after: tokens_after.min(u32::MAX as usize) as u32,
-                            messages_before: messages_before
-                                .min(u32::MAX as usize) as u32,
+                            messages_before: messages_before.min(u32::MAX as usize) as u32,
                             messages_after: messages_after.min(u32::MAX as usize) as u32,
                             turn_index: self.turn_index,
                             at_secs: now,
@@ -610,7 +601,7 @@ impl CompactionStrategy for SummarizeStrategy {
             return CompactionResult {
                 removed_tokens: 0,
                 groups_affected: 0,
-            evicted: Vec::new(),
+                evicted: Vec::new(),
             };
         }
 
@@ -667,7 +658,7 @@ impl CompactionStrategy for SummarizeStrategy {
         CompactionResult {
             removed_tokens: net_removed,
             groups_affected,
-        evicted: Vec::new(),
+            evicted: Vec::new(),
         }
     }
 }
@@ -695,7 +686,7 @@ impl CompactionStrategy for SlidingWindowStrategy {
             return CompactionResult {
                 removed_tokens: 0,
                 groups_affected: 0,
-            evicted: Vec::new(),
+                evicted: Vec::new(),
             };
         }
 
@@ -1039,7 +1030,7 @@ impl CompactionStrategy for PatternCompactor {
         CompactionResult {
             removed_tokens,
             groups_affected,
-        evicted: Vec::new(),
+            evicted: Vec::new(),
         }
     }
 }
@@ -1179,7 +1170,10 @@ mod tests {
         let mut p = CompactionPipeline::new(0); // budget 0 forces all strategies
         p.add_strategy(Box::new(SlidingWindowStrategy { window_size: 2 }));
         let result = p.run(&mut groups);
-        assert!(!result.evicted.is_empty(), "pipeline must surface evictions");
+        assert!(
+            !result.evicted.is_empty(),
+            "pipeline must surface evictions"
+        );
     }
 
     #[test]
@@ -1200,7 +1194,11 @@ mod tests {
         assert!(json.contains("oldest-non-system"));
         let back: AgentEvent = serde_json::from_str(&json).expect("deserialise");
         match back {
-            AgentEvent::ContextGroupsEvicted { strategy, groups, total_tokens } => {
+            AgentEvent::ContextGroupsEvicted {
+                strategy,
+                groups,
+                total_tokens,
+            } => {
                 assert_eq!(strategy, "truncate-oldest");
                 assert_eq!(total_tokens, 42);
                 assert_eq!(groups.len(), 1);
@@ -1682,7 +1680,7 @@ mod tests {
                 CompactionResult {
                     removed_tokens: 0,
                     groups_affected: 0,
-                evicted: Vec::new(),
+                    evicted: Vec::new(),
                 }
             }
         }
@@ -1954,7 +1952,10 @@ mod tests {
         // An assistant whose content also contains a tool_use marker but with
         // an explicitly empty tool_call_ids set is still classified by content
         // (since structured fields are absent). Constructed via `new`, no ids.
-        let messages = vec![CompactMessage::new("assistant", "<tool_call>foo</tool_call>")];
+        let messages = vec![CompactMessage::new(
+            "assistant",
+            "<tool_call>foo</tool_call>",
+        )];
         let groups = build_message_groups(&messages);
         assert_eq!(groups[0].kind, MessageGroupKind::ToolCall);
     }
@@ -2168,7 +2169,9 @@ mod tests {
         ];
         let mut groups = build_message_groups(&messages);
         let before_count = groups.len();
-        let compactor = PatternCompactor { retention_window: 0 };
+        let compactor = PatternCompactor {
+            retention_window: 0,
+        };
         compactor.compact(&mut groups);
         assert_eq!(groups.len(), before_count);
         assert!(groups.iter().any(|g| g.is_atomic()));
@@ -2194,7 +2197,7 @@ mod tests {
                 },
             ],
             tool_result: None,
-                    cache_breakpoint: false,
+            cache_breakpoint: false,
         };
         let cm: CompactMessage = (&pmsg).into();
         assert_eq!(cm.role, "assistant");
@@ -2211,7 +2214,7 @@ mod tests {
             content_blocks: None,
             tool_calls: vec![],
             tool_result: Some(ToolResult::success("ok").with_tool_use_id("call_1")),
-                    cache_breakpoint: false,
+            cache_breakpoint: false,
         };
         let cm: CompactMessage = (&pmsg).into();
         assert_eq!(cm.role, "tool");
@@ -2234,7 +2237,7 @@ mod tests {
                     input: serde_json::json!({}),
                 }],
                 tool_result: None,
-                            cache_breakpoint: false,
+                cache_breakpoint: false,
             },
             caduceus_providers::Message {
                 role: "tool".into(),
@@ -2242,7 +2245,7 @@ mod tests {
                 content_blocks: None,
                 tool_calls: vec![],
                 tool_result: Some(ToolResult::success("result").with_tool_use_id("c1")),
-                            cache_breakpoint: false,
+                cache_breakpoint: false,
             },
         ];
         let compact: Vec<CompactMessage> = provider_msgs.iter().map(Into::into).collect();
@@ -2268,7 +2271,7 @@ mod tests {
                     input: serde_json::json!({}),
                 }],
                 tool_result: None,
-                            cache_breakpoint: false,
+                cache_breakpoint: false,
             },
             caduceus_providers::Message {
                 role: "tool".into(),
@@ -2276,7 +2279,7 @@ mod tests {
                 content_blocks: None,
                 tool_calls: vec![],
                 tool_result: Some(ToolResult::success("r").with_tool_use_id("c1")),
-                            cache_breakpoint: false,
+                cache_breakpoint: false,
             },
         ];
         let groups = build_message_groups_from_provider(&provider_msgs);
@@ -2386,7 +2389,7 @@ mod iter3_tests {
                 content_blocks: None,
                 tool_calls: vec![],
                 tool_result: Some(ToolResult::success("x".repeat(5000)).with_tool_use_id("c1")),
-                            cache_breakpoint: false,
+                cache_breakpoint: false,
             },
             caduceus_providers::Message::user("u2"),
             caduceus_providers::Message::assistant("done"),
@@ -2446,7 +2449,8 @@ mod iter3_tests {
         assert!(!g.is_empty(), "expected ≥1 telemetry event");
         // Every recorded event must report turn_index 7 and a strategy
         // matching one of those that actually fired.
-        for ev in (0..g.len()).filter_map(|_| None::<crate::compaction_telemetry::CompactionEvent>) {
+        for ev in (0..g.len()).filter_map(|_| None::<crate::compaction_telemetry::CompactionEvent>)
+        {
             // (no-op iter; assertions below use stats instead)
             let _ = ev;
         }
@@ -2467,8 +2471,8 @@ mod iter3_tests {
 
         let telem = Arc::new(Mutex::new(CompactionTelemetry::default()));
         // Tiny groups → already under budget → no strategy should fire.
-        let pipeline = CompactionPipeline::default_pipeline(1_000_000)
-            .with_telemetry(Arc::clone(&telem));
+        let pipeline =
+            CompactionPipeline::default_pipeline(1_000_000).with_telemetry(Arc::clone(&telem));
         let mut groups = make_long_groups(2);
         let _ = pipeline.run(&mut groups);
         assert!(
@@ -2525,7 +2529,12 @@ mod iter3_tests {
         // unless tool-collapse was a no-op.
         if result.strategies_applied.len() >= 2 {
             // Map names to indices in the default insertion order:
-            let order = ["tool-collapse", "summarize", "sliding-window", "emergency-truncator"];
+            let order = [
+                "tool-collapse",
+                "summarize",
+                "sliding-window",
+                "emergency-truncator",
+            ];
             let idx_of = |n: &str| order.iter().position(|x| *x == n).unwrap_or(usize::MAX);
             let mut prev = 0usize;
             for n in &result.strategies_applied {
@@ -2566,8 +2575,7 @@ mod iter3_tests {
         let model = fit(&pairs);
         let sel = LearnedSelector::new(model).with_mode(SelectionMode::Learned);
 
-        let pipeline = CompactionPipeline::default_pipeline(1)
-            .with_learned_selector(sel);
+        let pipeline = CompactionPipeline::default_pipeline(1).with_learned_selector(sel);
         let mut groups = make_long_groups(20);
         let result = pipeline.run(&mut groups);
 
@@ -2604,13 +2612,17 @@ mod iter3_tests {
         // Empty model + Auto mode → has_enough_data() == false → use
         // heuristic (insertion) order.
         let sel = LearnedSelector::new(BradleyTerryModel::default());
-        let pipeline = CompactionPipeline::default_pipeline(1)
-            .with_learned_selector(sel);
+        let pipeline = CompactionPipeline::default_pipeline(1).with_learned_selector(sel);
         let mut groups = make_long_groups(20);
         let result = pipeline.run(&mut groups);
         // Same insertion-order invariant as the no-selector test.
         if result.strategies_applied.len() >= 2 {
-            let order = ["tool-collapse", "summarize", "sliding-window", "emergency-truncator"];
+            let order = [
+                "tool-collapse",
+                "summarize",
+                "sliding-window",
+                "emergency-truncator",
+            ];
             let idx_of = |n: &str| order.iter().position(|x| *x == n).unwrap_or(usize::MAX);
             let mut prev = 0usize;
             for n in &result.strategies_applied {

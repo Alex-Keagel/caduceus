@@ -40,9 +40,7 @@ use std::time::Instant;
 pub mod fixtures;
 pub mod locomo;
 pub mod trajectory;
-pub use locomo::{
-    LocomoRunner, MultiTurnTask, RecallProbe, RecallReport, TurnOutcome,
-};
+pub use locomo::{LocomoRunner, MultiTurnTask, RecallProbe, RecallReport, TurnOutcome};
 pub use trajectory::{
     RecordingLlmAdapter, ReplayingLlmAdapter, Trajectory, TrajectoryEntry, TrajectoryRecorder,
     TRAJECTORY_SCHEMA_VERSION,
@@ -151,13 +149,14 @@ impl EvalRunner {
             outcomes.push(Self::run_one(task.as_ref()).await);
         }
 
-        let passed = outcomes.iter().filter(|o| o.passed && o.error.is_none()).count();
+        let passed = outcomes
+            .iter()
+            .filter(|o| o.passed && o.error.is_none())
+            .count();
         let errored = outcomes.iter().filter(|o| o.error.is_some()).count();
         let failed = outcomes.len() - passed - errored;
-        let total_input_tokens: u64 =
-            outcomes.iter().map(|o| o.input_tokens as u64).sum();
-        let total_output_tokens: u64 =
-            outcomes.iter().map(|o| o.output_tokens as u64).sum();
+        let total_input_tokens: u64 = outcomes.iter().map(|o| o.input_tokens as u64).sum();
+        let total_output_tokens: u64 = outcomes.iter().map(|o| o.output_tokens as u64).sum();
         let total_wall_clock_ms: u64 = outcomes.iter().map(|o| o.wall_clock_ms).sum();
         let task_count = outcomes.len();
         let pass_rate = if task_count > 0 {
@@ -222,8 +221,7 @@ impl EvalRunner {
                     passed: false,
                     input_tokens: state.token_budget.used_input,
                     output_tokens: state.token_budget.used_output,
-                    total_tokens: state.token_budget.used_input
-                        + state.token_budget.used_output,
+                    total_tokens: state.token_budget.used_input + state.token_budget.used_output,
                     wall_clock_ms,
                     error: Some(format!("harness: {e}")),
                     output_preview: String::new(),
@@ -311,10 +309,8 @@ mod tests {
 
     #[tokio::test]
     async fn runner_distinguishes_failed_from_errored() {
-        let pass: Box<dyn EvalTask> =
-            Box::new(EchoTask::new("p", "go", "hi", true));
-        let fail: Box<dyn EvalTask> =
-            Box::new(EchoTask::new("f", "go", "hi", false)); // judge -> false
+        let pass: Box<dyn EvalTask> = Box::new(EchoTask::new("p", "go", "hi", true));
+        let fail: Box<dyn EvalTask> = Box::new(EchoTask::new("f", "go", "hi", false)); // judge -> false
         let report = EvalRunner::run(vec![pass, fail]).await.unwrap();
         assert_eq!(report.task_count, 2);
         assert_eq!(report.passed, 1);

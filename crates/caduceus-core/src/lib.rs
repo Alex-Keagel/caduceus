@@ -15,12 +15,13 @@ pub mod verification;
 
 pub use keybindings::{resolve_platform_shortcut, Keybinding, KeybindingConfig, KeybindingPreset};
 pub use path_norm::{is_path_like_field, normalize_lex, PATH_LIKE_FIELDS};
-pub use sanitizer::{
-    SanitizationFlags, SanitizedOutput, ToolOutputSanitizer, DEFAULT_MAX_BYTES as DEFAULT_TOOL_OUTPUT_MAX_BYTES,
-};
 pub use process_reward::{
     EnsembleCombiner, EnsembleStepVerifier, ObservedToolCall, OffStepVerifier, StepScore,
     StepVerifier, StepView,
+};
+pub use sanitizer::{
+    SanitizationFlags, SanitizedOutput, ToolOutputSanitizer,
+    DEFAULT_MAX_BYTES as DEFAULT_TOOL_OUTPUT_MAX_BYTES,
 };
 pub use verification::{majority_vote, weighted_majority_vote, VerificationStrategy, VoteOutcome};
 
@@ -354,7 +355,7 @@ pub enum PermissionOutcome {
     /// because the user didn't actually choose.
     TimedOut { waited_secs: u64 },
     /// Approval channel was closed (frontend gone, IPC torn down). Treated
-     /// as a denial, surfaced separately so callers can distinguish from a
+    /// as a denial, surfaced separately so callers can distinguish from a
     /// real "no" or a dropped prompt.
     ChannelClosed,
     /// A decision arrived but its `id` did not match the request we were
@@ -429,7 +430,8 @@ impl PermissionOutcome {
                 waited_secs
             ),
             PermissionOutcome::ChannelClosed => {
-                "Permission channel closed before a decision was made (treated as denied)".to_string()
+                "Permission channel closed before a decision was made (treated as denied)"
+                    .to_string()
             }
             PermissionOutcome::MismatchedId { expected, got } => {
                 // Bound `got` so an oversized id (from a malicious or buggy
@@ -2580,7 +2582,11 @@ mod tests {
 
     #[test]
     fn budget_breach_messages_are_actionable() {
-        let m = BudgetBreach::ToolCalls { used: 100, limit: 50 }.message();
+        let m = BudgetBreach::ToolCalls {
+            used: 100,
+            limit: 50,
+        }
+        .message();
         assert!(m.contains("100"));
         assert!(m.contains("50"));
         assert!(m.contains("max_tool_calls"));
@@ -2673,10 +2679,7 @@ mod tests {
             },
         };
         let json3 = serde_json::to_string(&mismatched).unwrap();
-        assert!(
-            json3.contains("\"kind\":\"mismatched_id\""),
-            "got: {json3}"
-        );
+        assert!(json3.contains("\"kind\":\"mismatched_id\""), "got: {json3}");
         assert!(json3.contains("\"expected\":\"perm_x\""), "got: {json3}");
         assert!(json3.contains("\"got\":\"perm_y\""), "got: {json3}");
     }
@@ -3378,9 +3381,7 @@ log_level = "debug"
 
     #[test]
     fn versioned_agent_event_roundtrips_at_current_version() {
-        let env = VersionedAgentEvent::current(AgentEvent::TextDelta {
-            text: "x".into(),
-        });
+        let env = VersionedAgentEvent::current(AgentEvent::TextDelta { text: "x".into() });
         let s = serde_json::to_string(&env).unwrap();
         let back: VersionedAgentEvent = serde_json::from_str(&s).unwrap();
         assert_eq!(back.v, AGENT_EVENT_SCHEMA_VERSION);
@@ -3469,7 +3470,10 @@ log_level = "debug"
         let back: AgentEvent = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             back,
-            AgentEvent::StepCompleted { step_id: 7, ok: false }
+            AgentEvent::StepCompleted {
+                step_id: 7,
+                ok: false
+            }
         ));
     }
 

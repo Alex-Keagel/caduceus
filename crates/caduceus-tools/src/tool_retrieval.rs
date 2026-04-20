@@ -152,7 +152,8 @@ mod tests {
             },
             ToolDescriptor {
                 name: "write_file".into(),
-                description: "Write a string to a file on disk, replacing any existing content.".into(),
+                description: "Write a string to a file on disk, replacing any existing content."
+                    .into(),
             },
             ToolDescriptor {
                 name: "shell".into(),

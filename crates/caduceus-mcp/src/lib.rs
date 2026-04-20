@@ -11,10 +11,10 @@ pub mod client;
 pub mod descriptor;
 pub mod error;
 pub mod manager;
+pub mod mcp_tool_bridge;
 pub mod permissions;
 pub mod registry;
 pub mod resource_keys;
-pub mod mcp_tool_bridge;
 pub mod types;
 
 pub use client::McpClient;

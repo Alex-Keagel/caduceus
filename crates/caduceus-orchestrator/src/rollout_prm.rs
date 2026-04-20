@@ -179,7 +179,8 @@ fn strip_code_fence(body: &str) -> &str {
     }
 }
 
-const DEFAULT_CRITIC_PROMPT: &str = "You are a strict judge of a single step taken by an autonomous coding agent. \
+const DEFAULT_CRITIC_PROMPT: &str =
+    "You are a strict judge of a single step taken by an autonomous coding agent. \
 You reply with ONE JSON object and nothing else: \
 {\"reward\": <float in [-1.0, 1.0]>, \"rationale\": <short single-sentence string>}. \
 Score 1.0 only if the step is clearly correct, useful, and matches the prompt. \
@@ -227,7 +228,9 @@ mod tests {
 
     #[tokio::test]
     async fn out_of_range_reward_is_clamped_by_step_score() {
-        let v = make_verifier(vec![judge_response(r#"{"reward": 12.0, "rationale": "x"}"#)]);
+        let v = make_verifier(vec![judge_response(
+            r#"{"reward": 12.0, "rationale": "x"}"#,
+        )]);
         let s = v.score(&step()).await;
         assert_eq!(s.reward, 1.0, "must clamp via StepScore::new");
     }
@@ -277,7 +280,11 @@ mod tests {
         let v = make_verifier(vec![]);
         let s = v.score(&step()).await;
         assert_eq!(s.reward, 0.0);
-        assert!(s.rationale.contains("verifier error"), "got: {}", s.rationale);
+        assert!(
+            s.rationale.contains("verifier error"),
+            "got: {}",
+            s.rationale
+        );
     }
 
     #[tokio::test]
@@ -291,10 +298,7 @@ mod tests {
             fn provider_id(&self) -> &caduceus_core::ProviderId {
                 &self.pid
             }
-            async fn chat(
-                &self,
-                _: ChatRequest,
-            ) -> caduceus_core::Result<ChatResponse> {
+            async fn chat(&self, _: ChatRequest) -> caduceus_core::Result<ChatResponse> {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 unreachable!()
             }
@@ -304,9 +308,7 @@ mod tests {
             ) -> caduceus_core::Result<caduceus_providers::StreamResult> {
                 unreachable!()
             }
-            async fn list_models(
-                &self,
-            ) -> caduceus_core::Result<Vec<caduceus_core::ModelId>> {
+            async fn list_models(&self) -> caduceus_core::Result<Vec<caduceus_core::ModelId>> {
                 Ok(Vec::new())
             }
         }
@@ -327,10 +329,7 @@ mod tests {
         let adapter = Arc::new(MockLlmAdapter::new(vec![judge_response(
             r#"{"reward": 0.0, "rationale": "ok"}"#,
         )]));
-        let v = RolloutPrmVerifier::new(
-            adapter.clone(),
-            caduceus_core::ModelId::new("test-judge"),
-        );
+        let v = RolloutPrmVerifier::new(adapter.clone(), caduceus_core::ModelId::new("test-judge"));
         let step = StepView::new(1, "p", "a").with_tool_calls(vec![ObservedToolCall {
             name: "shell".into(),
             args_summary: "ls".into(),

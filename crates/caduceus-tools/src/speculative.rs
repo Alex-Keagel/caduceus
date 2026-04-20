@@ -83,17 +83,15 @@ fn normalise_value(v: &serde_json::Value) -> serde_json::Value {
             for (k, val) in map {
                 let new_val = if caduceus_core::is_path_like_field(k) {
                     match val {
-                        serde_json::Value::String(s) => serde_json::Value::String(
-                            caduceus_core::normalize_lex(s),
-                        ),
+                        serde_json::Value::String(s) => {
+                            serde_json::Value::String(caduceus_core::normalize_lex(s))
+                        }
                         serde_json::Value::Array(items) => serde_json::Value::Array(
                             items
                                 .iter()
                                 .map(|it| match it {
                                     serde_json::Value::String(s) => {
-                                        serde_json::Value::String(
-                                            caduceus_core::normalize_lex(s),
-                                        )
+                                        serde_json::Value::String(caduceus_core::normalize_lex(s))
                                     }
                                     other => normalise_value(other),
                                 })
@@ -191,7 +189,13 @@ impl SpeculativeCache {
             map.remove(key);
             return None;
         }
-        let ready = matches!(map.get(key), Some(Entry { result: Some(_), .. }));
+        let ready = matches!(
+            map.get(key),
+            Some(Entry {
+                result: Some(_),
+                ..
+            })
+        );
         if !ready {
             return None;
         }
@@ -247,7 +251,10 @@ mod tests {
         let cache = SpeculativeCache::new(Duration::from_secs(60));
         let key = SpecKey::new("read", &json!({"path": "x"}));
         assert!(cache.reserve(&key), "first reservation must win");
-        assert!(!cache.reserve(&key), "second reservation must fail (single-flight)");
+        assert!(
+            !cache.reserve(&key),
+            "second reservation must fail (single-flight)"
+        );
         cache.complete(&key, ok("file contents"));
         let taken = cache.take(&key).expect("should be ready");
         assert!(taken.is_ok());
@@ -341,14 +348,8 @@ mod tests {
         // The `mode` field is not path-shaped — it must NOT be
         // touched by the normaliser, otherwise we'd merge unrelated
         // tool calls.
-        let a = SpecKey::new(
-            "read",
-            &json!({"path": "x", "mode": "./preserved/literal"}),
-        );
-        let b = SpecKey::new(
-            "read",
-            &json!({"path": "x", "mode": "preserved/literal"}),
-        );
+        let a = SpecKey::new("read", &json!({"path": "x", "mode": "./preserved/literal"}));
+        let b = SpecKey::new("read", &json!({"path": "x", "mode": "preserved/literal"}));
         // `mode` value is left untouched, so these are distinct.
         assert_ne!(a, b, "non-path fields must not be normalised");
     }
@@ -358,10 +359,7 @@ mod tests {
         // Tools that take a list of paths (`grep` over multiple files)
         // must canonicalise each element.
         let canon = SpecKey::new("grep", &json!({"path": ["a/b.rs", "c/d.rs"]}));
-        let dirty = SpecKey::new(
-            "grep",
-            &json!({"path": ["./a/b.rs", "c/./d.rs"]}),
-        );
+        let dirty = SpecKey::new("grep", &json!({"path": ["./a/b.rs", "c/./d.rs"]}));
         assert_eq!(canon, dirty);
     }
 

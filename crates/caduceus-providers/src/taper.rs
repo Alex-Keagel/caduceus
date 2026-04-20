@@ -194,9 +194,7 @@ impl LlmAdapter for ProviderTaper {
                 let mut guard = self.record_writer.lock().unwrap();
                 if let Some(ref mut f) = *guard {
                     writeln!(f, "{line}").map_err(|e| {
-                        CaduceusError::Provider(format!(
-                            "ProviderTaper: tape write failed: {e}"
-                        ))
+                        CaduceusError::Provider(format!("ProviderTaper: tape write failed: {e}"))
                     })?;
                     let _ = f.flush();
                 }
@@ -205,7 +203,9 @@ impl LlmAdapter for ProviderTaper {
             TaperMode::Replay { path } => {
                 self.ensure_replay_loaded(path)?;
                 let mut guard = self.replay_state.lock().unwrap();
-                let state = guard.as_mut().expect("ensure_replay_loaded populates state");
+                let state = guard
+                    .as_mut()
+                    .expect("ensure_replay_loaded populates state");
                 if state.cursor >= state.entries.len() {
                     return Err(CaduceusError::Provider(format!(
                         "ProviderTaper: tape exhausted at call #{} (tape has {} entries)",
@@ -294,13 +294,7 @@ mod tests {
             mk_response("first"),
             mk_response("second"),
         ]));
-        let recorder = ProviderTaper::new(
-            inner,
-            TaperMode::Record {
-                path: tape.clone(),
-            },
-        )
-        .unwrap();
+        let recorder = ProviderTaper::new(inner, TaperMode::Record { path: tape.clone() }).unwrap();
         let r1 = recorder.chat(mk_request("m", "a")).await.unwrap();
         let r2 = recorder.chat(mk_request("m", "b")).await.unwrap();
         assert_eq!(r1.content, "first");
@@ -309,13 +303,8 @@ mod tests {
         // Replay phase — inner is a panicking adapter to prove the tape is
         // the only source of responses.
         let panicking = Arc::new(MockLlmAdapter::new(vec![]));
-        let replayer = ProviderTaper::new(
-            panicking,
-            TaperMode::Replay {
-                path: tape.clone(),
-            },
-        )
-        .unwrap();
+        let replayer =
+            ProviderTaper::new(panicking, TaperMode::Replay { path: tape.clone() }).unwrap();
         let p1 = replayer.chat(mk_request("m", "a")).await.unwrap();
         let p2 = replayer.chat(mk_request("m", "b")).await.unwrap();
         assert_eq!(p1.content, "first");
@@ -328,13 +317,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tape = dir.path().join("tape.ndjson");
         let inner = Arc::new(MockLlmAdapter::new(vec![mk_response("only")]));
-        let recorder =
-            ProviderTaper::new(inner, TaperMode::Record { path: tape.clone() }).unwrap();
+        let recorder = ProviderTaper::new(inner, TaperMode::Record { path: tape.clone() }).unwrap();
         let _ = recorder.chat(mk_request("m", "x")).await.unwrap();
 
         let panicking = Arc::new(MockLlmAdapter::new(vec![]));
-        let replayer =
-            ProviderTaper::new(panicking, TaperMode::Replay { path: tape }).unwrap();
+        let replayer = ProviderTaper::new(panicking, TaperMode::Replay { path: tape }).unwrap();
         let _ = replayer.chat(mk_request("m", "x")).await.unwrap();
         let err = replayer
             .chat(mk_request("m", "x"))
@@ -360,8 +347,7 @@ mod tests {
         std::fs::write(&tape, format!("{bad_entry}\n")).unwrap();
 
         let panicking = Arc::new(MockLlmAdapter::new(vec![]));
-        let replayer =
-            ProviderTaper::new(panicking, TaperMode::Replay { path: tape }).unwrap();
+        let replayer = ProviderTaper::new(panicking, TaperMode::Replay { path: tape }).unwrap();
         let err = replayer
             .chat(mk_request("m", "x"))
             .await
@@ -375,7 +361,10 @@ mod tests {
         let tape = dir.path().join("eager.ndjson");
         let inner = Arc::new(MockLlmAdapter::new(vec![]));
         let _t = ProviderTaper::new(inner, TaperMode::Record { path: tape.clone() }).unwrap();
-        assert!(tape.exists(), "Record mode must create the tape on construction");
+        assert!(
+            tape.exists(),
+            "Record mode must create the tape on construction"
+        );
     }
 
     #[tokio::test]
@@ -392,13 +381,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tape = dir.path().join("drift.ndjson");
         let inner = Arc::new(MockLlmAdapter::new(vec![mk_response("rec")]));
-        let recorder =
-            ProviderTaper::new(inner, TaperMode::Record { path: tape.clone() }).unwrap();
+        let recorder = ProviderTaper::new(inner, TaperMode::Record { path: tape.clone() }).unwrap();
         let _ = recorder.chat(mk_request("model-A", "x")).await.unwrap();
 
         let panicking = Arc::new(MockLlmAdapter::new(vec![]));
-        let replayer =
-            ProviderTaper::new(panicking, TaperMode::Replay { path: tape }).unwrap();
+        let replayer = ProviderTaper::new(panicking, TaperMode::Replay { path: tape }).unwrap();
         // Different model — should log warn but still return recorded "rec".
         let resp = replayer.chat(mk_request("model-B", "x")).await.unwrap();
         assert_eq!(resp.content, "rec");

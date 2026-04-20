@@ -1176,7 +1176,9 @@ impl CodeHashEmbedder {
 fn split_identifier(s: &str) -> Vec<String> {
     let mut parts = Vec::new();
     for part in s.split('_') {
-        if part.is_empty() { continue; }
+        if part.is_empty() {
+            continue;
+        }
         // Split camelCase, keeping acronym runs together (HTTPServer → HTTP, Server)
         let mut current = String::new();
         let chars: Vec<char> = part.chars().collect();
@@ -1348,22 +1350,33 @@ pub struct FastEmbedBackend {
 impl FastEmbedBackend {
     /// Create with Jina Code model (best code-specific model available via fastembed).
     pub fn new_code() -> caduceus_core::Result<Self> {
-        use fastembed::{TextEmbedding, InitOptions, EmbeddingModel};
+        use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
         let model = TextEmbedding::try_new(
             InitOptions::new(EmbeddingModel::JinaEmbeddingsV2BaseCode)
                 .with_show_download_progress(true),
-        ).map_err(|e| caduceus_core::CaduceusError::Internal(format!("FastEmbed init failed: {e}")))?;
-        Ok(Self { model: std::sync::Mutex::new(model), dims: 768 })
+        )
+        .map_err(|e| {
+            caduceus_core::CaduceusError::Internal(format!("FastEmbed init failed: {e}"))
+        })?;
+        Ok(Self {
+            model: std::sync::Mutex::new(model),
+            dims: 768,
+        })
     }
 
     /// Create with a smaller general model for lower resource usage.
     pub fn new_small() -> caduceus_core::Result<Self> {
-        use fastembed::{TextEmbedding, InitOptions, EmbeddingModel};
+        use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
         let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::AllMiniLML6V2)
-                .with_show_download_progress(true),
-        ).map_err(|e| caduceus_core::CaduceusError::Internal(format!("FastEmbed init failed: {e}")))?;
-        Ok(Self { model: std::sync::Mutex::new(model), dims: 384 })
+            InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true),
+        )
+        .map_err(|e| {
+            caduceus_core::CaduceusError::Internal(format!("FastEmbed init failed: {e}"))
+        })?;
+        Ok(Self {
+            model: std::sync::Mutex::new(model),
+            dims: 384,
+        })
     }
 }
 
@@ -1371,10 +1384,13 @@ impl FastEmbedBackend {
 #[async_trait]
 impl EmbeddingBackend for FastEmbedBackend {
     async fn embed(&self, texts: Vec<String>) -> caduceus_core::Result<Vec<Vec<f32>>> {
-        let model = self.model.lock()
+        let model = self
+            .model
+            .lock()
             .map_err(|e| caduceus_core::CaduceusError::Internal(format!("Lock error: {e}")))?;
         let str_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-        let embeddings = model.embed(str_refs, None)
+        let embeddings = model
+            .embed(str_refs, None)
             .map_err(|e| caduceus_core::CaduceusError::Internal(format!("Embed error: {e}")))?;
         Ok(embeddings)
     }
@@ -1479,18 +1495,23 @@ impl SemanticIndex {
             return Ok(Vec::new());
         }
 
-        let semantic_scores: Vec<(usize, f32)> = entries.iter().enumerate()
+        let semantic_scores: Vec<(usize, f32)> = entries
+            .iter()
+            .enumerate()
             .map(|(i, (_, emb))| (i, cosine_similarity(&query_vec, emb)))
             .collect();
 
         // Keyword search (BM25-like) — exact token matching
-        let query_tokens: Vec<String> = query.to_lowercase()
+        let query_tokens: Vec<String> = query
+            .to_lowercase()
             .split(|c: char| !c.is_alphanumeric() && c != '_')
             .filter(|s| s.len() > 1)
             .map(|s| s.to_string())
             .collect();
 
-        let keyword_scores: Vec<(usize, f32)> = entries.iter().enumerate()
+        let keyword_scores: Vec<(usize, f32)> = entries
+            .iter()
+            .enumerate()
             .map(|(i, (chunk, _))| {
                 let content_lower = chunk.content.to_lowercase();
                 let name_lower = chunk.symbol_name.to_lowercase();
@@ -1521,12 +1542,15 @@ impl SemanticIndex {
             fused_scores[*idx] += 1.0 / (k + rank as f32);
         }
         for (rank, (idx, score)) in keyword_ranked.iter().enumerate() {
-            if *score > 0.0 { // only count keyword matches
+            if *score > 0.0 {
+                // only count keyword matches
                 fused_scores[*idx] += 1.0 / (k + rank as f32);
             }
         }
 
-        let mut results: Vec<SearchResult> = entries.iter().enumerate()
+        let mut results: Vec<SearchResult> = entries
+            .iter()
+            .enumerate()
             .map(|(i, (chunk, _))| SearchResult {
                 chunk: chunk.clone(),
                 score: fused_scores[i],
@@ -1534,7 +1558,11 @@ impl SemanticIndex {
             .collect();
         drop(entries);
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(top_k);
 
         Ok(results)
@@ -1551,11 +1579,7 @@ impl SemanticIndex {
     /// Index already-loaded content. **Append-only**: existing entries for
     /// `path` are NOT removed (use `replace_file_content` for replace
     /// semantics). The embed call happens with no entries lock held.
-    pub async fn index_content(
-        &self,
-        path: &str,
-        content: &str,
-    ) -> caduceus_core::Result<usize> {
+    pub async fn index_content(&self, path: &str, content: &str) -> caduceus_core::Result<usize> {
         let chunks = self.chunker.chunk_file(path, content);
         let count = chunks.len();
 
@@ -1626,12 +1650,13 @@ impl SemanticIndex {
     /// Save the index to a file for persistence across restarts.
     pub fn save_to_file(&self, path: &Path) -> caduceus_core::Result<()> {
         let entries = self.entries.read().unwrap_or_else(|e| e.into_inner());
-        let data: Vec<SerializedEntry> = entries.iter().map(|(chunk, emb)| {
-            SerializedEntry {
+        let data: Vec<SerializedEntry> = entries
+            .iter()
+            .map(|(chunk, emb)| SerializedEntry {
                 chunk: chunk.clone(),
                 embedding: emb.clone(),
-            }
-        }).collect();
+            })
+            .collect();
         drop(entries);
         let json = serde_json::to_vec(&data)?;
         let dir = path.parent().unwrap_or(Path::new("."));
@@ -1663,7 +1688,10 @@ impl SemanticIndex {
         let entries: Vec<SerializedEntry> = serde_json::from_slice(&data)?;
         let count = entries.len();
         let mut guard = self.entries.write().unwrap_or_else(|e| e.into_inner());
-        *guard = entries.into_iter().map(|e| (e.chunk, e.embedding)).collect();
+        *guard = entries
+            .into_iter()
+            .map(|e| (e.chunk, e.embedding))
+            .collect();
         Ok(count)
     }
 
@@ -2319,7 +2347,9 @@ impl CodePropertyGraph {
             // Import edges
             if chunk.symbol_type == SymbolType::Import {
                 // Extract the imported symbol name from content
-                let imported: Vec<&str> = chunk.content.split(|c: char| !c.is_alphanumeric() && c != '_')
+                let imported: Vec<&str> = chunk
+                    .content
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
                     .filter(|s| s.len() > 1)
                     .collect();
                 for name in imported {
@@ -2339,7 +2369,9 @@ impl CodePropertyGraph {
 
             // Call/reference edges — scan content for known symbol names
             if matches!(chunk.symbol_type, SymbolType::Function | SymbolType::Method) {
-                let tokens: Vec<&str> = chunk.content.split(|c: char| !c.is_alphanumeric() && c != '_')
+                let tokens: Vec<&str> = chunk
+                    .content
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
                     .filter(|s| s.len() > 2)
                     .collect();
                 for token in tokens {
@@ -2358,8 +2390,12 @@ impl CodePropertyGraph {
         }
 
         // Deduplicate edges
-        self.edges.sort_by(|a, b| (&a.source, &a.target, &a.edge_type).cmp(&(&b.source, &b.target, &b.edge_type)));
-        self.edges.dedup_by(|a, b| a.source == b.source && a.target == b.target && a.edge_type == b.edge_type);
+        self.edges.sort_by(|a, b| {
+            (&a.source, &a.target, &a.edge_type).cmp(&(&b.source, &b.target, &b.edge_type))
+        });
+        self.edges.dedup_by(|a, b| {
+            a.source == b.source && a.target == b.target && a.edge_type == b.edge_type
+        });
     }
 
     pub fn stats(&self) -> GraphStats {

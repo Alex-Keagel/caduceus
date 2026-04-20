@@ -367,7 +367,7 @@ mod tests {
             cache_creation_tokens: 0,
             stop_reason: StopReason::EndTurn,
             tool_calls: vec![],
-                logprobs: None,
+            logprobs: None,
         }]))
     }
 

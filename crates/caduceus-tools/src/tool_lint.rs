@@ -80,7 +80,9 @@ fn json_type_name(v: &Value) -> &'static str {
 
 fn type_matches(v: &Value, target: &str) -> bool {
     match (target, v) {
-        ("integer", Value::Number(n)) => n.is_i64() || n.is_u64() || n.as_f64().map(|f| f.fract() == 0.0).unwrap_or(false),
+        ("integer", Value::Number(n)) => {
+            n.is_i64() || n.is_u64() || n.as_f64().map(|f| f.fract() == 0.0).unwrap_or(false)
+        }
         ("number", Value::Number(_)) => true,
         _ => json_type_name(v) == target,
     }
@@ -114,10 +116,9 @@ fn try_coerce(v: &Value, target: &str) -> Option<Value> {
             _ => None,
         },
         // bare scalar → 1‑element array.
-        (
-            Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Object(_),
-            "array",
-        ) => Some(Value::Array(vec![v.clone()])),
+        (Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Object(_), "array") => {
+            Some(Value::Array(vec![v.clone()]))
+        }
         _ => None,
     }
 }
@@ -193,8 +194,7 @@ pub fn lint(input: &Value, schema: &Value) -> Result<Value, LintError> {
             if let Some(allowed) = prop_schema.get("enum").and_then(|v| v.as_array()) {
                 let cur = out.get(&k).cloned().unwrap_or(Value::Null);
                 if !allowed.iter().any(|a| a == &cur) {
-                    let allowed_strs: Vec<String> =
-                        allowed.iter().map(|v| v.to_string()).collect();
+                    let allowed_strs: Vec<String> = allowed.iter().map(|v| v.to_string()).collect();
                     return Err(LintError::EnumViolation {
                         field: k,
                         allowed: allowed_strs,

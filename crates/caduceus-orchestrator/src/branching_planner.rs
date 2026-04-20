@@ -182,8 +182,7 @@ impl<T: Clone, E: BranchExpander<T>, S: BranchScorer<T>> TreeOfThoughts<T, E, S>
                 let kids = self.expander.expand(parent, self.cfg.branching_factor);
                 nodes_expanded += 1;
                 for (thought, terminal) in kids {
-                    let mut child =
-                        ThoughtNode::new(parent.depth + 1, thought, 0.0, terminal);
+                    let mut child = ThoughtNode::new(parent.depth + 1, thought, 0.0, terminal);
                     child.score = self.scorer.score(&child);
                     next_heap.push(Ranked {
                         score: child.score,
@@ -208,12 +207,7 @@ impl<T: Clone, E: BranchExpander<T>, S: BranchScorer<T>> TreeOfThoughts<T, E, S>
             }
             // Promote any terminal child seen this round into `best`.
             for child in &new_frontier {
-                if child.terminal
-                    && best
-                        .as_ref()
-                        .map(|b| child.score > b.score)
-                        .unwrap_or(true)
-                {
+                if child.terminal && best.as_ref().map(|b| child.score > b.score).unwrap_or(true) {
                     best = Some(child.clone());
                 }
             }
@@ -230,11 +224,7 @@ impl<T: Clone, E: BranchExpander<T>, S: BranchScorer<T>> TreeOfThoughts<T, E, S>
         if best.is_none() {
             best = frontier
                 .iter()
-                .max_by(|a, b| {
-                    a.score
-                        .partial_cmp(&b.score)
-                        .unwrap_or(Ordering::Equal)
-                })
+                .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal))
                 .cloned();
         }
 

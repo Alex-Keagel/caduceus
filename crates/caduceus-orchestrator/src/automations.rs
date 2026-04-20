@@ -195,10 +195,7 @@ impl AutomationRegistry {
     /// callers don't stall on disk I/O. The snapshot is owned, so
     /// even if the in-memory map is mutated concurrently, this call
     /// writes a coherent point-in-time view.
-    fn persist_snapshot(
-        autos: &[Automation],
-        path: &Path,
-    ) -> Result<(), AutomationError> {
+    fn persist_snapshot(autos: &[Automation], path: &Path) -> Result<(), AutomationError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(AutomationError::Io)?;
         }
@@ -791,10 +788,7 @@ mod tests {
         for i in 0..50 {
             let r = registry.clone();
             tasks.push(tokio::spawn(async move {
-                let auto = make_test_automation(
-                    &format!("a{i}"),
-                    AutomationTrigger::Manual,
-                );
+                let auto = make_test_automation(&format!("a{i}"), AutomationTrigger::Manual);
                 r.register(auto).await.unwrap();
             }));
             let r = registry.clone();

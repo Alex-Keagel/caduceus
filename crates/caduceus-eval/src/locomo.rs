@@ -194,11 +194,7 @@ mod tests {
             &self.probes
         }
         fn provider(&self) -> Arc<dyn LlmAdapter> {
-            let chats: Vec<_> = self
-                .responses
-                .iter()
-                .map(|r| scripted(r, 5))
-                .collect();
+            let chats: Vec<_> = self.responses.iter().map(|r| scripted(r, 5)).collect();
             Arc::new(MockLlmAdapter::new(chats))
         }
     }
@@ -216,7 +212,11 @@ mod tests {
         let task = ScriptedLocomoTask {
             name: "perfect".into(),
             probes: vec![
-                probe("inject", "Remember: my favourite colour is blue.", &["blue"]),
+                probe(
+                    "inject",
+                    "Remember: my favourite colour is blue.",
+                    &["blue"],
+                ),
                 probe("recall", "What was my favourite colour?", &["blue"]),
             ],
             responses: vec![
@@ -239,10 +239,7 @@ mod tests {
                 probe("recall", "What's my pet?", &["cat"]),
             ],
             // Second response forgets — should fail.
-            responses: vec![
-                "Noted, your pet is a cat.".into(),
-                "I don't recall.".into(),
-            ],
+            responses: vec!["Noted, your pet is a cat.".into(), "I don't recall.".into()],
         };
         let r = LocomoRunner::run(&task).await.unwrap();
         assert_eq!(r.passed_turns, 1);
@@ -264,11 +261,7 @@ mod tests {
     async fn p12_1_all_substrings_must_match_for_pass() {
         let task = ScriptedLocomoTask {
             name: "conjunction".into(),
-            probes: vec![probe(
-                "recall",
-                "summarise",
-                &["alpha", "beta", "gamma"],
-            )],
+            probes: vec![probe("recall", "summarise", &["alpha", "beta", "gamma"])],
             // Missing "gamma" → must fail.
             responses: vec!["Found alpha and beta but nothing else.".into()],
         };

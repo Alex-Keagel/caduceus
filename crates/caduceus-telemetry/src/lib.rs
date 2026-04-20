@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 pub mod genai;
-pub use genai::{GenAiContext, GenAiMapper, GenAiSpan, GenAiSpanExporter, GenAiValue, JsonlGenAiExporter};
+pub use genai::{
+    GenAiContext, GenAiMapper, GenAiSpan, GenAiSpanExporter, GenAiValue, JsonlGenAiExporter,
+};
 
 // ── Token counting ─────────────────────────────────────────────────────────────
 

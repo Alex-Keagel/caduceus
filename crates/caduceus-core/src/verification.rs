@@ -325,7 +325,10 @@ mod tests {
             ("b".to_string(), -1.0),
         ];
         let r = weighted_majority_vote(&ballots).unwrap();
-        assert_eq!(r.winner, "a", "must fall back to plain majority on zero weight");
+        assert_eq!(
+            r.winner, "a",
+            "must fall back to plain majority on zero weight"
+        );
     }
 
     #[test]

@@ -61,7 +61,11 @@ pub struct Notification {
 }
 
 impl Notification {
-    pub fn info(source: impl Into<String>, title: impl Into<String>, body: impl Into<String>) -> Self {
+    pub fn info(
+        source: impl Into<String>,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
         Self {
             severity: Severity::Info,
             source: source.into(),
@@ -70,7 +74,11 @@ impl Notification {
         }
     }
 
-    pub fn error(source: impl Into<String>, title: impl Into<String>, body: impl Into<String>) -> Self {
+    pub fn error(
+        source: impl Into<String>,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
         Self {
             severity: Severity::Error,
             source: source.into(),
@@ -135,7 +143,7 @@ mod tests {
     use super::*;
     use crate::automations::AutomationResult;
     use chrono::Utc;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{timeout, Duration};
 
     fn dummy_result(success: bool) -> AutomationResult {
         AutomationResult {
@@ -211,8 +219,14 @@ mod tests {
         let mut rx1 = subscribe(&bus);
         let mut rx2 = subscribe(&bus);
         publish(&bus, Notification::info("s", "t", "b")).unwrap();
-        let m1 = timeout(Duration::from_millis(100), rx1.recv()).await.unwrap().unwrap();
-        let m2 = timeout(Duration::from_millis(100), rx2.recv()).await.unwrap().unwrap();
+        let m1 = timeout(Duration::from_millis(100), rx1.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let m2 = timeout(Duration::from_millis(100), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(m1.content, m2.content);
     }
 

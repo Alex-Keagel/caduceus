@@ -425,7 +425,8 @@ mod tests {
                 args: vec![],
                 env: HashMap::new(),
             },
-            auto_start: false, trust_tier: crate::types::TrustTier::Trusted,
+            auto_start: false,
+            trust_tier: crate::types::TrustTier::Trusted,
         }
     }
 
@@ -651,9 +652,8 @@ mod tests {
         let m2 = Arc::clone(&mgr);
         let tools_task = tokio::spawn(async move { m2.all_tools().await });
         let m3 = Arc::clone(&mgr);
-        let call_task = tokio::spawn(async move {
-            m3.call_tool("nope", serde_json::json!({})).await
-        });
+        let call_task =
+            tokio::spawn(async move { m3.call_tool("nope", serde_json::json!({})).await });
 
         // None of these should take more than a fraction of a second —
         // statuses and all_tools will skip the locked entry by simply

@@ -45,9 +45,9 @@
 //! them or replay will silently diverge.
 
 use anyhow::{anyhow, Context, Result};
-use caduceus_providers::{ChatRequest, ChatResponse, LlmAdapter, StreamResult};
-use caduceus_core::{ModelId, ProviderId};
 use async_trait::async_trait;
+use caduceus_core::{ModelId, ProviderId};
+use caduceus_providers::{ChatRequest, ChatResponse, LlmAdapter, StreamResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
@@ -276,9 +276,8 @@ impl Trajectory {
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: TrajectoryEntry = serde_json::from_str(&line).with_context(|| {
-                format!("parsing trajectory line {}: {line}", i + 1)
-            })?;
+            let entry: TrajectoryEntry = serde_json::from_str(&line)
+                .with_context(|| format!("parsing trajectory line {}: {line}", i + 1))?;
             entries.push(entry);
         }
         if entries.is_empty() {
@@ -473,8 +472,11 @@ mod tests {
             &ModelId::new("mock-model"),
         )
         .unwrap();
-        let lines: Vec<String> =
-            std::fs::read_to_string(&path).unwrap().lines().map(String::from).collect();
+        let lines: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
         assert_eq!(lines.len(), 1);
         let entry: TrajectoryEntry = serde_json::from_str(&lines[0]).unwrap();
         assert!(matches!(entry, TrajectoryEntry::Header { .. }));
@@ -541,8 +543,14 @@ mod tests {
         assert_eq!(replay.remaining(), 2);
         let p1 = replay.chat(sample_request()).await.unwrap();
         let p2 = replay.chat(sample_request()).await.unwrap();
-        assert_eq!(p1.content, r1.content, "replayed response must equal recorded");
-        assert_eq!(p2.content, r2.content, "replayed response must equal recorded");
+        assert_eq!(
+            p1.content, r1.content,
+            "replayed response must equal recorded"
+        );
+        assert_eq!(
+            p2.content, r2.content,
+            "replayed response must equal recorded"
+        );
         assert_eq!(replay.remaining(), 0);
     }
 
@@ -551,13 +559,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("traj.jsonl");
         let mock = Arc::new(MockLlmAdapter::new(vec![sample_response("only")]));
-        let rec = TrajectoryRecorder::create(
-            &path,
-            "s",
-            &ProviderId::new("mock"),
-            &ModelId::new("m"),
-        )
-        .unwrap();
+        let rec =
+            TrajectoryRecorder::create(&path, "s", &ProviderId::new("mock"), &ModelId::new("m"))
+                .unwrap();
         let recording = RecordingLlmAdapter::new(mock, rec);
         let _ = recording.chat(sample_request()).await.unwrap();
 
@@ -586,8 +590,11 @@ mod tests {
             provider_id: "mock".into(),
             model_id: "m".into(),
         };
-        std::fs::write(&path, format!("{}\n", serde_json::to_string(&header).unwrap()))
-            .unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&header).unwrap()),
+        )
+        .unwrap();
         let err = Trajectory::load(&path).unwrap_err();
         assert!(
             format!("{err}").contains("newer than this build supports"),
@@ -626,13 +633,9 @@ mod tests {
         // it, and verify entry_count doesn't advance.
         let dir = tempdir().unwrap();
         let path = dir.path().join("traj.jsonl");
-        let rec = TrajectoryRecorder::create(
-            &path,
-            "x",
-            &ProviderId::new("mock"),
-            &ModelId::new("m"),
-        )
-        .unwrap();
+        let rec =
+            TrajectoryRecorder::create(&path, "x", &ProviderId::new("mock"), &ModelId::new("m"))
+                .unwrap();
         let baseline = rec.entry_count();
         // Manually poison by acquiring the lock and setting the flag.
         {
@@ -643,6 +646,10 @@ mod tests {
             request: sample_request(),
             response: sample_response("never written"),
         });
-        assert_eq!(rec.entry_count(), baseline, "poisoned recorder must not advance count");
+        assert_eq!(
+            rec.entry_count(),
+            baseline,
+            "poisoned recorder must not advance count"
+        );
     }
 }

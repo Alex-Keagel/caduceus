@@ -101,13 +101,9 @@ impl McpError {
         match self {
             McpError::NotConnected | McpError::ServerClosed => McpErrorKind::Transient,
             McpError::SpawnFailed | McpError::Config(_) => McpErrorKind::Config,
-            McpError::ServerNotFound(_) | McpError::ToolNotFound(_) => {
-                McpErrorKind::NotFound
-            }
+            McpError::ServerNotFound(_) | McpError::ToolNotFound(_) => McpErrorKind::NotFound,
             McpError::PermissionDenied(_) => McpErrorKind::Permission,
-            McpError::EmptyResult | McpError::Serialization(_) => {
-                McpErrorKind::Permanent
-            }
+            McpError::EmptyResult | McpError::Serialization(_) => McpErrorKind::Permanent,
             McpError::JsonRpc { code, .. } => match *code {
                 401 | 403 => McpErrorKind::Auth,
                 -32603 => McpErrorKind::Transient,
@@ -129,7 +125,9 @@ impl McpError {
             McpError::Http(e) => {
                 if e.is_timeout() || e.is_connect() {
                     McpErrorKind::Transient
-                } else if e.status().map(|s| s.as_u16() == 401 || s.as_u16() == 403)
+                } else if e
+                    .status()
+                    .map(|s| s.as_u16() == 401 || s.as_u16() == 403)
                     .unwrap_or(false)
                 {
                     McpErrorKind::Auth
@@ -228,11 +226,9 @@ mod tests {
 
     #[test]
     fn classifies_io_errors() {
-        let timed_out =
-            McpError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let timed_out = McpError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
         assert_eq!(timed_out.kind(), McpErrorKind::Transient);
-        let not_found =
-            McpError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let not_found = McpError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
         assert_eq!(not_found.kind(), McpErrorKind::Config);
     }
 

@@ -402,7 +402,11 @@ mod tests {
             events.push(ev("SlidingWindow", 12_000, true, 30 + i));
         }
         let pairs = pairs_from_events(&events);
-        assert!(pairs.len() > 100, "expected many pairs, got {}", pairs.len());
+        assert!(
+            pairs.len() > 100,
+            "expected many pairs, got {}",
+            pairs.len()
+        );
         let m = fit(&pairs);
         let s_sum = m.scores["Summarize"];
         let s_win = m.scores["SlidingWindow"];

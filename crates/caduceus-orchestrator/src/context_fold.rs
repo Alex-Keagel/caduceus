@@ -107,7 +107,10 @@ pub struct TranscriptStore {
 
 impl Default for TranscriptStore {
     fn default() -> Self {
-        Self::new(DEFAULT_STORE_CAPACITY, Duration::from_secs(DEFAULT_TTL_SECS))
+        Self::new(
+            DEFAULT_STORE_CAPACITY,
+            Duration::from_secs(DEFAULT_TTL_SECS),
+        )
     }
 }
 

@@ -8,8 +8,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 // ── Core types ─────────────────────────────────────────────────────────────────
@@ -717,7 +717,10 @@ mod tests {
         // the loop kept observing pause_token.is_cancelled() == true and
         // slept forever. Verify the agent can complete after pause+resume.
         let mgr = BackgroundAgentManager::in_memory();
-        let id = mgr.start("complete after resume".to_string()).await.unwrap();
+        let id = mgr
+            .start("complete after resume".to_string())
+            .await
+            .unwrap();
 
         // Pause briefly, then resume; agent should still be able to complete.
         mgr.pause(&id).await.unwrap();

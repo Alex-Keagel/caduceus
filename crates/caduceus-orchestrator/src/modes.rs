@@ -388,10 +388,7 @@ pub enum PlanAmendment {
         expected_plan_revision: u64,
     },
     /// Remove the step at index `step`.
-    Remove {
-        step: usize,
-        expected_revision: u64,
-    },
+    Remove { step: usize, expected_revision: u64 },
 }
 
 /// Reasons an amendment can fail. Returned by
@@ -401,9 +398,7 @@ pub enum PlanAmendment {
 pub enum AmendError {
     #[error("step {step} does not exist (plan has {len} actions)")]
     StepOutOfRange { step: usize, len: usize },
-    #[error(
-        "stale revision: amendment expected {expected}, current is {actual}"
-    )]
+    #[error("stale revision: amendment expected {expected}, current is {actual}")]
     StaleRevision { expected: u64, actual: u64 },
     #[error("plan is empty; cannot amend")]
     EmptyPlan,
@@ -1101,7 +1096,11 @@ mod tests {
         let back: caduceus_core::AgentEvent = serde_json::from_str(&json).unwrap();
         match back {
             caduceus_core::AgentEvent::PlanStepPending {
-                step, revision, plan_revision, tool_name, description,
+                step,
+                revision,
+                plan_revision,
+                tool_name,
+                description,
             } => {
                 assert_eq!(step, 2);
                 assert_eq!(revision, 0);
@@ -1126,7 +1125,11 @@ mod tests {
         let back: caduceus_core::AgentEvent = serde_json::from_str(&json).unwrap();
         match back {
             caduceus_core::AgentEvent::PlanAmended {
-                kind, step, ok, reason, plan_revision,
+                kind,
+                step,
+                ok,
+                reason,
+                plan_revision,
             } => {
                 assert_eq!(kind, "replace");
                 assert_eq!(step, 2);

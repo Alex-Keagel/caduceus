@@ -50,18 +50,14 @@ impl Snapshot {
     /// same filesystem (otherwise it falls back to copy+unlink, which is
     /// NOT atomic on POSIX).
     pub fn write_atomic(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string(self).map_err(|e| {
-            CaduceusError::Other(anyhow::anyhow!("snapshot serialise: {e}"))
-        })?;
+        let json = serde_json::to_string(self)
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("snapshot serialise: {e}")))?;
         let parent = path
             .parent()
             .ok_or_else(|| CaduceusError::Other(anyhow::anyhow!("snapshot path has no parent")))?;
         std::fs::create_dir_all(parent)
             .map_err(|e| CaduceusError::Other(anyhow::anyhow!("mkdir {parent:?}: {e}")))?;
-        let tmp = parent.join(format!(
-            ".snapshot.{}.tmp",
-            std::process::id()
-        ));
+        let tmp = parent.join(format!(".snapshot.{}.tmp", std::process::id()));
         // Best‑effort cleanup if a previous run left a tmp file behind.
         let _ = std::fs::remove_file(&tmp);
         std::fs::write(&tmp, &json)
@@ -76,9 +72,8 @@ impl Snapshot {
     pub fn read(path: &Path) -> Result<Self> {
         let json = std::fs::read_to_string(path)
             .map_err(|e| CaduceusError::Other(anyhow::anyhow!("read snapshot: {e}")))?;
-        let snap: Snapshot = serde_json::from_str(&json).map_err(|e| {
-            CaduceusError::Other(anyhow::anyhow!("snapshot deserialise: {e}"))
-        })?;
+        let snap: Snapshot = serde_json::from_str(&json)
+            .map_err(|e| CaduceusError::Other(anyhow::anyhow!("snapshot deserialise: {e}")))?;
         if snap.version != SNAPSHOT_VERSION {
             return Err(CaduceusError::Other(anyhow::anyhow!(
                 "snapshot version mismatch: got {} expected {}",

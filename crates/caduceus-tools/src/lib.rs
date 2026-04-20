@@ -312,8 +312,9 @@ impl ToolRegistry {
 
         // Sequential fallback when any task is destructive.
         if any_destructive {
-            let mut out: Vec<Option<Result<ToolResult>>> =
-                std::iter::repeat_with(|| None).take(resolved.len()).collect();
+            let mut out: Vec<Option<Result<ToolResult>>> = std::iter::repeat_with(|| None)
+                .take(resolved.len())
+                .collect();
             for (idx, name, input, _kind, _keys) in resolved {
                 let result = match self.get(&name) {
                     Some(t) => t.call(input).await,
@@ -368,12 +369,13 @@ impl ToolRegistry {
                     let guard = mu.lock_owned().await;
                     held.push(guard);
                 }
-                let permit = semaphore.acquire_owned().await.map_err(|err| {
-                    CaduceusError::Tool {
+                let permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .map_err(|err| CaduceusError::Tool {
                         tool: name.clone(),
                         message: format!("failed to acquire parallel execution permit: {err}"),
-                    }
-                });
+                    });
                 let result = match permit {
                     Ok(_p) => match tool {
                         Some(t) => t.call(input).await,
@@ -6194,7 +6196,9 @@ mod tests {
             .await;
         let elapsed = start.elapsed();
         assert_eq!(results.len(), 3);
-        assert!(results.iter().all(|r| r.as_ref().is_ok_and(|t| !t.is_error)));
+        assert!(results
+            .iter()
+            .all(|r| r.as_ref().is_ok_and(|t| !t.is_error)));
         // Three 40ms sleeps in parallel ≈ 40ms; sequential would be ≥120ms.
         assert!(
             elapsed < Duration::from_millis(110),
@@ -6225,8 +6229,7 @@ mod tests {
             )
             .await;
         assert_eq!(results.len(), 3);
-        let peak_for_shared =
-            peak.lock().unwrap().get("shared").copied().unwrap_or(0);
+        let peak_for_shared = peak.lock().unwrap().get("shared").copied().unwrap_or(0);
         assert_eq!(
             peak_for_shared, 1,
             "same-resource tasks must never run concurrently; saw peak={peak_for_shared}"
@@ -6355,7 +6358,11 @@ mod tests {
             ToolKind::Destructive
         }
         fn resource_kind(&self, input: &Value) -> ToolKind {
-            if input.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if input
+                .get("dry_run")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 ToolKind::ReadOnly
             } else {
                 ToolKind::Destructive
@@ -6401,8 +6408,14 @@ mod tests {
         let results = registry
             .execute_parallel_locked(
                 vec![
-                    ("dryrun_writer".into(), json!({"path": "a", "dry_run": true})),
-                    ("dryrun_writer".into(), json!({"path": "b", "dry_run": true})),
+                    (
+                        "dryrun_writer".into(),
+                        json!({"path": "a", "dry_run": true}),
+                    ),
+                    (
+                        "dryrun_writer".into(),
+                        json!({"path": "b", "dry_run": true}),
+                    ),
                 ],
                 4,
             )
@@ -6439,7 +6452,10 @@ mod tests {
         let _ = registry
             .execute_parallel_locked(
                 vec![
-                    ("dryrun_writer".into(), json!({"path": "a", "dry_run": true})),
+                    (
+                        "dryrun_writer".into(),
+                        json!({"path": "a", "dry_run": true}),
+                    ),
                     ("dryrun_writer".into(), json!({"path": "b"})), // real write
                 ],
                 4,

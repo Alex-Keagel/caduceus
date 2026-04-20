@@ -37,12 +37,10 @@ impl QueueDepthMetric {
         let n = self.inner.fetch_add(1, Ordering::Relaxed) + 1;
         let mut hw = self.high_water.load(Ordering::Relaxed);
         while n > hw {
-            match self.high_water.compare_exchange(
-                hw,
-                n,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .high_water
+                .compare_exchange(hw, n, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(actual) => hw = actual,
             }

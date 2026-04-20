@@ -287,7 +287,9 @@ mod tests {
         let dropped = mb.set_project_context("ééé"); // 6 bytes
         assert!(dropped > 0);
         // The truncated string must still be valid UTF-8.
-        assert!(mb.project_context.is_char_boundary(mb.project_context.len()));
+        assert!(mb
+            .project_context
+            .is_char_boundary(mb.project_context.len()));
     }
 
     #[test]

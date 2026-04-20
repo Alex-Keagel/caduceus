@@ -31,11 +31,7 @@ pub struct WorkerOutput {
 /// agents and return their (possibly heterogeneous) outputs.
 #[async_trait]
 pub trait WorkerRunner: Send + Sync {
-    async fn run(
-        &self,
-        prompt: &str,
-        n_agents: usize,
-    ) -> Result<Vec<WorkerOutput>, anyhow::Error>;
+    async fn run(&self, prompt: &str, n_agents: usize) -> Result<Vec<WorkerOutput>, anyhow::Error>;
 }
 
 /// Worker‑pool tool. Acceptance: fan‑out N agents, vote on output, return
@@ -181,7 +177,10 @@ mod tests {
             },
         ]));
         let pool = WorkerPool::new(runner);
-        let res = pool.call(&json!({"prompt": "split decision"})).await.unwrap();
+        let res = pool
+            .call(&json!({"prompt": "split decision"}))
+            .await
+            .unwrap();
         assert_eq!(res["consensus"], "none");
         assert_eq!(res["top_votes"], 1);
     }

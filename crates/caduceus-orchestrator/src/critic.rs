@@ -133,7 +133,9 @@ mod tests {
     #[tokio::test]
     async fn p13_6_heuristic_accepts_normal_response() {
         let c = HeuristicCritic::default();
-        let v = c.judge("write hello", "Hello, world! Here is the answer.", &[]).await;
+        let v = c
+            .judge("write hello", "Hello, world! Here is the answer.", &[])
+            .await;
         assert_eq!(v, Verdict::Accept);
     }
 
@@ -164,7 +166,10 @@ mod tests {
             },
             Verdict::Accept,
         ]);
-        assert!(matches!(c.judge("t", "r1", &[]).await, Verdict::Reject { .. }));
+        assert!(matches!(
+            c.judge("t", "r1", &[]).await,
+            Verdict::Reject { .. }
+        ));
         assert_eq!(c.judge("t", "r2", &[]).await, Verdict::Accept);
         // Underflow defaults to Accept so a misconfigured test
         // doesn't hang the harness loop.

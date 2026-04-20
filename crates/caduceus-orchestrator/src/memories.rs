@@ -446,7 +446,10 @@ mod tests {
     #[async_trait]
     impl MemoryDistiller for MockDistiller {
         async fn distill(&self, transcript: &str) -> Result<Vec<ExtractedMemory>, MemoryError> {
-            self.transcripts.lock().unwrap().push(transcript.to_string());
+            self.transcripts
+                .lock()
+                .unwrap()
+                .push(transcript.to_string());
             let mut q = self.next.lock().unwrap();
             if q.is_empty() {
                 Ok(Vec::new())
@@ -540,7 +543,10 @@ mod tests {
             .await
             .unwrap();
         assert!(new.is_empty());
-        assert!(transcripts.lock().unwrap().is_empty(), "must NOT call distiller");
+        assert!(
+            transcripts.lock().unwrap().is_empty(),
+            "must NOT call distiller"
+        );
         assert!(store.read_all().await.unwrap().is_empty());
     }
 
@@ -556,7 +562,12 @@ mod tests {
         let extractor = MemoryExtractor::new(mock, store.clone()).min_messages(2);
 
         let messages: Vec<Message> = (0..6)
-            .map(|i| msg(if i % 2 == 0 { "user" } else { "assistant" }, &format!("turn {i}")))
+            .map(|i| {
+                msg(
+                    if i % 2 == 0 { "user" } else { "assistant" },
+                    &format!("turn {i}"),
+                )
+            })
             .collect();
         let new = extractor.extract_and_persist(&messages).await.unwrap();
         assert_eq!(new.len(), 2);
@@ -578,8 +589,7 @@ mod tests {
             em(MemoryCategory::Convention, "Use #[must_use] on builders"),
         ]]);
         let extractor = MemoryExtractor::new(mock, store.clone()).min_messages(2);
-        let messages: Vec<Message> =
-            (0..4).map(|i| msg("user", &format!("m{i}"))).collect();
+        let messages: Vec<Message> = (0..4).map(|i| msg("user", &format!("m{i}"))).collect();
         let new = extractor.extract_and_persist(&messages).await.unwrap();
         assert_eq!(new.len(), 1);
         assert_eq!(new[0].content, "Use #[must_use] on builders");
@@ -598,11 +608,19 @@ mod tests {
 
         // Multi-byte chars to ensure the boundary logic does not panic.
         let long = "✨".repeat(2_000);
-        let messages = vec![msg("user", &long), msg("assistant", &long), msg("user", "ok")];
+        let messages = vec![
+            msg("user", &long),
+            msg("assistant", &long),
+            msg("user", "ok"),
+        ];
         let _ = extractor.extract_and_persist(&messages).await.unwrap();
         let t = transcripts.lock().unwrap();
         assert_eq!(t.len(), 1);
-        assert!(t[0].len() <= 512 + 8, "transcript not truncated: {}", t[0].len());
+        assert!(
+            t[0].len() <= 512 + 8,
+            "transcript not truncated: {}",
+            t[0].len()
+        );
     }
 
     #[tokio::test]
@@ -632,8 +650,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = MemoryStore::new(tmp.path().join("memory.md"));
         let extractor = MemoryExtractor::new(Failing, store).min_messages(2);
-        let messages: Vec<Message> =
-            (0..4).map(|i| msg("user", &format!("m{i}"))).collect();
+        let messages: Vec<Message> = (0..4).map(|i| msg("user", &format!("m{i}"))).collect();
         let err = extractor.extract_and_persist(&messages).await.unwrap_err();
         assert!(matches!(err, MemoryError::Distiller(_)));
     }
@@ -651,9 +668,8 @@ mod tests {
 
     #[test]
     fn parse_json_strips_code_fences_and_unknown_categories() {
-        let out = parse_distiller_json(
-            "```json\n[{\"category\":\"weird\",\"content\":\"x\"}]\n```",
-        );
+        let out =
+            parse_distiller_json("```json\n[{\"category\":\"weird\",\"content\":\"x\"}]\n```");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].category, MemoryCategory::Other);
     }
@@ -680,8 +696,7 @@ mod tests {
             ))
         });
         let extractor = MemoryExtractor::new(distiller, store.clone()).min_messages(2);
-        let messages: Vec<Message> =
-            (0..4).map(|i| msg("user", &format!("m{i}"))).collect();
+        let messages: Vec<Message> = (0..4).map(|i| msg("user", &format!("m{i}"))).collect();
         let new = extractor.extract_and_persist(&messages).await.unwrap();
         assert_eq!(new.len(), 1);
         assert_eq!(new[0].content, "closure works");

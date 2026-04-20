@@ -62,11 +62,7 @@ impl std::fmt::Debug for BroadcastBus {
             .field("capacity", &self.capacity)
             .field(
                 "channel_count",
-                &self
-                    .inner
-                    .lock()
-                    .map(|m| m.len())
-                    .unwrap_or(0),
+                &self.inner.lock().map(|m| m.len()).unwrap_or(0),
             )
             .finish()
     }
@@ -289,15 +285,16 @@ mod tests {
         // ordering — just that recv doesn't deadlock and receives
         // at least one message.
         let mut count = 0;
-        while let Ok(Ok(_)) =
-            tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
-        {
+        while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
             count += 1;
             if count > 200 {
                 break;
             }
         }
-        assert!(count > 0, "broadcast bus delivered nothing under contention");
+        assert!(
+            count > 0,
+            "broadcast bus delivered nothing under contention"
+        );
     }
 
     #[test]

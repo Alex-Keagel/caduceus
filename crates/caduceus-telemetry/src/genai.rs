@@ -182,10 +182,7 @@ impl GenAiMapper {
                     GenAiValue::Int(*iteration as i64),
                 );
                 GenAiSpan {
-                    name: format!(
-                        "chat {}",
-                        ctx.default_model.as_deref().unwrap_or("unknown")
-                    ),
+                    name: format!("chat {}", ctx.default_model.as_deref().unwrap_or("unknown")),
                     attributes: attrs,
                 }
             }
@@ -235,17 +232,10 @@ impl GenAiMapper {
                 }
             }
 
-            AgentEvent::ToolResultEnd {
-                id,
-                is_error,
-                ..
-            } => {
+            AgentEvent::ToolResultEnd { id, is_error, .. } => {
                 attrs.insert("gen_ai.operation.name".into(), "execute_tool".into());
                 attrs.insert("gen_ai.tool.call.id".into(), id.0.clone().into());
-                attrs.insert(
-                    "caduceus.tool.is_error".into(),
-                    GenAiValue::Bool(*is_error),
-                );
+                attrs.insert("caduceus.tool.is_error".into(), GenAiValue::Bool(*is_error));
                 GenAiSpan {
                     name: "execute_tool.result".into(),
                     attributes: attrs,
@@ -284,11 +274,12 @@ impl GenAiMapper {
             }
 
             // ── Permission / HITL ────────────────────────────────────
-            AgentEvent::PermissionDecision { id, capability, outcome } => {
-                attrs.insert(
-                    "gen_ai.operation.name".into(),
-                    "human_in_the_loop".into(),
-                );
+            AgentEvent::PermissionDecision {
+                id,
+                capability,
+                outcome,
+            } => {
+                attrs.insert("gen_ai.operation.name".into(), "human_in_the_loop".into());
                 attrs.insert("caduceus.permission.id".into(), id.clone().into());
                 attrs.insert(
                     "caduceus.permission.capability".into(),
@@ -314,10 +305,7 @@ impl GenAiMapper {
                 ..
             } => {
                 attrs.insert("gen_ai.operation.name".into(), "chat".into());
-                attrs.insert(
-                    "gen_ai.request.model".into(),
-                    critic_model.clone().into(),
-                );
+                attrs.insert("gen_ai.request.model".into(), critic_model.clone().into());
                 attrs.insert("caduceus.critique.denied".into(), GenAiValue::Bool(*denied));
                 if !*denied {
                     attrs.insert(
@@ -347,7 +335,9 @@ impl GenAiMapper {
             _ => return None,
         };
 
-        Some(finalise(span, ctx, /* respect_step_override = */ false))
+        Some(finalise(
+            span, ctx, /* respect_step_override = */ false,
+        ))
     }
 }
 
@@ -367,8 +357,10 @@ fn finalise(mut span: GenAiSpan, ctx: &GenAiContext, respect_step_override: bool
             .or_insert_with(|| m.clone().into());
     }
     if !respect_step_override {
-        span.attributes
-            .insert("caduceus.step_id".into(), GenAiValue::Int(ctx.current_step as i64));
+        span.attributes.insert(
+            "caduceus.step_id".into(),
+            GenAiValue::Int(ctx.current_step as i64),
+        );
     }
     span
 }
@@ -387,8 +379,10 @@ fn finalise_with_model_override(
         "gen_ai.conversation.id".into(),
         ctx.conversation_id.clone().into(),
     );
-    span.attributes
-        .insert("caduceus.step_id".into(), GenAiValue::Int(ctx.current_step as i64));
+    span.attributes.insert(
+        "caduceus.step_id".into(),
+        GenAiValue::Int(ctx.current_step as i64),
+    );
     // gen_ai.request.model was set by the caller to the override value.
     span
 }
@@ -489,24 +483,11 @@ mod tests {
 
     #[test]
     fn maps_thinking_started_to_chat_span() {
-        let span = GenAiMapper::map(
-            &AgentEvent::ThinkingStarted { iteration: 0 },
-            &ctx(),
-        )
-        .unwrap();
+        let span = GenAiMapper::map(&AgentEvent::ThinkingStarted { iteration: 0 }, &ctx()).unwrap();
         assert_eq!(span.name, "chat claude-opus-4.6");
-        assert_eq!(
-            span.attr("gen_ai.operation.name"),
-            Some(&"chat".into())
-        );
-        assert_eq!(
-            span.attr("gen_ai.system"),
-            Some(&"anthropic".into())
-        );
-        assert_eq!(
-            span.attr("gen_ai.conversation.id"),
-            Some(&"conv_42".into())
-        );
+        assert_eq!(span.attr("gen_ai.operation.name"), Some(&"chat".into()));
+        assert_eq!(span.attr("gen_ai.system"), Some(&"anthropic".into()));
+        assert_eq!(span.attr("gen_ai.conversation.id"), Some(&"conv_42".into()));
         assert_eq!(
             span.attr("gen_ai.request.model"),
             Some(&"claude-opus-4.6".into())
@@ -529,8 +510,14 @@ mod tests {
             &ctx(),
         )
         .unwrap();
-        assert_eq!(span.attr("gen_ai.usage.input_tokens"), Some(&GenAiValue::Int(100)));
-        assert_eq!(span.attr("gen_ai.usage.output_tokens"), Some(&GenAiValue::Int(200)));
+        assert_eq!(
+            span.attr("gen_ai.usage.input_tokens"),
+            Some(&GenAiValue::Int(100))
+        );
+        assert_eq!(
+            span.attr("gen_ai.usage.output_tokens"),
+            Some(&GenAiValue::Int(200))
+        );
         assert_eq!(
             span.attr("gen_ai.response.finish_reasons"),
             Some(&"[\"stop\"]".into())
@@ -558,8 +545,7 @@ mod tests {
 
     #[test]
     fn maps_step_started_uses_event_step_not_context_step() {
-        let span = GenAiMapper::map(&AgentEvent::StepStarted { step_id: 9 }, &ctx())
-            .unwrap();
+        let span = GenAiMapper::map(&AgentEvent::StepStarted { step_id: 9 }, &ctx()).unwrap();
         // Critical: the step *event itself* carries the new step id;
         // we must NOT clobber it with the context's stale value (3).
         // Otherwise OTel traces would show every step span pinned to
@@ -577,7 +563,10 @@ mod tests {
             &ctx(),
         )
         .unwrap();
-        assert_eq!(span.attr("caduceus.step.ok"), Some(&GenAiValue::Bool(false)));
+        assert_eq!(
+            span.attr("caduceus.step.ok"),
+            Some(&GenAiValue::Bool(false))
+        );
         assert_eq!(span.attr("caduceus.step_id"), Some(&GenAiValue::Int(5)));
     }
 
@@ -678,7 +667,10 @@ mod tests {
         let exp = JsonlGenAiExporter::new();
         let s1 = GenAiMapper::map(&AgentEvent::StepStarted { step_id: 1 }, &ctx()).unwrap();
         let s2 = GenAiMapper::map(
-            &AgentEvent::StepCompleted { step_id: 1, ok: true },
+            &AgentEvent::StepCompleted {
+                step_id: 1,
+                ok: true,
+            },
             &ctx(),
         )
         .unwrap();

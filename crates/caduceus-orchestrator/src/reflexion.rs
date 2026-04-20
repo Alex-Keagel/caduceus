@@ -123,7 +123,10 @@ impl Reflector for HeuristicReflector {
                         act.trim(),
                         first_line
                     ),
-                    _ => format!("Previous attempt failed: {}. Avoid the same path.", first_line),
+                    _ => format!(
+                        "Previous attempt failed: {}. Avoid the same path.",
+                        first_line
+                    ),
                 };
                 Some(Reflection::new(task_tag, lesson))
             }
@@ -250,11 +253,7 @@ impl ReflexionMemory {
     /// [`Self::recent_for`]. **This method REINFORCES the returned entries**
     /// (bumps strength + last_accessed) so frequently‑recalled lessons
     /// decay slower — the spaced‑repetition effect.
-    pub fn recent_for_with_decay(
-        &mut self,
-        task_tag: &str,
-        max_n: usize,
-    ) -> Vec<Reflection> {
+    pub fn recent_for_with_decay(&mut self, task_tag: &str, max_n: usize) -> Vec<Reflection> {
         let Some(hl) = self.decay_half_life else {
             return self.recent_for(task_tag, max_n);
         };
@@ -266,9 +265,7 @@ impl ReflexionMemory {
             .iter()
             .enumerate()
             .rev()
-            .filter(|(_, r)| {
-                r.task_tag == task_tag && r.recall_strength(now, hl) >= threshold
-            })
+            .filter(|(_, r)| r.task_tag == task_tag && r.recall_strength(now, hl) >= threshold)
             .take(max_n)
             .map(|(i, _)| i)
             .collect();

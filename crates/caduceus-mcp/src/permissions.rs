@@ -127,11 +127,7 @@ impl PermissionedMcpManager {
     /// Register a server config. The server is added to the underlying
     /// manager but a `Pending` policy entry is created so it cannot be
     /// invoked until the caller explicitly approves it.
-    pub async fn register_server(
-        &self,
-        config: McpServerConfig,
-        connect: bool,
-    ) -> Result<()> {
+    pub async fn register_server(&self, config: McpServerConfig, connect: bool) -> Result<()> {
         let id = config.id.clone();
         self.inner.add_server(config, connect).await?;
         let mut policies = self.policies.write().await;
@@ -281,13 +277,8 @@ impl PermissionedMcpManager {
     ) -> Result<Value> {
         let decision = self.check(server_id, tool_name).await;
         if decision != PermissionDecision::Approved {
-            self.audit_push(
-                server_id,
-                tool_name,
-                "denied",
-                &format!("{decision:?}"),
-            )
-            .await;
+            self.audit_push(server_id, tool_name, "denied", &format!("{decision:?}"))
+                .await;
             return Err(McpError::PermissionDenied(format!(
                 "{server_id}/{tool_name}: {decision:?}"
             )));
@@ -297,7 +288,8 @@ impl PermissionedMcpManager {
             Ok(_) => ("ok", String::from("approved")),
             Err(e) => ("error", e.to_string()),
         };
-        self.audit_push(server_id, tool_name, outcome, &detail).await;
+        self.audit_push(server_id, tool_name, outcome, &detail)
+            .await;
         result
     }
 
@@ -372,7 +364,10 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(mgr.check("srv-a", "read").await, PermissionDecision::Approved);
+        assert_eq!(
+            mgr.check("srv-a", "read").await,
+            PermissionDecision::Approved
+        );
         assert_eq!(
             mgr.check("srv-a", "delete").await,
             PermissionDecision::ToolNotAllowed
@@ -390,9 +385,18 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(mgr.check("srv-a", "read").await, PermissionDecision::Approved);
-        assert_eq!(mgr.check("srv-a", "delete").await, PermissionDecision::ToolDenied);
-        assert_eq!(mgr.check("srv-a", "exec").await, PermissionDecision::ToolDenied);
+        assert_eq!(
+            mgr.check("srv-a", "read").await,
+            PermissionDecision::Approved
+        );
+        assert_eq!(
+            mgr.check("srv-a", "delete").await,
+            PermissionDecision::ToolDenied
+        );
+        assert_eq!(
+            mgr.check("srv-a", "exec").await,
+            PermissionDecision::ToolDenied
+        );
     }
 
     #[tokio::test]
@@ -441,11 +445,12 @@ mod tests {
 
     #[tokio::test]
     async fn audit_log_fifo_trims_to_cap() {
-        let mgr = PermissionedMcpManager::new(Arc::new(McpServerManager::new()))
-            .with_audit_cap(3);
+        let mgr = PermissionedMcpManager::new(Arc::new(McpServerManager::new())).with_audit_cap(3);
         mgr.register_server(cfg("srv-a"), false).await.unwrap();
         for i in 0..5 {
-            let _ = mgr.call_tool("srv-a", &format!("tool-{i}"), Value::Null).await;
+            let _ = mgr
+                .call_tool("srv-a", &format!("tool-{i}"), Value::Null)
+                .await;
         }
         let log = mgr.audit_log().await;
         assert_eq!(log.len(), 3);

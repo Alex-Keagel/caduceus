@@ -288,12 +288,7 @@ where
             }
         }
         for child in &new_frontier {
-            if child.terminal
-                && best
-                    .as_ref()
-                    .map(|b| child.score > b.score)
-                    .unwrap_or(true)
-            {
+            if child.terminal && best.as_ref().map(|b| child.score > b.score).unwrap_or(true) {
                 best = Some(child.clone());
             }
         }
@@ -304,9 +299,10 @@ where
     }
 
     if best.is_none() {
-        if let Some(top) = frontier.iter().max_by(|a, b| {
-            a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal)
-        }) {
+        if let Some(top) = frontier
+            .iter()
+            .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal))
+        {
             best = Some(top.clone());
         }
     }
@@ -377,11 +373,11 @@ mod tests {
         // First call: scorer for root → 0.1
         // Then alternating expand/score pairs until terminal hit.
         let responses = vec![
-            final_resp("0.1"),               // root score
-            final_resp("a\nb DONE.\nc"),     // expand root → 3 children
-            final_resp("0.3"),               // score 'a'
-            final_resp("0.9"),               // score 'b' (terminal)
-            final_resp("0.2"),               // score 'c'
+            final_resp("0.1"),           // root score
+            final_resp("a\nb DONE.\nc"), // expand root → 3 children
+            final_resp("0.3"),           // score 'a'
+            final_resp("0.9"),           // score 'b' (terminal)
+            final_resp("0.2"),           // score 'c'
         ];
         let adapter = Arc::new(caduceus_providers::mock::MockLlmAdapter::new(responses));
         let exp = LlmExpander::new(adapter.clone(), "mock");
@@ -391,7 +387,9 @@ mod tests {
             beam_width: 1,
             max_depth: 3,
         };
-        let result = search_async(cfg, "root".to_string(), &exp, &scr).await.unwrap();
+        let result = search_async(cfg, "root".to_string(), &exp, &scr)
+            .await
+            .unwrap();
         let best = result.best.expect("must find a terminal");
         assert_eq!(best.thought, "b");
         assert!(best.terminal);

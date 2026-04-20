@@ -438,7 +438,8 @@ mod tests {
                 args: vec![],
                 env: HashMap::new(),
             },
-            auto_start: false, trust_tier: crate::types::TrustTier::Trusted,
+            auto_start: false,
+            trust_tier: crate::types::TrustTier::Trusted,
         };
         let client = McpClient::new(cfg);
         assert_eq!(client.status, ServerStatus::Stopped);

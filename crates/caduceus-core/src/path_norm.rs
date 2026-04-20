@@ -46,7 +46,10 @@ pub fn normalize_lex(input: &str) -> String {
     // drive letters — caduceus runs on Linux/macOS in practice and
     // treating `C:\\foo` as a relative path is fine for cache-key
     // purposes (it would still hash consistently with itself).
-    let folded: String = input.chars().map(|c| if c == '\\' { '/' } else { c }).collect();
+    let folded: String = input
+        .chars()
+        .map(|c| if c == '\\' { '/' } else { c })
+        .collect();
 
     let is_absolute = folded.starts_with('/');
     let mut stack: Vec<&str> = Vec::new();

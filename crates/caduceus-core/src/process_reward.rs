@@ -216,8 +216,7 @@ impl EnsembleStepVerifier {
             match combiner {
                 EnsembleCombiner::Mean => "mean".to_string(),
                 EnsembleCombiner::Median => "median".to_string(),
-                EnsembleCombiner::Threshold(f) =>
-                    format!("threshold({:.2})", f.clamp(0.0, 1.0)),
+                EnsembleCombiner::Threshold(f) => format!("threshold({:.2})", f.clamp(0.0, 1.0)),
             }
         );
         Self {
@@ -276,10 +275,7 @@ impl StepVerifier for EnsembleStepVerifier {
             }
         };
 
-        let rationale = format!(
-            "{} of {} members scored positive",
-            positive, total
-        );
+        let rationale = format!("{} of {} members scored positive", positive, total);
         StepScore::new(combined, rationale, self.name())
     }
 }
@@ -404,7 +400,11 @@ mod tests {
         let e = EnsembleStepVerifier::new(members, EnsembleCombiner::Mean);
         let s = e.score(&step()).await;
         assert!((s.reward - 0.0).abs() < 1e-6, "mean of 1,0,-1 = 0");
-        assert!(s.rationale.contains("1 of 3"), "rationale = {}", s.rationale);
+        assert!(
+            s.rationale.contains("1 of 3"),
+            "rationale = {}",
+            s.rationale
+        );
     }
 
     #[tokio::test]
@@ -447,10 +447,8 @@ mod tests {
 
     #[tokio::test]
     async fn ensemble_source_tag_includes_combiner_name() {
-        let e = EnsembleStepVerifier::new(
-            vec![Arc::new(FixedVerifier(1.0))],
-            EnsembleCombiner::Mean,
-        );
+        let e =
+            EnsembleStepVerifier::new(vec![Arc::new(FixedVerifier(1.0))], EnsembleCombiner::Mean);
         let s = e.score(&step()).await;
         assert_eq!(s.source, "chain-of-verifiers:mean");
     }

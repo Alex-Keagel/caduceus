@@ -45,9 +45,7 @@
 //!
 //! System groups are always kept and do NOT count against `budget`.
 
-use crate::compaction::{
-    CompactionResult, CompactionStrategy, MessageGroup, MessageGroupKind,
-};
+use crate::compaction::{CompactionResult, CompactionStrategy, MessageGroup, MessageGroupKind};
 
 /// Tunable weights and metadata for [`PriorityScoreStrategy`].
 #[derive(Debug, Clone)]
@@ -100,12 +98,7 @@ impl UnitScorer {
     /// Compute raw score for a group. `idx_from_end` is 0 for the
     /// most recent non‑system group. `is_first_user` flags the very
     /// first user turn in the conversation.
-    pub fn score_group(
-        &self,
-        g: &MessageGroup,
-        idx_from_end: usize,
-        is_first_user: bool,
-    ) -> f32 {
+    pub fn score_group(&self, g: &MessageGroup, idx_from_end: usize, is_first_user: bool) -> f32 {
         let recency = 1.0 / (1.0 + idx_from_end as f32);
         let relevance = if self.query_terms.is_empty() {
             0.0
@@ -123,10 +116,12 @@ impl UnitScorer {
                 .count();
             hits as f32 / self.query_terms.len() as f32
         };
-        let importance = if g.is_atomic() || is_first_user { 1.0 } else { 0.0 };
-        self.w_recency * recency
-            + self.w_relevance * relevance
-            + self.w_importance * importance
+        let importance = if g.is_atomic() || is_first_user {
+            1.0
+        } else {
+            0.0
+        };
+        self.w_recency * recency + self.w_relevance * relevance + self.w_importance * importance
     }
 }
 
@@ -153,9 +148,8 @@ impl CompactionStrategy for PriorityScoreStrategy {
         // 1. Identify non-system groups; compute end-relative index
         //    and "is_first_user" flags.
         let total = groups.len();
-        let mut non_sys_indices: Vec<usize> = (0..total)
-            .filter(|&i| !groups[i].is_system())
-            .collect();
+        let mut non_sys_indices: Vec<usize> =
+            (0..total).filter(|&i| !groups[i].is_system()).collect();
         if non_sys_indices.is_empty() {
             return CompactionResult {
                 removed_tokens: 0,
@@ -165,9 +159,10 @@ impl CompactionStrategy for PriorityScoreStrategy {
         }
 
         // First user turn: earliest non-system group whose kind is User.
-        let first_user_idx = non_sys_indices.iter().find(|&&i| {
-            matches!(groups[i].kind, MessageGroupKind::User)
-        }).copied();
+        let first_user_idx = non_sys_indices
+            .iter()
+            .find(|&&i| matches!(groups[i].kind, MessageGroupKind::User))
+            .copied();
 
         let last_non_sys_pos = non_sys_indices.len() - 1;
         let pin_set: std::collections::HashSet<usize> =
