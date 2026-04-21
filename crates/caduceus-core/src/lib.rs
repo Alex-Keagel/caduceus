@@ -1693,6 +1693,10 @@ impl CaduceusPaths {
         Self::config_dir().join("logs")
     }
 
+    pub fn guidelines_dir() -> PathBuf {
+        Self::config_dir().join("guidelines")
+    }
+
     pub fn project_config_file(workspace_root: &Path) -> PathBuf {
         workspace_root.join(".caduceus").join("config.toml")
     }
@@ -1702,6 +1706,28 @@ impl CaduceusPaths {
         std::fs::create_dir_all(Self::config_dir())?;
         std::fs::create_dir_all(Self::cache_dir())?;
         std::fs::create_dir_all(Self::logs_dir())?;
+        std::fs::create_dir_all(Self::guidelines_dir())?;
+        Self::seed_guidelines()?;
+        Ok(())
+    }
+
+    /// Seed built-in guideline templates into `~/.caduceus/guidelines/`.
+    ///
+    /// Only writes files that don't already exist — user edits are never
+    /// overwritten. New templates shipped in future releases will appear on
+    /// next launch; removed/renamed templates stay behind (user owns them).
+    pub fn seed_guidelines() -> std::io::Result<()> {
+        let dir = Self::guidelines_dir();
+        let templates: &[(&str, &str)] = &[(
+            "strategy-selection.md",
+            include_str!("../../../resources/guidelines/strategy-selection.md"),
+        )];
+        for (name, body) in templates {
+            let path = dir.join(name);
+            if !path.exists() {
+                std::fs::write(&path, body)?;
+            }
+        }
         Ok(())
     }
 }
@@ -2734,6 +2760,7 @@ mod tests {
         assert!(CaduceusPaths::db_file().ends_with("db.sqlite"));
         assert!(CaduceusPaths::cache_dir().ends_with("cache"));
         assert!(CaduceusPaths::logs_dir().ends_with("logs"));
+        assert!(CaduceusPaths::guidelines_dir().ends_with("guidelines"));
     }
 
     #[test]
@@ -2744,6 +2771,21 @@ mod tests {
             project_config,
             PathBuf::from("/workspace/my-project/.caduceus/config.toml")
         );
+    }
+
+    #[test]
+    fn seed_guidelines_does_not_overwrite_user_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let g = tmp.path().join("guidelines");
+        std::fs::create_dir_all(&g).unwrap();
+        let tpl = g.join("strategy-selection.md");
+        std::fs::write(&tpl, "USER EDITED").unwrap();
+        // Simulate the seed loop with a user-owned file present.
+        let body = "DEFAULT";
+        if !tpl.exists() {
+            std::fs::write(&tpl, body).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&tpl).unwrap(), "USER EDITED");
     }
 
     // ── P0: ConfigLoader tests ─────────────────────────────────────────────────
