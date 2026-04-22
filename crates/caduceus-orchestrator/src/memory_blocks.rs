@@ -56,7 +56,7 @@ pub struct MemoryBlocks {
     pub persona: String,
     pub project_context: String,
     pub working_history: VecDeque<WorkingMessage>,
-    pub archival_summary: Vec<ArchivalSummary>,
+    pub archival_summary: VecDeque<ArchivalSummary>,
     /// Token budget per block. Hard caps; compaction triggers when a
     /// block's used tokens exceed its budget.
     pub limits: BlockLimits,
@@ -151,7 +151,7 @@ impl MemoryBlocks {
     }
 
     pub fn append_archival(&mut self, summary: ArchivalSummary) {
-        self.archival_summary.push(summary);
+        self.archival_summary.push_back(summary);
     }
 
     /// Sum of approx tokens currently in working_history.
@@ -221,8 +221,8 @@ impl MemoryBlocks {
         while self.archival_tokens() > self.limits.archival_summary_tokens
             && self.archival_summary.len() >= 2
         {
-            let a = self.archival_summary.remove(0);
-            let b = self.archival_summary.remove(0);
+            let a = self.archival_summary.pop_front().expect("len >= 2 checked");
+            let b = self.archival_summary.pop_front().expect("len >= 2 checked");
             let merged = ArchivalSummary {
                 text: format!("{}\n---\n{}", a.text, b.text),
                 // Lossy merge: keep the larger of the two, NOT the
@@ -233,7 +233,7 @@ impl MemoryBlocks {
                     .saturating_add(b.replaced_entries)
                     .saturating_add(1),
             };
-            self.archival_summary.insert(0, merged);
+            self.archival_summary.push_front(merged);
             report.archival_merged += 1;
         }
 
