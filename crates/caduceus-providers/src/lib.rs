@@ -639,11 +639,8 @@ enum AnthropicContentBlock {
     Text { text: String },
     #[serde(rename = "tool_use")]
     ToolUse {
-        #[allow(dead_code)]
         id: String,
-        #[allow(dead_code)]
         name: String,
-        #[allow(dead_code)]
         input: serde_json::Value,
     },
 }
@@ -1202,20 +1199,43 @@ fn parse_openai_chat_response(body: &str) -> Result<ChatResponse> {
         })
         .unwrap_or((0, 0, 0));
 
-    // Extract tool calls from OpenAI format
+    // Extract tool calls from OpenAI format.
+    //
+    // ST-A7 / audit I11: previously malformed JSON in `tc.function.arguments`
+    // was silently coerced to `Value::Null` via `unwrap_or_default()`, which
+    // fed the tool handler a bogus input and masked upstream provider bugs.
+    // We now surface the parse error. An empty string (common for zero-arg
+    // tools) is treated as an empty object, matching tool-schema expectation.
     let tool_calls: Vec<ToolUse> = choice
         .message
         .as_ref()
         .and_then(|m| m.tool_calls.as_ref())
         .map(|tcs| {
             tcs.iter()
-                .map(|tc| ToolUse {
-                    id: tc.id.clone(),
-                    name: tc.function.name.clone(),
-                    input: serde_json::from_str(&tc.function.arguments).unwrap_or_default(),
+                .map(|tc| {
+                    let raw = tc.function.arguments.trim();
+                    let input = if raw.is_empty() {
+                        serde_json::Value::Object(serde_json::Map::new())
+                    } else {
+                        serde_json::from_str(raw).map_err(|e| {
+                            CaduceusError::Provider(format!(
+                                "Malformed tool_call arguments for {} (id={}): {} (raw: {})",
+                                tc.function.name,
+                                tc.id,
+                                e,
+                                &raw[..raw.len().min(200)]
+                            ))
+                        })?
+                    };
+                    Ok::<_, CaduceusError>(ToolUse {
+                        id: tc.id.clone(),
+                        name: tc.function.name.clone(),
+                        input,
+                    })
                 })
-                .collect()
+                .collect::<Result<Vec<_>>>()
         })
+        .transpose()?
         .unwrap_or_default();
 
     // Aggregate per-token logprobs into a summary if the response carries
@@ -3174,6 +3194,81 @@ mod tests {
         let body2 = build_openai_request_body(&request2, false, true);
         assert_eq!(body2["tool_choice"]["type"], "function");
         assert_eq!(body2["tool_choice"]["function"]["name"], "my_func");
+    }
+
+    // ── ST-A7 / audit I11: tool_call arguments parse semantics ────────
+    #[test]
+    fn malformed_tool_call_arguments_surface_error() {
+        let body = r#"{
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "foo", "arguments": "{not json" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }"#;
+        let err = parse_openai_chat_response(body).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Malformed tool_call arguments for foo"),
+            "expected named-tool error, got: {msg}"
+        );
+        assert!(
+            msg.contains("call_1"),
+            "expected tool_call id in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_tool_call_arguments_become_empty_object() {
+        let body = r#"{
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_0",
+                        "type": "function",
+                        "function": { "name": "noop", "arguments": "" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }"#;
+        let resp = parse_openai_chat_response(body).expect("should parse");
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert!(resp.tool_calls[0].input.is_object());
+        assert_eq!(
+            resp.tool_calls[0].input.as_object().unwrap().len(),
+            0,
+            "empty-args should be empty object"
+        );
+    }
+
+    #[test]
+    fn valid_tool_call_arguments_parse() {
+        let body = r#"{
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_2",
+                        "type": "function",
+                        "function": { "name": "fetch", "arguments": "{\"url\":\"https://x\"}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }"#;
+        let resp = parse_openai_chat_response(body).expect("should parse");
+        assert_eq!(resp.tool_calls[0].input["url"], "https://x");
     }
 
     // ── Response format tests ──────────────────────────────────────────
