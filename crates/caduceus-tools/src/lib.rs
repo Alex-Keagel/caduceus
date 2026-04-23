@@ -2315,7 +2315,12 @@ impl Tool for ReplTool {
             "node" => ("node", vec!["-e".to_string(), parsed.code.clone()]),
             other => return Ok(tool_error(format!("unsupported language: {other}"))),
         };
-        let output = match tokio::process::Command::new(cmd).args(&args).output().await {
+        let output = match tokio::process::Command::new(cmd)
+            .args(&args)
+            .kill_on_drop(true)
+            .output()
+            .await
+        {
             Ok(output) => output,
             Err(err) => return Ok(tool_error(format!("failed to execute {cmd}: {err}"))),
         };
@@ -2378,6 +2383,7 @@ impl Tool for PowerShellTool {
         };
         let output = match tokio::process::Command::new("pwsh")
             .args(["-NoProfile", "-NonInteractive", "-Command", &parsed.command])
+            .kill_on_drop(true)
             .output()
             .await
         {
@@ -2863,6 +2869,7 @@ impl Tool for WorktreeEnterTool {
 
         let output = match tokio::process::Command::new("git")
             .args(["worktree", "add", &parsed.path, &parsed.branch])
+            .kill_on_drop(true)
             .output()
             .await
         {
@@ -2933,6 +2940,7 @@ impl Tool for WorktreeExitTool {
 
         let output = match tokio::process::Command::new("git")
             .args(["worktree", "remove", &parsed.path])
+            .kill_on_drop(true)
             .output()
             .await
         {
@@ -3131,6 +3139,7 @@ impl Tool for PdfExtractTool {
         }
         let output = match tokio::process::Command::new("pdftotext")
             .args([resolved.to_string_lossy().as_ref(), "-"])
+            .kill_on_drop(true)
             .output()
             .await
         {
@@ -3730,6 +3739,7 @@ impl Tool for DiagnosticsTool {
             match tokio::process::Command::new("cargo")
                 .args(["check", "--message-format=json"])
                 .current_dir(&project_path)
+                .kill_on_drop(true)
                 .output()
                 .await
             {
@@ -3740,6 +3750,7 @@ impl Tool for DiagnosticsTool {
             match tokio::process::Command::new("npx")
                 .args(["tsc", "--noEmit"])
                 .current_dir(&project_path)
+                .kill_on_drop(true)
                 .output()
                 .await
             {
@@ -4033,7 +4044,7 @@ impl SelfVerifier {
             .as_secs()
     }
 
-    pub fn run_tests(&mut self, command: &str) -> Result<VerificationResult> {
+    pub async fn run_tests(&mut self, command: &str) -> Result<VerificationResult> {
         let parts: Vec<&str> = command.split_whitespace().collect();
         if parts.is_empty() {
             return Err(CaduceusError::Tool {
@@ -4041,10 +4052,12 @@ impl SelfVerifier {
                 message: "Empty command".to_string(),
             });
         }
-        let output = std::process::Command::new(parts[0])
+        let output = tokio::process::Command::new(parts[0])
             .args(&parts[1..])
             .current_dir(&self.workspace)
+            .kill_on_drop(true)
             .output()
+            .await
             .map_err(|e| CaduceusError::Tool {
                 tool: "SelfVerifier".to_string(),
                 message: e.to_string(),
@@ -7252,10 +7265,10 @@ mod tests {
         assert!(!verifier.all_passed());
     }
 
-    #[test]
-    fn test_verifier_run_tests_echo() {
+    #[tokio::test]
+    async fn test_verifier_run_tests_echo() {
         let mut verifier = SelfVerifier::new(PathBuf::from("."));
-        let result = verifier.run_tests("echo hello").unwrap();
+        let result = verifier.run_tests("echo hello").await.unwrap();
         assert!(result.passed);
         assert!(result.output.contains("hello"));
         // artifact captured
@@ -7266,10 +7279,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_verifier_run_tests_failing_command() {
+    #[tokio::test]
+    async fn test_verifier_run_tests_failing_command() {
         let mut verifier = SelfVerifier::new(PathBuf::from("."));
-        let result = verifier.run_tests("false").unwrap();
+        let result = verifier.run_tests("false").await.unwrap();
         assert!(!result.passed);
     }
 

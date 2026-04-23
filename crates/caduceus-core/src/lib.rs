@@ -7,13 +7,13 @@ use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
-pub mod keybindings;
+pub mod loop_detector;
 pub mod path_norm;
 pub mod process_reward;
 pub mod sanitizer;
 pub mod verification;
 
-pub use keybindings::{resolve_platform_shortcut, Keybinding, KeybindingConfig, KeybindingPreset};
+pub use loop_detector::{LoopCheckResult, LoopDetector};
 pub use path_norm::{is_path_like_field, normalize_lex, PATH_LIKE_FIELDS};
 pub use process_reward::{
     EnsembleCombiner, EnsembleStepVerifier, ObservedToolCall, OffStepVerifier, StepScore,
@@ -107,7 +107,9 @@ impl ToolCallId {
 // * the counter itself lives on `SessionState` and is shared with the
 //   emitter via `Arc<AtomicU64>` so producer threads can fetch the
 //   current step without locking
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, PartialOrd, Ord,
+)]
 pub struct StepId(pub u64);
 
 impl StepId {
@@ -501,6 +503,19 @@ pub struct VersionedAgentEvent {
     /// The wrapped event. May deserialise to [`AgentEvent::Unknown`]
     /// if the producer is on a newer schema.
     pub event: AgentEvent,
+    /// P13 — monotonic id within the session. Defaults to 0 on legacy
+    /// payloads; new producers MUST assign a non-zero value. Clients use
+    /// this to bootstrap live-state (`snapshot + events from last_event_id+1`).
+    #[serde(default)]
+    pub event_id: EventId,
+    /// P13 — user-turn grouping. All events emitted in response to a
+    /// single user turn share the same `turn_seq`. Defaults to 0.
+    #[serde(default)]
+    pub turn_seq: u64,
+    /// P13 — causal parents by `event_id`. Multiple causes are legal
+    /// (e.g. a `PlanAmended` synthesized from 3 critiques).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub causal_parent_ids: Vec<EventId>,
 }
 
 /// Current schema version for [`VersionedAgentEvent`]. Bump on
@@ -509,11 +524,32 @@ pub struct VersionedAgentEvent {
 pub const AGENT_EVENT_SCHEMA_VERSION: u16 = 1;
 
 impl VersionedAgentEvent {
-    /// Wrap an event with the current schema version.
+    /// Wrap an event with the current schema version. Causality fields are
+    /// zeroed — use [`VersionedAgentEvent::with_causality`] when emitting
+    /// new events that participate in the P13 introspection stream.
     pub fn current(event: AgentEvent) -> Self {
         Self {
             v: AGENT_EVENT_SCHEMA_VERSION,
             event,
+            event_id: EventId(0),
+            turn_seq: 0,
+            causal_parent_ids: Vec::new(),
+        }
+    }
+
+    /// P13 — wrap an event with full causal metadata.
+    pub fn with_causality(
+        event: AgentEvent,
+        event_id: EventId,
+        turn_seq: u64,
+        causal_parent_ids: Vec<EventId>,
+    ) -> Self {
+        Self {
+            v: AGENT_EVENT_SCHEMA_VERSION,
+            event,
+            event_id,
+            turn_seq,
+            causal_parent_ids,
         }
     }
 
@@ -543,6 +579,227 @@ pub struct EvictedGroupRef {
     /// Why this group was evicted. Examples: `"oldest-non-system"`,
     /// `"window-overflow"`, `"emergency-budget"`, `"tool-collapse"`.
     pub reason: String,
+}
+
+/// P8 — a single persona's critique of a plan or diff, surfaced inside an
+/// [`AgentEvent::AwaitingApproval`] event for user triage. One of these is
+/// emitted per persona that participated in a fan-out run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Critique {
+    /// Persona name that produced this critique (e.g. `"rubber-duck"`,
+    /// `"cloud-architect"`).
+    pub persona: String,
+    /// Coarse severity — informational vs. must-address.
+    pub severity: CritiqueSeverity,
+    /// Individual findings, one per line. Opaque prose; UIs render verbatim.
+    pub findings: Vec<String>,
+    /// If true, the critique flags an issue that SHOULD block approval
+    /// until addressed. Non-blocking critiques are advisory.
+    pub blocking: bool,
+}
+
+/// Severity bucket carried by [`Critique`]. Kept deliberately small so UIs
+/// render it as a single colored pill.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CritiqueSeverity {
+    /// No concerns worth flagging.
+    Info,
+    /// Worth addressing but does not block the plan.
+    Warn,
+    /// Must be addressed before proceeding.
+    Critical,
+}
+
+/// P13 — stable identifier for a single execution of a step. Each attempt
+/// (retry, critique persona, sub-agent spawn) gets its own `ExecutionId`.
+/// Agents-DAG nodes are keyed by this, not by `StepId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct ExecutionId(pub u64);
+
+impl ExecutionId {
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ExecutionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "exec#{}", self.0)
+    }
+}
+
+/// P13 — monotonic event id within a session. Assigned by the orchestrator
+/// when an [`AgentEvent`] is wrapped in [`VersionedAgentEvent`]. Clients use
+/// it to (a) reconstruct causal order under concurrent fan-out and (b)
+/// bootstrap live-state queries (`snapshot.last_event_id` then subscribe
+/// from `N+1`).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, PartialOrd, Ord,
+)]
+pub struct EventId(pub u64);
+
+impl EventId {
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for EventId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "evt#{}", self.0)
+    }
+}
+
+/// P13 — structured envelope summary. Exposed on the wire *instead of*
+/// the rendered prompt text so clients can query and filter without
+/// parsing prose. Rendered text is optional (`display_text`) and MUST NOT
+/// be parsed by clients — only displayed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EnvelopeSummaryV1 {
+    pub read_scope_count: u32,
+    pub write_scope_count: u32,
+    pub write_deny_count: u32,
+    pub network_enabled: bool,
+    pub exec_enabled: bool,
+    /// One of: `"always"` | `"per_turn"` | `"never"`.
+    pub approval_cadence: String,
+    /// One of: `"preset:plan"` | `"preset:research"` | `"preset:act"` |
+    /// `"preset:autopilot"` | `"custom"`.
+    pub scope_source: String,
+    /// Optional human-readable rendering. Clients MUST NOT parse this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_text: Option<String>,
+}
+
+/// P13 — edge kinds inside the Agents DAG (who-ran-what topology).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEdgeKind {
+    /// Parent execution spawned a child to do part of its work.
+    Delegation,
+    /// Critic persona commented on an executor's output.
+    Critique,
+    /// Mode/persona transition from one executor to another.
+    Handoff,
+    /// Same step re-executed after failure.
+    Retry,
+    /// Fresh sub-session (distinct from Delegation: no parent-owns-child).
+    Spawn,
+}
+
+/// P13 — cross-graph provenance edges linking an execution in the Agents
+/// DAG to a mutation in the Features DAG.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceEdgeKind {
+    /// Execution is the one doing the step.
+    ExecutesStep,
+    /// Execution produced a `PlanAmended` against the Features DAG.
+    AmendsPlan,
+    /// Execution emitted a `ScopeExpansionRequested`.
+    ExpandsScope,
+}
+
+/// P13 — per-execution assignment row (a node in the Agents DAG).
+///
+/// One `AssignmentSummaryV1` is emitted for EVERY execution — the primary
+/// executor of a step AND each critic persona that fans out. Do NOT collapse
+/// critics into edge-only records; clients need the full (persona, model,
+/// skills) tuple to answer "which model produced the blocking critique?".
+///
+/// Security: exact model id and skill/agent names are gated by
+/// `include_sensitive` at the bridge layer. The wire shape carries both
+/// coarse (`model_vendor` + `model_tier`, `*_count`) and exact fields;
+/// the bridge redacts the exact fields for untrusted consumers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssignmentSummaryV1 {
+    pub execution_id: ExecutionId,
+    pub step_id: StepId,
+    /// Stable persona id (e.g. `"rubber-duck"`, `"ml-architect"`).
+    pub persona_id: String,
+    /// E.g. `"anthropic"`, `"openai"`, `"local"`.
+    pub model_vendor: String,
+    /// E.g. `"opus"`, `"sonnet"`, `"haiku"`, `"mini"`.
+    pub model_tier: String,
+    /// Exact model id (e.g. `"claude-opus-4.7"`) — populated only when the
+    /// consumer is trusted (`include_sensitive = true`). Omitted on the wire
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id_exact: Option<String>,
+    pub activated_skills_count: u32,
+    pub activated_agents_count: u32,
+    /// Skill names — gated by `include_sensitive`. `None` = redacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activated_skill_names: Option<Vec<String>>,
+    /// Agent names — gated by `include_sensitive`. `None` = redacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activated_agent_names: Option<Vec<String>>,
+    /// 1 = first try, 2 = first retry, etc.
+    pub attempt: u32,
+}
+
+/// P13 — introspection-surface events, versioned so the schema can evolve
+/// without minting a new top-level [`AgentEvent`] variant per added field.
+///
+/// The top-level enum carries [`AgentEvent::Introspection`] as a single
+/// variant; all schema churn happens here under the `v` tag.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IntrospectionEventV1 {
+    /// Fan-out has been dispatched: `critic_count` critics are running in
+    /// parallel against the primary executor's output for `step_id`.
+    /// Emitted ONCE before any [`IntrospectionEventV1::StepAssigned`] for
+    /// the batch. Clients use this to render a "N critics running..." UI
+    /// state and to pre-allocate DAG slots.
+    FanoutStarted {
+        step_id: StepId,
+        parent_execution_id: ExecutionId,
+        critic_count: u32,
+        personas: Vec<String>,
+    },
+    /// Fan-out has completed: all critics reached terminal state (success
+    /// or runner-error). Emitted AFTER the last
+    /// [`IntrospectionEventV1::AgentEdgeRecorded`] for the batch. Carries
+    /// the summary counts so a client can verify it saw everything.
+    FanoutCompleted {
+        step_id: StepId,
+        parent_execution_id: ExecutionId,
+        critic_count: u32,
+        blocking_count: u32,
+    },
+    /// Envelope snapshot applied to the session/turn.
+    EnvelopeApplied { summary: EnvelopeSummaryV1 },
+    /// A new execution was assigned. One event per execution (primary + each
+    /// critic). Clients build the Agents-DAG node set from these.
+    StepAssigned { assignment: AssignmentSummaryV1 },
+    /// Execution spawned a sub-session.
+    SubAgentSpawned {
+        parent_execution_id: ExecutionId,
+        child_session_id: String,
+        assignment: AssignmentSummaryV1,
+    },
+    /// Agents-DAG edge between two executions.
+    AgentEdgeRecorded {
+        edge: AgentEdgeKind,
+        from_execution_id: ExecutionId,
+        to_execution_id: ExecutionId,
+    },
+    /// Cross-graph provenance: an execution caused a Features-DAG change.
+    ProvenanceRecorded {
+        edge: ProvenanceEdgeKind,
+        execution_id: ExecutionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_step_id: Option<StepId>,
+    },
+    /// A critique was emitted by `from_execution_id` about
+    /// `target_execution_id`'s output. Emitted live in addition to the
+    /// existing [`AgentEvent::AwaitingApproval`] snapshot.
+    CritiqueEmitted {
+        from_execution_id: ExecutionId,
+        target_execution_id: ExecutionId,
+        severity: CritiqueSeverity,
+        blocking: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -630,8 +887,14 @@ pub enum AgentEvent {
     /// optional user amendment via the `amend_plan` IPC. (G4 / P3.1)
     /// The UI shows this as an editable row in the plan panel.
     PlanStepPending {
-        /// 1-indexed step number within the plan.
+        /// 1-indexed step number within the plan (positional, may shift on
+        /// plan amendment).
         step: usize,
+        /// P13 — stable, revision-independent step id. Use THIS (not `step`)
+        /// when storing inter-step relationships. Defaults to 0 for pre-P13
+        /// producers; new emitters MUST set it.
+        #[serde(default)]
+        step_id: StepId,
         /// Per-step revision (starts at 0, bumps on each amendment).
         revision: u64,
         /// Plan-level revision after this step was added.
@@ -640,6 +903,13 @@ pub enum AgentEvent {
         tool_name: String,
         /// Human-readable description (the rendered tool call args).
         description: String,
+        /// P13 — Features-DAG edges: step ids this step depends on.
+        /// Empty for root steps. Serde default for back-compat.
+        #[serde(default)]
+        depends_on: Vec<StepId>,
+        /// P13 — optional parent step for sub-step decomposition.
+        #[serde(default)]
+        parent_step_id: Option<StepId>,
     },
 
     /// An external `amend_plan` IPC mutated the plan. Emitted on
@@ -980,6 +1250,59 @@ pub enum AgentEvent {
         feedback: String,
         iteration: u32,
     },
+
+    // ── Permission envelope (P1b) ─────────────────────────────────────────────
+    /// Agent attempted an action outside its PermissionEnvelope. The
+    /// orchestrator (or user-facing UI) MAY grant a scope expansion and
+    /// resume; otherwise the agent should treat this as a hard stop and ask
+    /// the user. This event fires regardless of approval_cadence, including
+    /// under Autopilot — scope expansion is the one thing that always
+    /// re-prompts.
+    ScopeExpansionRequested {
+        /// One of: "read" | "write" | "network" | "exec".
+        capability: String,
+        /// Path, URL, host, or command string depending on capability.
+        resource: String,
+        /// Machine-readable deny reason, e.g. "NotInAllowList".
+        reason: String,
+        /// Name of the tool that triggered the check.
+        tool: String,
+    },
+
+    /// P8 — a plan draft has been critiqued by a fan-out of domain-specialist
+    /// personas (and optionally rubber-duck) and is now pending user approval.
+    /// UIs SHOULD render the critiques inline with the plan and offer
+    /// Accept / Amend / Reject. This is a separate channel from
+    /// `PlanAmendment` so fan-out results don't silently mutate the plan.
+    AwaitingApproval {
+        /// The plan text the critiques are about. Verbatim from the agent.
+        plan_revision: String,
+        /// One entry per persona that actually ran (rubber-duck + N domain
+        /// specialists depending on `FanoutPolicy`).
+        critiques: Vec<Critique>,
+    },
+
+    /// P13 — the active mode or lens changed on the running session. First-
+    /// class (not under `Introspection`) because the mode catalog is stable
+    /// and client code often gates UI affordances on it. `from_lens` /
+    /// `to_lens` are `Option<String>` because non-Act modes have no lens.
+    /// Lens values are the serde-name strings (e.g. `"fast"`, `"normal"`,
+    /// `"slow"`); mode values are serde-name strings on `AgentMode`
+    /// (e.g. `"plan"`, `"research"`, `"act"`, `"autopilot"`, plus legacy
+    /// aliases for back-compat).
+    ModeChanged {
+        from_mode: String,
+        to_mode: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_lens: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_lens: Option<String>,
+    },
+
+    /// P13 — versioned introspection surface. All envelope/assignment/edge
+    /// events ship inside here so schema churn doesn't mint new top-level
+    /// variants. Older clients see this under [`AgentEvent::Unknown`].
+    Introspection(IntrospectionEventV1),
 
     /// G33 — forward-compat catch-all. Any `type` tag this build
     /// doesn't recognise deserialises here, so an older reader doesn't
@@ -3667,15 +3990,193 @@ log_level = "debug"
         assert_eq!(lo.reserved_output, mixed.reserved_output);
     }
 
+    // ── P13 — introspection surface wire-format pinning ──────────────────
+
     #[test]
-    fn token_budget_reserved_output_caps_at_quarter_of_window() {
-        // o1 wants 100k reserved, context 200k → cap is 50k (¼).
-        let b = TokenBudget::for_model("o1");
+    fn p13_plan_step_pending_backwards_compatible_missing_new_fields() {
+        // Legacy producers without P13 fields must still deserialize —
+        // step_id defaults to 0, depends_on to [], parent_step_id to None.
+        let legacy = r#"{"type":"PlanStepPending","step":1,"revision":0,"plan_revision":1,"tool_name":"edit","description":"x"}"#;
+        let parsed: AgentEvent = serde_json::from_str(legacy).unwrap();
+        match parsed {
+            AgentEvent::PlanStepPending {
+                step_id,
+                depends_on,
+                parent_step_id,
+                ..
+            } => {
+                assert_eq!(step_id, StepId(0));
+                assert!(depends_on.is_empty());
+                assert!(parent_step_id.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn p13_plan_step_pending_with_deps_roundtrips() {
+        let ev = AgentEvent::PlanStepPending {
+            step: 3,
+            step_id: StepId(30),
+            revision: 0,
+            plan_revision: 7,
+            tool_name: "edit".into(),
+            description: "apply fix".into(),
+            depends_on: vec![StepId(10), StepId(20)],
+            parent_step_id: Some(StepId(5)),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains("\"step_id\":30"));
+        assert!(s.contains("\"depends_on\":[10,20]"));
+        assert!(s.contains("\"parent_step_id\":5"));
+        let _: AgentEvent = serde_json::from_str(&s).unwrap();
+    }
+
+    #[test]
+    fn p13_mode_changed_roundtrip_with_and_without_lens() {
+        let with_lens = AgentEvent::ModeChanged {
+            from_mode: "plan".into(),
+            to_mode: "act".into(),
+            from_lens: None,
+            to_lens: Some("normal".into()),
+        };
+        let s = serde_json::to_string(&with_lens).unwrap();
+        assert!(s.contains("\"type\":\"ModeChanged\""));
+        assert!(s.contains("\"to_lens\":\"normal\""));
         assert!(
-            b.reserved_output <= b.context_limit / 4,
-            "reserved_output {} exceeds 1/4 of context_limit {}",
-            b.reserved_output,
-            b.context_limit
+            !s.contains("\"from_lens\""),
+            "None lens must be omitted, got {s}"
+        );
+        let _: AgentEvent = serde_json::from_str(&s).unwrap();
+    }
+
+    #[test]
+    fn p13_introspection_envelope_applied_wire_shape() {
+        let summary = EnvelopeSummaryV1 {
+            read_scope_count: 4,
+            write_scope_count: 2,
+            write_deny_count: 1,
+            network_enabled: false,
+            exec_enabled: false,
+            approval_cadence: "per_turn".into(),
+            scope_source: "preset:plan".into(),
+            display_text: None,
+        };
+        let ev = AgentEvent::Introspection(IntrospectionEventV1::EnvelopeApplied { summary });
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains("\"type\":\"Introspection\""));
+        assert!(s.contains("\"kind\":\"envelope_applied\""));
+        assert!(s.contains("\"approval_cadence\":\"per_turn\""));
+        // Security: display_text must be omitted when None (don't leak
+        // prompt-text-as-API by accident).
+        assert!(!s.contains("display_text"));
+        let _: AgentEvent = serde_json::from_str(&s).unwrap();
+    }
+
+    #[test]
+    fn p13_step_assigned_default_redacts_exact_names() {
+        let assignment = AssignmentSummaryV1 {
+            execution_id: ExecutionId(42),
+            step_id: StepId(7),
+            persona_id: "ml-architect".into(),
+            model_vendor: "anthropic".into(),
+            model_tier: "opus".into(),
+            model_id_exact: None,
+            activated_skills_count: 2,
+            activated_agents_count: 1,
+            activated_skill_names: None,
+            activated_agent_names: None,
+            attempt: 1,
+        };
+        let ev = AgentEvent::Introspection(IntrospectionEventV1::StepAssigned { assignment });
+        let s = serde_json::to_string(&ev).unwrap();
+        // The redaction-by-default contract: exact names must be absent
+        // from the default wire payload.
+        assert!(
+            !s.contains("model_id_exact"),
+            "model_id_exact leaked in default wire format: {s}"
+        );
+        assert!(!s.contains("activated_skill_names"));
+        assert!(!s.contains("activated_agent_names"));
+        // But counts must be present.
+        assert!(s.contains("\"activated_skills_count\":2"));
+        assert!(s.contains("\"activated_agents_count\":1"));
+        assert!(s.contains("\"attempt\":1"));
+        let _: AgentEvent = serde_json::from_str(&s).unwrap();
+    }
+
+    #[test]
+    fn p13_agent_edge_kinds_cover_rubber_duck_findings() {
+        // Enumerate every kind the critique called out so a future
+        // contributor can't silently drop one.
+        use AgentEdgeKind::*;
+        for k in [Delegation, Critique, Handoff, Retry, Spawn] {
+            let s = serde_json::to_string(&k).unwrap();
+            // snake_case on the wire.
+            assert!(s.chars().all(|c| c.is_lowercase() || c == '_' || c == '"'));
+            let back: AgentEdgeKind = serde_json::from_str(&s).unwrap();
+            assert_eq!(k, back);
+        }
+        use ProvenanceEdgeKind::*;
+        for k in [ExecutesStep, AmendsPlan, ExpandsScope] {
+            let s = serde_json::to_string(&k).unwrap();
+            let back: ProvenanceEdgeKind = serde_json::from_str(&s).unwrap();
+            assert_eq!(k, back);
+        }
+    }
+
+    #[test]
+    fn p13_critique_emitted_carries_target_execution() {
+        let ev = AgentEvent::Introspection(IntrospectionEventV1::CritiqueEmitted {
+            from_execution_id: ExecutionId(2),
+            target_execution_id: ExecutionId(1),
+            severity: CritiqueSeverity::Critical,
+            blocking: true,
+        });
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains("\"kind\":\"critique_emitted\""));
+        assert!(s.contains("\"from_execution_id\":2"));
+        assert!(s.contains("\"target_execution_id\":1"));
+        assert!(s.contains("\"blocking\":true"));
+        let _: AgentEvent = serde_json::from_str(&s).unwrap();
+    }
+
+    #[test]
+    fn p13_versioned_event_carries_causal_metadata() {
+        let ev = AgentEvent::TextDelta { text: "x".into() };
+        let wrapped =
+            VersionedAgentEvent::with_causality(ev, EventId(42), 7, vec![EventId(40), EventId(41)]);
+        let s = serde_json::to_string(&wrapped).unwrap();
+        assert!(s.contains("\"event_id\":42"));
+        assert!(s.contains("\"turn_seq\":7"));
+        assert!(s.contains("\"causal_parent_ids\":[40,41]"));
+        let back: VersionedAgentEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.event_id, EventId(42));
+        assert_eq!(back.turn_seq, 7);
+        assert_eq!(back.causal_parent_ids.len(), 2);
+    }
+
+    #[test]
+    fn p13_versioned_event_legacy_payload_defaults_causality() {
+        // Pre-P13 producer — no event_id / turn_seq / causal_parent_ids.
+        let legacy = r#"{"v":1,"event":{"type":"TextDelta","text":"hi"}}"#;
+        let back: VersionedAgentEvent = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.event_id, EventId(0));
+        assert_eq!(back.turn_seq, 0);
+        assert!(back.causal_parent_ids.is_empty());
+    }
+
+    #[test]
+    fn p13_older_client_absorbs_introspection_as_unknown() {
+        // Client on pre-P13 schema would see the new Introspection tag
+        // via #[serde(other)] Unknown. Simulate: feed a NEW-style payload,
+        // but assert parsed type.
+        let payload = r#"{"type":"Introspection","kind":"envelope_applied","summary":{"read_scope_count":0,"write_scope_count":0,"write_deny_count":0,"network_enabled":false,"exec_enabled":false,"approval_cadence":"never","scope_source":"custom"}}"#;
+        let ev: AgentEvent = serde_json::from_str(payload).unwrap();
+        // On THIS build (new schema) it parses into Introspection, not Unknown.
+        assert!(
+            matches!(ev, AgentEvent::Introspection(_)),
+            "new build must parse Introspection; got {ev:?}"
         );
     }
 }

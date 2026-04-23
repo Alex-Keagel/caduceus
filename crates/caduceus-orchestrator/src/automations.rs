@@ -634,7 +634,8 @@ pub fn create_template_files(automations_dir: &Path) -> std::io::Result<()> {
             repo: "owner/repo".to_string(),
         },
         agent_config: AutomationAgentConfig {
-            mode: AgentMode::Review,
+            // P2: Review is now a lens on Act, not a standalone mode.
+            mode: AgentMode::Act,
             model: ModelId::new("claude-sonnet-4-6"),
             prompt_template:
                 "Review this pull request for bugs, security issues, and code quality. \
@@ -944,5 +945,45 @@ mod tests {
         let a = registry.get("counter").await.unwrap();
         assert_eq!(a.run_count, 2);
         assert!(a.last_run.is_some());
+    }
+
+    /// P11: saved automation JSON from before the 7→4 mode collapse must
+    /// still load. A user's `pr-review.json` written against the old
+    /// `Review` variant should deserialize cleanly as `Act` — the lens is
+    /// lost (as designed) but the automation does not break.
+    #[test]
+    fn p11_legacy_automation_json_loads_through_serde_aliases() {
+        let legacy_json = r#"{
+            "mode": "Review",
+            "model": "claude-sonnet-4-6",
+            "prompt_template": "Review PR {{event}}",
+            "tools": ["read_file", "grep"],
+            "max_turns": 10,
+            "auto_commit": false,
+            "auto_pr": false
+        }"#;
+        let cfg: AutomationAgentConfig =
+            serde_json::from_str(legacy_json).expect("legacy Review automation must deserialize");
+        assert_eq!(cfg.mode, AgentMode::Act);
+
+        // Architect is the other legacy string we need to cover.
+        let legacy_arch = r#"{
+            "mode": "Architect",
+            "model": "claude-sonnet-4-6",
+            "prompt_template": "t",
+            "tools": [],
+            "max_turns": 1,
+            "auto_commit": false,
+            "auto_pr": false
+        }"#;
+        let cfg: AutomationAgentConfig = serde_json::from_str(legacy_arch).unwrap();
+        assert_eq!(cfg.mode, AgentMode::Plan);
+
+        // Round-trip: new form serializes to the canonical lowercase name.
+        let canon = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            canon.contains("\"mode\":\"Plan\"") || canon.contains("\"Plan\""),
+            "expected canonical 'Plan' in {canon}"
+        );
     }
 }

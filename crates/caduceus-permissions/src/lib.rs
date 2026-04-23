@@ -9,6 +9,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod envelope;
+pub use envelope::{
+    ApprovalCadence, Decision, DenyReason, EnvelopeScope, ExecPolicy, ExpansionCapability,
+    ExpansionDelta, FanoutPolicy, NetworkPolicy, PathAllowlist, PermissionEnvelope,
+    PermissionEvent,
+};
+
 // ── Capabilities ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -10,7 +10,6 @@ caduceus-storage = { path = "../caduceus-storage" }
 caduceus-providers = { path = "../caduceus-providers" }
 caduceus-tools = { path = "../caduceus-tools" }
 caduceus-permissions = { path = "../caduceus-permissions" }
-caduceus-scanner = { path = "../caduceus-scanner" }
 caduceus-telemetry = { path = "../caduceus-telemetry" }
 serde = { workspace = true }
 serde_json = { workspace = true }

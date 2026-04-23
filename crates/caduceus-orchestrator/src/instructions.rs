@@ -29,6 +29,10 @@ use std::path::{Path, PathBuf};
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 32_000;
 /// Max chars per single instruction file.
 const MAX_INSTRUCTION_FILE_CHARS: usize = 8_000;
+/// Max chars for a skill/agent `description` field (matches Copilot CLI +
+/// Claude Code skill-loader limits — skills with longer descriptions fail
+/// to load rather than being silently truncated).
+const MAX_SKILL_DESCRIPTION_CHARS: usize = 1024;
 
 // ── Loading strategy ──────────────────────────────────────────────────────────
 
@@ -88,8 +92,21 @@ pub struct AgentDefinition {
 pub struct SkillDefinition {
     pub name: String,
     pub description: String,
+    /// Full prose body of the skill (markdown between frontmatter and EOF).
+    /// This is the real content injected when the skill activates. Earlier
+    /// versions only extracted numbered steps, losing context and prose
+    /// guidance — P3 stores the full body.
+    pub body: String,
+    /// Legacy: numbered steps extracted from the body. Retained for tests and
+    /// downstream tooling that still walks a step list. New callers should
+    /// use `body`.
     pub steps: Vec<String>,
     pub trigger_phrases: Vec<String>,
+    /// Per-skill char budget hint from frontmatter. When the skill activates,
+    /// its injected body is truncated to this many chars (default: no cap,
+    /// fall back to MAX_INSTRUCTION_FILE_CHARS). The envelope's `skill_budget`
+    /// caps the *number* of skills that activate, not the size of each.
+    pub budget_hint_chars: Option<usize>,
 }
 
 /// An MCP server configuration entry.
@@ -142,6 +159,16 @@ struct SkillFrontmatter {
     description: Option<String>,
     #[serde(default)]
     triggers: Option<Vec<String>>,
+    /// Optional per-skill char budget hint — how much of the body to inject
+    /// when this skill activates. When omitted, the loader's per-file cap
+    /// applies.
+    #[serde(default, alias = "budget_hint_chars")]
+    budget_hint: Option<u32>,
+    /// Optional informational list of tools this skill expects to use.
+    /// Not enforced — permissions come from the envelope.
+    #[serde(default)]
+    #[allow(dead_code)]
+    tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,10 +354,11 @@ impl InstructionLoader {
 
         // 5. Custom agent definitions (.caduceus/agents/*.md) — LAZY loaded
         // Only name/description/triggers go into system prompt.
-        // Full body stored in lazy_content, injected when trigger matches.
+        // 5. Custom agents (.caduceus/agents/<name>.md or <name>/AGENT.md) — LAZY loaded
+        //    Full body stored in lazy_content, injected when trigger matches.
         let agents_dir = self.workspace_root.join(".caduceus/agents");
         if agents_dir.is_dir() {
-            let mut entries = read_dir_md_files(&agents_dir)?;
+            let mut entries = discover_instruction_files(&agents_dir, "AGENT.md")?;
             entries.sort();
             for path in entries {
                 if let Some(agent) = self.load_agent_definition(&path)? {
@@ -342,16 +370,22 @@ impl InstructionLoader {
             }
         }
 
-        // 6. Skill definitions (.caduceus/skills/*.md) — LAZY loaded
+        // 6. Skill definitions (.caduceus/skills/<name>.md or <name>/SKILL.md) — LAZY loaded
         let skills_dir = self.workspace_root.join(".caduceus/skills");
         if skills_dir.is_dir() {
-            let mut entries = read_dir_md_files(&skills_dir)?;
+            let mut entries = discover_instruction_files(&skills_dir, "SKILL.md")?;
             entries.sort();
             for path in entries {
                 if let Some(skill) = self.load_skill_definition(&path)? {
-                    // Store full steps as lazy content
-                    set.lazy_content
-                        .insert(skill.name.clone(), skill.steps.join("\n"));
+                    // P3: store full prose body as lazy content. Earlier versions
+                    // stored only numbered steps, which dropped most prose and
+                    // lost context. `body` is the authoritative skill text.
+                    let lazy = if !skill.body.is_empty() {
+                        skill.body.clone()
+                    } else {
+                        skill.steps.join("\n")
+                    };
+                    set.lazy_content.insert(skill.name.clone(), lazy);
                     set.available_skills.push(skill);
                 }
             }
@@ -507,7 +541,27 @@ impl InstructionLoader {
     ///
     /// The LLM then decides which activated agents/skills to actually use.
     /// Returns a `RoutingResult` with content to inject plus decision metadata.
+    ///
+    /// Backward-compatible wrapper — uses the legacy "top 3" activation cap.
+    /// New callers with a permission envelope should call
+    /// [`Self::resolve_lazy_with_budget`] so the envelope's `skill_budget`
+    /// governs how many skills activate.
     pub fn resolve_lazy(&self, set: &InstructionSet, user_message: &str) -> RoutingResult {
+        self.resolve_lazy_with_budget(set, user_message, 3)
+    }
+
+    /// Envelope-aware variant of [`Self::resolve_lazy`].
+    ///
+    /// `max_activations` is the **number** of agents/skills that may activate
+    /// in this turn — pass `envelope.skill_budget` when an envelope is in play.
+    /// Each activated skill's body is further truncated to its per-skill
+    /// `budget_hint_chars` (or the loader's `MAX_INSTRUCTION_FILE_CHARS` cap).
+    pub fn resolve_lazy_with_budget(
+        &self,
+        set: &InstructionSet,
+        user_message: &str,
+        max_activations: usize,
+    ) -> RoutingResult {
         let msg_lower = user_message.to_lowercase();
         let msg_words: Vec<&str> = msg_lower.split_whitespace().collect();
         let mut scored: Vec<(f64, &str, &str)> = Vec::new(); // (score, type, name)
@@ -538,14 +592,22 @@ impl InstructionLoader {
             }
         }
 
-        // Sort by score descending, take top 3 (don't overload context)
+        // Sort by score descending.
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Build a per-skill body-cap lookup so we can honor `budget_hint_chars`.
+        let skill_body_cap: HashMap<&str, Option<usize>> = set
+            .available_skills
+            .iter()
+            .map(|s| (s.name.as_str(), s.budget_hint_chars))
+            .collect();
 
         let threshold = 2.0;
         let mut activated_content = Vec::new();
         let mut activated_names = Vec::new();
+        let take_n = max_activations.max(1);
 
-        for (score, kind, name) in scored.iter().take(3) {
+        for (score, kind, name) in scored.iter().take(take_n) {
             if *score < threshold {
                 break;
             }
@@ -556,17 +618,39 @@ impl InstructionLoader {
                 } else {
                     "activated_skill"
                 };
+                // P3: apply per-skill body truncation. Skills with a
+                // `budget_hint` in their frontmatter get that cap; otherwise
+                // fall back to the global per-file cap.
+                let cap = if *kind == "skill" {
+                    skill_body_cap
+                        .get(*name)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(MAX_INSTRUCTION_FILE_CHARS)
+                } else {
+                    MAX_INSTRUCTION_FILE_CHARS
+                };
+                let injected: std::borrow::Cow<'_, str> = if content.len() > cap {
+                    std::borrow::Cow::Owned(format!(
+                        "{}\n\n[truncated — {} chars omitted by skill budget]",
+                        &content[..cap],
+                        content.len() - cap
+                    ))
+                } else {
+                    std::borrow::Cow::Borrowed(content.as_str())
+                };
                 activated_content.push(format!(
-                    "<{tag} name=\"{name}\" relevance=\"{score:.1}\">\n{content}\n</{tag}>"
+                    "<{tag} name=\"{name}\" relevance=\"{score:.1}\">\n{injected}\n</{tag}>"
                 ));
             }
         }
 
         if !activated_names.is_empty() {
             tracing::info!(
-                "Semantic routing activated: {:?} (from {} candidates)",
+                "Semantic routing activated: {:?} (from {} candidates, budget={})",
                 activated_names,
-                set.active_agents.len() + set.available_skills.len()
+                set.active_agents.len() + set.available_skills.len(),
+                take_n
             );
         }
 
@@ -634,10 +718,24 @@ impl InstructionLoader {
         };
 
         let name = fm.name.unwrap_or_else(|| {
-            path.file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string()
+            // P3: when the file is `<dir>/AGENT.md`, use the parent directory
+            // name. Otherwise fall back to the file stem.
+            let is_agent_md = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.eq_ignore_ascii_case("AGENT.md"))
+                .unwrap_or(false);
+            if is_agent_md {
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "agent".to_string())
+            } else {
+                path.file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            }
         });
 
         Ok(Some(AgentDefinition {
@@ -660,19 +758,51 @@ impl InstructionLoader {
             None => SkillFrontmatter::default(),
         };
 
+        // P3: name resolution — frontmatter wins, else the directory name
+        // (for `skills/<name>/SKILL.md`), else the file stem.
         let name = fm.name.unwrap_or_else(|| {
-            path.file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string()
+            let is_skill_md = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.eq_ignore_ascii_case("SKILL.md"))
+                .unwrap_or(false);
+            if is_skill_md {
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "skill".to_string())
+            } else {
+                path.file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            }
         });
 
-        // Extract numbered steps from the body
-        let steps: Vec<String> = body
+        let description = fm.description.unwrap_or_default();
+
+        // P3: hard-fail long descriptions instead of silently truncating,
+        // matching how the global Copilot CLI skill loader behaves. Buggy
+        // skills surface as a load error with a clear message.
+        if description.len() > MAX_SKILL_DESCRIPTION_CHARS {
+            return Err(CaduceusError::Config(format!(
+                "Skill '{}' at {}: description is {} chars (max {}). \
+                 Shorten the description or move prose into the body.",
+                name,
+                path.display(),
+                description.len(),
+                MAX_SKILL_DESCRIPTION_CHARS
+            )));
+        }
+
+        let body_str = body.trim().to_string();
+
+        // Legacy: extract numbered steps from the body for downstream tooling
+        // that still walks a step list. New callers should use `body`.
+        let steps: Vec<String> = body_str
             .lines()
             .filter(|l| {
                 let t = l.trim();
-                // Match lines starting with "N." or "N)" (numbered steps)
                 t.chars()
                     .next()
                     .map(|c| c.is_ascii_digit())
@@ -682,11 +812,15 @@ impl InstructionLoader {
             .map(|l| l.trim().to_string())
             .collect();
 
+        let budget_hint_chars = fm.budget_hint.map(|n| n as usize);
+
         Ok(Some(SkillDefinition {
             name,
-            description: fm.description.unwrap_or_default(),
+            description,
+            body: body_str,
             steps,
             trigger_phrases: fm.triggers.unwrap_or_default(),
+            budget_hint_chars,
         }))
     }
 }
@@ -711,6 +845,59 @@ fn read_optional(path: &Path) -> Result<Option<String>> {
             path.display()
         ))),
     }
+}
+
+/// List instruction files in a directory.
+///
+/// Supports two layouts side-by-side:
+///   - flat: `<dir>/<name>.md`
+///   - dir-based: `<dir>/<name>/<NAME>.md` (e.g. `skills/foo/SKILL.md` or
+///     `agents/foo/AGENT.md`). `manifest_basename` must match case-insensitively.
+///
+/// Directory layout is preferred when both exist (allows co-locating
+/// examples and assets next to the manifest).
+fn discover_instruction_files(dir: &Path, manifest_basename: &str) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| CaduceusError::Config(format!("Cannot read {}: {e}", dir.display())))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| CaduceusError::Config(format!("Cannot read dir entry: {e}")))?;
+        let path = entry.path();
+        let ty = entry
+            .file_type()
+            .map_err(|e| CaduceusError::Config(format!("Cannot stat {}: {e}", path.display())))?;
+        if ty.is_dir() {
+            // Look for a manifest file inside — try case-insensitive match.
+            let inner = match std::fs::read_dir(&path) {
+                Ok(x) => x,
+                Err(_) => continue,
+            };
+            for sub in inner.flatten() {
+                let sub_path = sub.path();
+                if sub_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.eq_ignore_ascii_case(manifest_basename))
+                    .unwrap_or(false)
+                {
+                    files.push(sub_path);
+                    break;
+                }
+            }
+        } else if path.extension().map(|e| e == "md").unwrap_or(false)
+            // Skip README.md and similar inside the top-level skills/agents dir
+            // — only treat top-level .md files as full definitions.
+            && !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.eq_ignore_ascii_case("README.md"))
+                .unwrap_or(false)
+        {
+            files.push(path);
+        }
+    }
+    Ok(files)
 }
 
 /// List all `.md` files in a directory.
@@ -780,8 +967,25 @@ fn serde_yaml_lite_parse<T: serde::de::DeserializeOwned>(yaml: &str) -> Option<T
             }
             obj.insert(key, serde_json::Value::Array(items));
         } else {
-            let value = value.trim_matches('"').trim_matches('\'');
-            obj.insert(key, serde_json::Value::String(value.to_string()));
+            let raw = value.trim_matches('"').trim_matches('\'');
+            // P3: detect unquoted numeric scalars so `budget_hint: 8000`
+            // deserializes into numeric frontmatter fields.
+            let json_val = if value == raw {
+                if let Ok(n) = raw.parse::<i64>() {
+                    serde_json::Value::Number(n.into())
+                } else if let Ok(f) = raw.parse::<f64>() {
+                    serde_json::Number::from_f64(f)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or_else(|| serde_json::Value::String(raw.to_string()))
+                } else if raw == "true" || raw == "false" {
+                    serde_json::Value::Bool(raw == "true")
+                } else {
+                    serde_json::Value::String(raw.to_string())
+                }
+            } else {
+                serde_json::Value::String(raw.to_string())
+            };
+            obj.insert(key, json_val);
         }
     }
 
@@ -1829,5 +2033,251 @@ mod tests {
         let msg_real: Vec<&str> = binding.split_whitespace().collect();
         let score = semantic_match_score(&msg_real, "README-Creator", "Creates readme files", &[]);
         assert!(score >= 10.0, "Should be case insensitive: {score}");
+    }
+
+    // ── P3: skill loader upgrade ──────────────────────────────────────────
+
+    #[test]
+    fn p3_skill_stores_full_body_not_just_steps() {
+        // Prose + numbered steps. Body should include both; steps still extracted.
+        let skill_md =
+            "---\nname: deploy\ndescription: Deploy the app\ntriggers:\n  - \"deploy\"\n---\n\
+            This skill walks the deploy process.\n\n\
+            ## Guidance\n\
+            - Always run tests first\n\
+            - Keep a rollback ready\n\n\
+            ## Steps\n\
+            1. Run cargo test\n\
+            2. Build release binary\n\
+            3. Ship artifact\n";
+        let dir = setup_workspace(&[(".caduceus/skills/deploy.md", skill_md)]);
+        let loader = InstructionLoader::new(dir.path());
+        let set = loader.load().unwrap();
+
+        assert_eq!(set.available_skills.len(), 1);
+        let skill = &set.available_skills[0];
+
+        // Body contains prose + rules + numbered steps.
+        assert!(skill.body.contains("walks the deploy process"));
+        assert!(skill.body.contains("Always run tests first"));
+        assert!(skill.body.contains("1. Run cargo test"));
+
+        // Steps extracted for back-compat.
+        assert_eq!(skill.steps.len(), 3);
+
+        // Lazy content is the body, not steps.join. The prose rule must be
+        // present — this is what the earlier loader lost.
+        let lazy = set.lazy_content.get("deploy").unwrap();
+        assert!(
+            lazy.contains("Always run tests first"),
+            "lazy content must contain prose guidance, not just numbered steps"
+        );
+    }
+
+    #[test]
+    fn p3_skill_description_over_1024_chars_fails_load() {
+        // Exactly the failure the user hit with workflow-recipes skill in prod.
+        let long_desc = "x".repeat(1025);
+        let skill_md =
+            format!("---\nname: verbose\ndescription: {long_desc}\ntriggers: []\n---\nBody.");
+        let dir = setup_workspace(&[(".caduceus/skills/verbose.md", skill_md.as_str())]);
+        let loader = InstructionLoader::new(dir.path());
+        let err = loader.load().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("description is 1025 chars") && msg.contains("max 1024"),
+            "error must name the real cap and the actual length: {msg}"
+        );
+        assert!(msg.contains("verbose"), "error must name the skill: {msg}");
+    }
+
+    #[test]
+    fn p3_skill_description_exactly_1024_chars_loads() {
+        let desc = "y".repeat(1024);
+        let skill_md = format!("---\nname: tight\ndescription: {desc}\ntriggers: []\n---\nBody.");
+        let dir = setup_workspace(&[(".caduceus/skills/tight.md", skill_md.as_str())]);
+        let loader = InstructionLoader::new(dir.path());
+        let set = loader.load().unwrap();
+        assert_eq!(set.available_skills.len(), 1);
+    }
+
+    #[test]
+    fn p3_skill_dir_layout_loads_with_dir_name() {
+        // .caduceus/skills/shipit/SKILL.md (no `name:` in frontmatter)
+        let skill_md = "---\ndescription: Ship the build\ntriggers: []\n---\nBody prose.";
+        let dir = setup_workspace(&[(".caduceus/skills/shipit/SKILL.md", skill_md)]);
+        let loader = InstructionLoader::new(dir.path());
+        let set = loader.load().unwrap();
+
+        assert_eq!(set.available_skills.len(), 1);
+        // Name falls back to the directory name, not "SKILL".
+        assert_eq!(set.available_skills[0].name, "shipit");
+    }
+
+    #[test]
+    fn p3_agent_dir_layout_loads_with_dir_name() {
+        let agent_md = "---\ndescription: Reviews\ntools: [read_file]\ntriggers: []\n---\nBody.";
+        let dir = setup_workspace(&[(".caduceus/agents/reviewer/AGENT.md", agent_md)]);
+        let loader = InstructionLoader::new(dir.path());
+        let set = loader.load().unwrap();
+        assert_eq!(set.active_agents.len(), 1);
+        assert_eq!(set.active_agents[0].name, "reviewer");
+    }
+
+    #[test]
+    fn p3_budget_hint_truncates_injected_body() {
+        let long_body = "abcdefghij".repeat(500); // 5000 chars
+        let skill_md = format!(
+            "---\nname: chonky\ndescription: Big skill\nbudget_hint: 120\ntriggers:\n  - \"chonky\"\n---\n{long_body}"
+        );
+        let dir = setup_workspace(&[(".caduceus/skills/chonky.md", skill_md.as_str())]);
+        let loader = InstructionLoader::new(dir.path());
+        let set = loader.load().unwrap();
+
+        assert_eq!(set.available_skills.len(), 1);
+        assert_eq!(set.available_skills[0].budget_hint_chars, Some(120));
+
+        let result = loader.resolve_lazy_with_budget(&set, "chonky please", 6);
+        assert_eq!(result.activated, vec!["chonky".to_string()]);
+        // Injected content must be truncated to ≤ ~120 chars of body + tag/meta.
+        let body_plus_notice = &result.content;
+        assert!(
+            body_plus_notice.contains("[truncated"),
+            "body should be truncated by skill budget"
+        );
+        // And the raw 5000-char body must not be fully inlined.
+        assert!(
+            !body_plus_notice.contains(&"abcdefghij".repeat(500)),
+            "full body should not leak past the budget"
+        );
+    }
+
+    #[test]
+    fn p3_resolve_lazy_budget_count_respected() {
+        // Six matching skills; envelope-style budget should cap activations.
+        let fixtures: Vec<(String, String)> = (0..6)
+            .map(|i| {
+                let path = format!(".caduceus/skills/match{i}.md");
+                let body = format!(
+                    "---\nname: match{i}\ndescription: Handles matchthing {i}\n\
+                     triggers:\n  - \"matchthing\"\n---\nSkill {i} body."
+                );
+                (path, body)
+            })
+            .collect();
+        let fixture_refs: Vec<(&str, &str)> = fixtures
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.as_str()))
+            .collect();
+        let dir = setup_workspace(&fixture_refs);
+        let loader = InstructionLoader::new(dir.path());
+        let set = loader.load().unwrap();
+        assert_eq!(set.available_skills.len(), 6);
+
+        // Legacy resolve_lazy caps at 3.
+        let legacy = loader.resolve_lazy(&set, "matchthing please");
+        assert!(legacy.activated.len() <= 3);
+
+        // Envelope-sized budget of 5 activates up to 5.
+        let with_budget = loader.resolve_lazy_with_budget(&set, "matchthing please", 5);
+        assert!(
+            with_budget.activated.len() >= 4 && with_budget.activated.len() <= 5,
+            "budget 5 should activate more than legacy cap of 3: got {}",
+            with_budget.activated.len()
+        );
+
+        // Budget of 1 activates at most 1.
+        let tight = loader.resolve_lazy_with_budget(&set, "matchthing please", 1);
+        assert_eq!(tight.activated.len(), 1);
+    }
+
+    #[test]
+    fn p3_yaml_parser_handles_numeric_scalars() {
+        // Sanity check for the numeric-aware frontmatter parser — needed so
+        // `budget_hint: 8000` deserializes as `Option<u32>`, not a string.
+        #[derive(Debug, Deserialize, Default)]
+        struct Fm {
+            #[serde(default)]
+            n: Option<u32>,
+            #[serde(default)]
+            b: Option<bool>,
+            #[serde(default)]
+            s: Option<String>,
+        }
+        let fm: Fm = serde_yaml_lite_parse("n: 42\nb: true\ns: hello").unwrap_or_default();
+        assert_eq!(fm.n, Some(42));
+        assert_eq!(fm.b, Some(true));
+        assert_eq!(fm.s.as_deref(), Some("hello"));
+    }
+
+    // ── P6: bundled skills port ───────────────────────────────────────────
+
+    /// All six ported skills load cleanly from the repo's `.caduceus/skills/`
+    /// directory — this is the integration test that catches:
+    ///   (a) descriptions exceeding the 1024-char cap,
+    ///   (b) long single-quoted YAML lines the mini-parser mis-handles,
+    ///   (c) dir-based layout regressions.
+    #[test]
+    fn p6_bundled_skills_load_from_repo() {
+        // Walk from this crate's manifest dir up to the caduceus workspace
+        // root (two levels up: crates/caduceus-orchestrator → caduceus).
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("caduceus repo root must resolve");
+
+        // If the repo hasn't been populated yet, skip — never fail CI on an
+        // absent optional skill pack.
+        if !repo_root.join(".caduceus/skills").is_dir() {
+            eprintln!("skipping P6 bundled-skill test — .caduceus/skills missing");
+            return;
+        }
+
+        let loader = InstructionLoader::new(&repo_root);
+        let set = loader
+            .load()
+            .expect("bundled skills must load without error");
+
+        // Six canonical names must be present.
+        let expected = [
+            "nontrivial-pipeline",
+            "literature-rubric",
+            "deep-code-audit",
+            "data-ml-guardrails",
+            "workflow-recipes",
+            "qa-strategist",
+        ];
+        for name in expected {
+            let found = set
+                .available_skills
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "bundled skill '{name}' not loaded (loaded: {:?})",
+                        set.available_skills
+                            .iter()
+                            .map(|s| s.name.as_str())
+                            .collect::<Vec<_>>()
+                    )
+                });
+
+            // Each must have a non-empty body (P3: body must survive the load).
+            assert!(
+                !found.body.is_empty(),
+                "bundled skill '{name}' has empty body"
+            );
+            // And a non-empty description within the 1024-char cap.
+            assert!(
+                !found.description.is_empty(),
+                "bundled skill '{name}' has empty description"
+            );
+            assert!(
+                found.description.len() <= MAX_SKILL_DESCRIPTION_CHARS,
+                "bundled skill '{name}' description too long: {} chars",
+                found.description.len()
+            );
+        }
     }
 }
