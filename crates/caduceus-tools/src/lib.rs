@@ -4490,7 +4490,7 @@ impl NotebookCellTool {
 
 // ── Security analysis features ─────────────────────────────────────────────────
 
-use caduceus_permissions::VulnSeverity;
+use caduceus_core::VulnSeverity;
 
 // ── #218: SAST Vulnerability Scanner ──────────────────────────────────────────
 

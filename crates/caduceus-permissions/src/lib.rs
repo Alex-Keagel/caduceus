@@ -1510,14 +1510,12 @@ impl std::fmt::Display for OwaspComplianceStatus {
 }
 
 // ── VulnSeverity (shared security type) ───────────────────────────────────────
+// Canonical definition moved to `caduceus-core` (audit I13: layering —
+// `caduceus-tools` previously depended on `caduceus-permissions` only for this
+// value type). Re-exported here so existing `caduceus_permissions::VulnSeverity`
+// imports keep working.
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VulnSeverity {
-    Critical,
-    High,
-    Medium,
-    Low,
-}
+pub use caduceus_core::VulnSeverity;
 
 // ── #223: Security Severity Classifier ────────────────────────────────────────
 

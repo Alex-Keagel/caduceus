@@ -668,7 +668,14 @@ fn map_anthropic_stop_reason(reason: &str) -> StopReason {
         "max_tokens" => StopReason::MaxTokens,
         "stop_sequence" => StopReason::StopSequence,
         "tool_use" => StopReason::ToolUse,
-        _ => StopReason::EndTurn,
+        other => {
+            tracing::warn!(
+                target: "caduceus::providers::anthropic",
+                unknown_stop_reason = other,
+                "Unknown Anthropic stop_reason; falling back to EndTurn (audit I11)"
+            );
+            StopReason::EndTurn
+        }
     }
 }
 
@@ -1163,7 +1170,14 @@ fn map_openai_finish_reason(reason: &str) -> StopReason {
         "stop" => StopReason::EndTurn,
         "length" => StopReason::MaxTokens,
         "tool_calls" | "function_call" => StopReason::ToolUse,
-        _ => StopReason::EndTurn,
+        other => {
+            tracing::warn!(
+                target: "caduceus::providers::openai",
+                unknown_finish_reason = other,
+                "Unknown OpenAI finish_reason; falling back to EndTurn (audit I11)"
+            );
+            StopReason::EndTurn
+        }
     }
 }
 

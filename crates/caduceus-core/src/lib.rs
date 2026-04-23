@@ -291,6 +291,18 @@ pub struct ImageContent {
 
 // ── LLM Response ──────────────────────────────────────────────────────────────
 
+/// Severity classification for security findings. Canonical location for this
+/// type is `caduceus-core` so that `caduceus-tools` (executor) does not need to
+/// depend on `caduceus-permissions` (policy) — see audit I13. The permissions
+/// crate re-exports this type for backwards compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VulnSeverity {
+    Critical,
+    High,
+    Medium,
+    Low,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopReason {
     EndTurn,
