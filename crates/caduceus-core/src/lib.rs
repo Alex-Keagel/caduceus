@@ -1875,22 +1875,49 @@ impl Default for ConfigLoader {
 
 // ── P0: Cancellation Token ─────────────────────────────────────────────────────
 
-/// Thread-safe cancellation token wrapping an `Arc<AtomicBool>`.
+/// Thread-safe cancellation token wrapping an `Arc<AtomicBool>` plus a
+/// monotonic generation counter (ST-A2b).
+///
+/// The generation counter binds a cancel signal to the turn that requested
+/// it. A long-lived harness that serves many turns can bump the generation
+/// at the start of each turn, then UI callers cancel *for a specific
+/// generation*. A late-arriving cancel from turn N cannot poison turn N+1
+/// because its generation no longer matches.
+///
+/// Legacy `cancel()` / `is_cancelled()` / `check()` / `reset()` remain
+/// generation-agnostic for paths that never reuse a token across turns.
 #[derive(Debug, Clone)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
 }
 
 impl CancellationToken {
     pub fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Signal cancellation.
+    /// Signal cancellation (generation-agnostic).
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// Signal cancellation *only* if the current generation equals `gen`.
+    /// Returns `true` when the cancel took effect.
+    ///
+    /// This is the ST-A2b API: UI captures the generation at turn start
+    /// and passes it back when the user clicks stop. A stale cancel
+    /// request for a prior turn is silently no-op'd here.
+    pub fn cancel_for_generation(&self, gen: u64) -> bool {
+        if self.current_generation() == gen {
+            self.cancelled.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
     }
 
     /// Check if cancellation has been requested.
@@ -1907,12 +1934,30 @@ impl CancellationToken {
         }
     }
 
+    /// Current generation. Callers snapshot this at turn start and pass
+    /// it back via `cancel_for_generation` to bind a cancel to the turn.
+    pub fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Increment the generation and return the new value. Also clears any
+    /// lingering cancel flag so the new generation starts clean. Call at
+    /// the start of every turn on a long-lived harness.
+    pub fn bump_generation(&self) -> u64 {
+        let next = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.cancelled.store(false, Ordering::SeqCst);
+        next
+    }
+
     /// Clear the cancelled flag so the token can be reused for a fresh run.
     ///
     /// Without this, a long-lived `AgentHarness` that gets cancelled once
     /// would refuse every subsequent `run` (audit finding #9). Callers
     /// reusing a harness across user requests should reset between runs;
     /// `AgentHarness::reset_cancellation` automates the bookkeeping.
+    ///
+    /// Note: `reset()` does NOT bump the generation. Use `bump_generation`
+    /// when entering a new turn on a shared harness.
     pub fn reset(&self) {
         self.cancelled.store(false, Ordering::SeqCst);
     }
@@ -2877,6 +2922,68 @@ log_level = "debug"
         clone.reset();
         assert!(!token.is_cancelled(), "reset on clone must affect original");
         assert!(token.check().is_ok());
+    }
+
+    // ── ST-A2b: Generation-bound cancellation tests ───────────────────────────
+
+    #[test]
+    fn cancellation_token_starts_at_generation_zero() {
+        let token = CancellationToken::new();
+        assert_eq!(token.current_generation(), 0);
+    }
+
+    #[test]
+    fn cancellation_token_bump_generation_increments_and_clears_flag() {
+        let token = CancellationToken::new();
+        token.cancel();
+        assert!(token.is_cancelled());
+        let gen = token.bump_generation();
+        assert_eq!(gen, 1);
+        assert_eq!(token.current_generation(), 1);
+        assert!(
+            !token.is_cancelled(),
+            "bump_generation must clear the cancel flag"
+        );
+    }
+
+    #[test]
+    fn cancellation_token_bump_generation_shared_across_clones() {
+        let token = CancellationToken::new();
+        let clone = token.clone();
+        assert_eq!(token.bump_generation(), 1);
+        assert_eq!(clone.current_generation(), 1);
+    }
+
+    #[test]
+    fn cancellation_token_cancel_for_generation_current_succeeds() {
+        let token = CancellationToken::new();
+        let gen = token.current_generation();
+        assert!(token.cancel_for_generation(gen));
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_token_cancel_for_stale_generation_noop() {
+        let token = CancellationToken::new();
+        let stale_gen = token.current_generation();
+        token.bump_generation();
+        assert!(!token.cancel_for_generation(stale_gen));
+        assert!(
+            !token.is_cancelled(),
+            "stale-generation cancel must not poison new turn"
+        );
+    }
+
+    #[test]
+    fn cancellation_token_cancel_for_generation_after_bump_works() {
+        let token = CancellationToken::new();
+        let gen0 = token.current_generation();
+        assert!(token.cancel_for_generation(gen0));
+        let gen1 = token.bump_generation();
+        assert_eq!(gen1, 1);
+        assert!(!token.is_cancelled());
+        assert!(token.cancel_for_generation(gen1));
+        assert!(token.is_cancelled());
     }
 
     // ── P1: Token Warning Levels tests ─────────────────────────────────────────
