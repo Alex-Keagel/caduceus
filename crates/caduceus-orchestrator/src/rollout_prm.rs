@@ -100,7 +100,7 @@ impl StepVerifier for RolloutPrmVerifier {
             thinking_mode: false,
             tool_choice: None,
             response_format: Some(ResponseFormat::JsonObject),
-            tools: Vec::new(),
+            tools: Vec::new().into(),
             logprobs: None,
         };
 

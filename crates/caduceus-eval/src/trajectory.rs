@@ -458,7 +458,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         }
     }

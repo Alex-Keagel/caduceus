@@ -247,6 +247,7 @@ mod tests {
     use crate::mock::MockLlmAdapter;
     use crate::{ChatRequest, ChatResponse};
     use caduceus_core::StopReason;
+    use std::sync::Arc;
 
     fn mk_response(text: &str) -> ChatResponse {
         ChatResponse {
@@ -271,7 +272,7 @@ mod tests {
             temperature: None,
             thinking_mode: false,
             tool_choice: None,
-            tools: vec![],
+            tools: vec![].into(),
             response_format: None,
             logprobs: None,
         }

@@ -104,7 +104,7 @@ impl AsyncBranchExpander<String> for LlmExpander {
                  Each step you produce should be actionable in one tool call."
                     .into(),
             ),
-            tools: vec![],
+            tools: vec![].into(),
             max_tokens: 512,
             temperature: Some(0.7),
             thinking_mode: false,
@@ -176,7 +176,7 @@ impl AsyncBranchScorer<String> for LlmScorer {
             system: Some(
                 "You are a plan critic. Output a single decimal number in [0.0, 1.0].".into(),
             ),
-            tools: vec![],
+            tools: vec![].into(),
             max_tokens: 16,
             temperature: Some(0.0),
             thinking_mode: false,

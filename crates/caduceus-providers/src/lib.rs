@@ -422,8 +422,13 @@ pub struct ChatRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ResponseFormat>,
     /// Tool definitions available for the LLM to call.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<ToolSpec>,
+    ///
+    /// Stored as `Arc<[ToolSpec]>` so that the long-lived tool spec list
+    /// cached on the harness can be shared across every turn's ChatRequest
+    /// without reallocating / cloning the underlying Vec (ST-C2 Phase 4 /
+    /// audit finding I10).
+    #[serde(default, skip_serializing_if = "<[ToolSpec]>::is_empty")]
+    pub tools: Arc<[ToolSpec]>,
     /// Opt-in: request token logprobs (gap G10 / P3.2). When `Some(n)`,
     /// providers that support logprobs (currently: OpenAI-compatible)
     /// will request `n` top alternatives per token AND return a
@@ -2001,7 +2006,7 @@ where
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
 
@@ -2864,7 +2869,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
 
@@ -2894,7 +2899,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
         let body = adapter.build_request_body(&request, false);
@@ -2939,7 +2944,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
         let body = adapter.build_request_body(&request, false);
@@ -2991,7 +2996,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![tool_spec],
+            tools: Arc::from([tool_spec]),
             logprobs: None,
         };
 
@@ -3039,7 +3044,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
 
@@ -3118,7 +3123,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
 
@@ -3218,7 +3223,7 @@ mod tests {
             thinking_mode: true,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
         assert!(req.thinking_mode);
@@ -3255,7 +3260,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
 
@@ -3284,7 +3289,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
 
@@ -3378,7 +3383,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
         let body = adapter.build_request_body(&request, false);
@@ -3405,7 +3410,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
         let body = build_openai_request_body(&request, false, true);
@@ -3455,7 +3460,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: Some(ToolChoice::Required),
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
         let body = adapter.build_request_body(&request, false);
@@ -3470,7 +3475,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: Some(ToolChoice::Specific("my_tool".into())),
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
         let body2 = adapter.build_request_body(&request2, false);
@@ -3489,7 +3494,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: Some(ToolChoice::Required),
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
         let body = build_openai_request_body(&request, false, true);
@@ -3504,7 +3509,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: Some(ToolChoice::Specific("my_func".into())),
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
         let body2 = build_openai_request_body(&request2, false, true);
@@ -3600,7 +3605,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: Some(ResponseFormat::JsonObject),
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
         let body = build_openai_request_body(&request, false, true);
@@ -3634,7 +3639,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
 
@@ -3657,7 +3662,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
 
@@ -3708,7 +3713,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         };
 
@@ -4021,7 +4026,7 @@ mod tests {
             model: ModelId::new("gpt-4"),
             messages: vec![],
             system: None,
-            tools: vec![],
+            tools: vec![].into(),
             tool_choice: None,
             response_format: None,
             max_tokens: 100,

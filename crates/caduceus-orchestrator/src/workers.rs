@@ -729,7 +729,7 @@ impl Coordinator {
             temperature: None,
             thinking_mode: false,
             tool_choice: None,
-            tools: vec![],
+            tools: vec![].into(),
             response_format: None,
             logprobs: None,
         };
@@ -868,7 +868,7 @@ impl Coordinator {
             temperature: None,
             thinking_mode: false,
             tool_choice: None,
-            tools: vec![],
+            tools: vec![].into(),
             response_format: None,
             logprobs: None,
         };
@@ -920,7 +920,7 @@ impl Coordinator {
             temperature: Some(critic_temperature.unwrap_or(0.0)),
             thinking_mode: false,
             tool_choice: None,
-            tools: vec![],
+            tools: vec![].into(),
             response_format: None,
             logprobs: None,
         };
@@ -1078,7 +1078,7 @@ async fn run_task(
             temperature: None,
             thinking_mode: false,
             tool_choice: None,
-            tools: task_tools.clone(),
+            tools: task_tools.clone().into(),
             response_format: None,
             logprobs: None,
         };

@@ -216,7 +216,7 @@ mod tests {
     use crate::ChatRequest;
     use caduceus_core::StopReason;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     /// Test adapter that returns a programmable sequence of results
     /// and records its provider_id and call count.
@@ -302,7 +302,7 @@ mod tests {
             thinking_mode: false,
             tool_choice: None,
             response_format: None,
-            tools: vec![],
+            tools: vec![].into(),
             logprobs: None,
         }
     }

@@ -241,7 +241,7 @@ impl BugBot {
             temperature: Some(0.1),
             thinking_mode: false,
             tool_choice: None,
-            tools: vec![],
+            tools: vec![].into(),
             response_format: None,
             logprobs: None,
         };
@@ -258,7 +258,7 @@ impl BugBot {
             temperature: Some(0.1),
             thinking_mode: false,
             tool_choice: None,
-            tools: vec![],
+            tools: vec![].into(),
             response_format: None,
             logprobs: None,
         };

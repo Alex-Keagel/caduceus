@@ -2180,7 +2180,7 @@ impl AgentHarness {
                 temperature: self.effective_temperature(),
                 thinking_mode: false,
                 tool_choice: None,
-                tools: vec![],
+                tools: vec![].into(),
                 response_format: None,
                 logprobs: if is_cisc { Some(5) } else { None },
             };
@@ -2553,8 +2553,11 @@ impl AgentHarness {
         }
 
         let assembler = MessageAssembler::new(self.max_context_tokens, &system_prompt);
-        // Build tool specs once — reused across iterations (only messages change)
-        let tool_specs = self.tools.specs();
+        // Build tool specs once — reused across iterations (only messages change).
+        // Converts `Vec<ToolSpec>` from the registry to `Arc<[ToolSpec]>` here so
+        // that each ChatRequest built below only bumps a refcount (ST-C2 Phase 4).
+        let tool_specs: Arc<[caduceus_core::ToolSpec]> =
+            Arc::from(self.tools.specs());
 
         // Token budget warning
         let warning = state.token_budget.warning_level();
@@ -2733,7 +2736,7 @@ impl AgentHarness {
                 temperature: self.effective_temperature(),
                 thinking_mode: false,
                 tool_choice: None,
-                tools: tool_specs.clone(),
+                tools: Arc::clone(&tool_specs),
                 response_format: None,
                 logprobs: self.request_logprobs.then_some(5),
             };
@@ -3626,7 +3629,7 @@ impl AgentHarness {
                 temperature: self.effective_temperature(),
                 thinking_mode: false,
                 tool_choice: None,
-                tools: vec![], // No tools — force text response
+                tools: vec![].into(), // No tools — force text response
                 response_format: None,
                 logprobs: None,
             };
@@ -3854,7 +3857,7 @@ impl AgentHarness {
             temperature: self.effective_temperature(),
             thinking_mode: false,
             tool_choice: None,
-            tools: vec![],
+            tools: vec![].into(),
             response_format: None,
             logprobs: None,
         };

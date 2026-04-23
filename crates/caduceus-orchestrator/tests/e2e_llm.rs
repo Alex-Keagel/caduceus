@@ -89,7 +89,7 @@ async fn e2e_anthropic_simple_chat() {
         temperature: Some(0.0),
         thinking_mode: false,
         tool_choice: None,
-        tools: vec![],
+        tools: vec![].into(),
         response_format: None,
         logprobs: None,
     };
@@ -133,7 +133,7 @@ async fn e2e_anthropic_tool_call() {
         temperature: Some(0.0),
         thinking_mode: false,
         tool_choice: None,
-        tools,
+        tools: tools.into(),
         response_format: None,
         logprobs: None,
     };
@@ -212,7 +212,7 @@ async fn e2e_openai_simple_chat() {
         temperature: Some(0.0),
         thinking_mode: false,
         tool_choice: None,
-        tools: vec![],
+        tools: vec![].into(),
         response_format: None,
         logprobs: None,
     };
@@ -252,7 +252,7 @@ async fn e2e_openai_tool_call() {
         temperature: Some(0.0),
         thinking_mode: false,
         tool_choice: None,
-        tools,
+        tools: tools.into(),
         response_format: None,
         logprobs: None,
     };
@@ -285,7 +285,7 @@ async fn e2e_copilot_simple_chat() {
         temperature: Some(0.0),
         thinking_mode: false,
         tool_choice: None,
-        tools: vec![],
+        tools: vec![].into(),
         response_format: None,
         logprobs: None,
     };
