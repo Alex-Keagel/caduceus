@@ -7,12 +7,14 @@ use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod event_redact;
 pub mod loop_detector;
 pub mod path_norm;
 pub mod process_reward;
 pub mod sanitizer;
 pub mod verification;
 
+pub use event_redact::{redact_secrets_for_event, REDACTED_SENTINEL};
 pub use loop_detector::{LoopCheckResult, LoopDetector};
 pub use path_norm::{is_path_like_field, normalize_lex, PATH_LIKE_FIELDS};
 pub use process_reward::{
@@ -1033,6 +1035,16 @@ pub enum AgentEvent {
         id: String,
         capability: String,
         description: String,
+        /// Raw tool-call input, with top-level secret-shaped keys redacted
+        /// via [`redact_secrets_for_event`]. Consumed by zed-side
+        /// always-allow matching (regex rules in
+        /// `tool_permissions.<tool>.always_allow`) so the matcher can look
+        /// at structured fields (`command`, `path`, `url`, ...) instead of
+        /// guessing them out of the humanized `description`. `None` on old
+        /// persisted events (backward-compat) and on paths that did not
+        /// have structured input available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_input: Option<serde_json::Value>,
     },
     /// Emitted after a permission request is resolved (or fails to resolve).
     /// Lets the UI distinguish user-deny from timeout / channel-closed /
@@ -4191,5 +4203,75 @@ log_level = "debug"
             matches!(ev, AgentEvent::Introspection(_)),
             "new build must parse Introspection; got {ev:?}"
         );
+    }
+
+    // ── PermissionRequest.raw_input (A1): wire-compat ────────────────────
+
+    /// Old persisted/legacy JSON (without `raw_input`) must deserialize
+    /// into `PermissionRequest` with `raw_input: None`. Guards against
+    /// inadvertent removal of `#[serde(default)]` on the new field.
+    #[test]
+    fn permission_request_old_payload_deserializes_to_none() {
+        let legacy = r#"{
+            "type": "PermissionRequest",
+            "id": "perm_t1",
+            "capability": "bash",
+            "description": "bash with args: {\"command\":\"ls\"}"
+        }"#;
+        let ev: AgentEvent = serde_json::from_str(legacy).unwrap();
+        match ev {
+            AgentEvent::PermissionRequest {
+                id,
+                capability,
+                description: _,
+                raw_input,
+            } => {
+                assert_eq!(id, "perm_t1");
+                assert_eq!(capability, "bash");
+                assert!(raw_input.is_none(), "raw_input must default to None");
+            }
+            other => panic!("expected PermissionRequest, got {other:?}"),
+        }
+    }
+
+    /// `raw_input: None` must NOT appear in the serialized JSON; a
+    /// downstream consumer reading old bytes shouldn't see a new
+    /// key pop up once this build roundtrips the event.
+    #[test]
+    fn permission_request_none_raw_input_skipped_in_serialization() {
+        let ev = AgentEvent::PermissionRequest {
+            id: "perm_t1".into(),
+            capability: "bash".into(),
+            description: "bash with args: {}".into(),
+            raw_input: None,
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(
+            !s.contains("raw_input"),
+            "None raw_input must be skipped; got {s}",
+        );
+    }
+
+    /// `Some(value)` roundtrips preserving structure — this is the
+    /// contract always-allow matching relies on.
+    #[test]
+    fn permission_request_some_raw_input_roundtrips() {
+        use serde_json::json;
+        let ev = AgentEvent::PermissionRequest {
+            id: "perm_t1".into(),
+            capability: "bash".into(),
+            description: "bash with args: {\"command\":\"ls\"}".into(),
+            raw_input: Some(json!({"command": "ls -la", "cwd": "/tmp"})),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let parsed: AgentEvent = serde_json::from_str(&s).unwrap();
+        match parsed {
+            AgentEvent::PermissionRequest { raw_input, .. } => {
+                let v = raw_input.expect("must be Some");
+                assert_eq!(v["command"].as_str(), Some("ls -la"));
+                assert_eq!(v["cwd"].as_str(), Some("/tmp"));
+            }
+            other => panic!("expected PermissionRequest, got {other:?}"),
+        }
     }
 }

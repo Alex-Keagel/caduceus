@@ -2295,6 +2295,17 @@ impl AgentHarness {
                                             .take(200)
                                             .collect::<String>()
                                     ),
+                                    // Structured input for downstream
+                                    // always-allow rule matching; top-level
+                                    // secret-shaped keys (api_key, token,
+                                    // headers, env, ...) are redacted before
+                                    // the value fans out over the broadcast
+                                    // channel + retention ring.
+                                    raw_input: Some(
+                                        caduceus_core::redact_secrets_for_event(
+                                            tool_use.input.clone(),
+                                        ),
+                                    ),
                                 })
                                 .await;
                             }
