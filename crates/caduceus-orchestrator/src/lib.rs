@@ -726,6 +726,13 @@ impl SessionManager {
 /// reconstruct the full timeline without server-side replay logic.
 pub const DEFAULT_EMITTER_RETENTION: usize = 200;
 
+/// Default capacity for the broadcast fan-out (ST-A2a).
+/// Per-subscriber buffer; slow subscribers get `RecvError::Lagged(n)`
+/// and must resubscribe. The retention ring is the durable source of
+/// truth, so lagged subscribers can always replay. Matches the
+/// retention cap so a subscriber that keeps up sees every event.
+pub const DEFAULT_BROADCAST_CAP: usize = 200;
+
 /// Clonable so callers (e.g. the IDE bridge) can hold a handle for
 /// [`AgentEventEmitter::replay`] on UI reattach without taking the only
 /// `&AgentEventEmitter` away from the harness. The clone shares the same
@@ -734,6 +741,15 @@ pub const DEFAULT_EMITTER_RETENTION: usize = 200;
 #[derive(Clone)]
 pub struct AgentEventEmitter {
     tx: mpsc::Sender<AgentEvent>,
+    /// Broadcast fan-out (ST-A2a): callers can `subscribe()` at any
+    /// time to get a fresh `broadcast::Receiver<AgentEvent>` without
+    /// moving the sender. Cheap when no subscribers exist
+    /// (`receiver_count()` is an atomic load). This is the API the
+    /// Zed bridge uses to attach a fresh per-turn receiver to a
+    /// long-lived harness — the mpsc `rx` from `channel(...)` remains
+    /// for single-consumer callers that want backpressure / strict
+    /// ordering semantics.
+    broadcast_tx: tokio::sync::broadcast::Sender<AgentEvent>,
     /// Retention ring (gap G14): every emitted event is also pushed here
     /// in order. UIs that disconnect (e.g. tab refresh, IPC reconnect)
     /// can call [`AgentEventEmitter::replay`] on reattach to rebuild the
@@ -760,8 +776,10 @@ impl AgentEventEmitter {
     /// which silently breaks the gap-G14 guarantee. If you want NO ring,
     /// use [`AgentEventEmitter::without_retention`] explicitly.
     pub fn with_retention(tx: mpsc::Sender<AgentEvent>, cap: usize) -> Self {
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(DEFAULT_BROADCAST_CAP);
         Self {
             tx,
+            broadcast_tx,
             retention: Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::with_capacity(cap.max(1)),
             )),
@@ -773,8 +791,10 @@ impl AgentEventEmitter {
     /// Construct without retention. Reserved for tests and headless runs
     /// that explicitly do not want per-emitter memory cost.
     pub fn without_retention(tx: mpsc::Sender<AgentEvent>) -> Self {
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(DEFAULT_BROADCAST_CAP);
         Self {
             tx,
+            broadcast_tx,
             retention: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             retention_cap: 0,
             dropped_since_last: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -811,6 +831,28 @@ impl AgentEventEmitter {
         self.retention_cap
     }
 
+    /// Subscribe to the broadcast fan-out (ST-A2a). Each call returns a
+    /// fresh `broadcast::Receiver<AgentEvent>` that will observe every
+    /// event emitted *after* this point (subscribers never see prior
+    /// events through the live channel; use [`replay`] to seed them
+    /// from the retention ring).
+    ///
+    /// Slow subscribers may observe `RecvError::Lagged(n)`, meaning
+    /// `n` events were dropped from their per-subscriber buffer (cap
+    /// = [`DEFAULT_BROADCAST_CAP`]). The retention ring still holds
+    /// those events, so lagged subscribers can replay + resubscribe
+    /// to resync without data loss.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentEvent> {
+        self.broadcast_tx.subscribe()
+    }
+
+    /// Current count of active broadcast subscribers. Primarily useful
+    /// for tests asserting the wiring; callers should not branch on
+    /// this in production paths (value can race with subscribe/drop).
+    pub fn broadcast_receiver_count(&self) -> usize {
+        self.broadcast_tx.receiver_count()
+    }
+
     /// Number of events dropped from the live mpsc channel since the last
     /// successful emit (gap G27). Reset to 0 by every successful send.
     /// Surfaced for diagnostics and tests; UIs should observe overflow
@@ -821,6 +863,17 @@ impl AgentEventEmitter {
     }
 
     pub async fn emit(&self, event: AgentEvent) {
+        // (0) ST-A2a broadcast fan-out. `receiver_count()` is a cheap
+        //     atomic load; when no bridge / UI is subscribed this is a
+        //     no-op and we avoid the clone. The `send` return value is
+        //     intentionally ignored — a broadcast with zero live
+        //     receivers returns `Err(SendError)`, but we've already
+        //     guarded against that with the count check; other errors
+        //     don't apply (broadcast has no "closed" state while the
+        //     sender lives).
+        if self.broadcast_tx.receiver_count() > 0 {
+            let _ = self.broadcast_tx.send(event.clone());
+        }
         // (1) Push into retention BEFORE try_send so the ring captures the
         //     event even if the live channel is full and we drop the
         //     real-time delivery. The ring is the durable source of truth
@@ -864,6 +917,11 @@ impl AgentEventEmitter {
                             }
                             ring.push_back(notice.clone());
                         }
+                    }
+                    // Mirror into the broadcast fan-out so live
+                    // subscribers see the gap marker too (ST-A2a).
+                    if self.broadcast_tx.receiver_count() > 0 {
+                        let _ = self.broadcast_tx.send(notice.clone());
                     }
                     if self.tx.try_send(notice).is_err() {
                         // Couldn't deliver the notice live; restore the
@@ -6677,6 +6735,97 @@ mod tests {
             })
             .collect();
         assert_eq!(msgs, vec!["e7", "e8", "e9"]);
+    }
+
+    // ── ST-A2a: Broadcast fan-out tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn emitter_subscribe_delivers_events_to_fresh_receiver() {
+        let (em, _rx) = AgentEventEmitter::channel(16);
+        let mut sub = em.subscribe();
+        em.emit_error("hello").await;
+        match sub.recv().await.unwrap() {
+            AgentEvent::Error { message } => assert_eq!(message, "hello"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emitter_subscribe_never_sees_prior_events() {
+        // Broadcast subscribers observe only events emitted AFTER they
+        // subscribe. Prior-turn events are reconstructed via replay()
+        // from the retention ring — this is the contract ST-A2a relies
+        // on for per-turn receivers attached to a long-lived harness.
+        let (em, _rx) = AgentEventEmitter::channel(16);
+        em.emit_error("before").await;
+        let mut sub = em.subscribe();
+        em.emit_error("after").await;
+        match sub.recv().await.unwrap() {
+            AgentEvent::Error { message } => assert_eq!(message, "after"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        // Nothing more in the live broadcast for this subscriber.
+        assert!(sub.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn emitter_subscribe_multiple_receivers_fan_out() {
+        let (em, _rx) = AgentEventEmitter::channel(16);
+        let mut s1 = em.subscribe();
+        let mut s2 = em.subscribe();
+        assert_eq!(em.broadcast_receiver_count(), 2);
+        em.emit_error("fanout").await;
+        for sub in [&mut s1, &mut s2] {
+            match sub.recv().await.unwrap() {
+                AgentEvent::Error { message } => assert_eq!(message, "fanout"),
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn emitter_broadcast_no_subs_is_zero_cost() {
+        // When no subscribers exist, emit must not observably change
+        // behaviour. Existing mpsc + retention contracts are
+        // untouched. This is the "subscriber dropped mid-session"
+        // steady-state for most of a harness's life.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let em = AgentEventEmitter::with_retention(tx, 10);
+        assert_eq!(em.broadcast_receiver_count(), 0);
+        em.emit_error("solo").await;
+        assert_eq!(em.broadcast_receiver_count(), 0);
+        match rx.recv().await.unwrap() {
+            AgentEvent::Error { message } => assert_eq!(message, "solo"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(em.replay().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn emitter_subscribe_after_drop_resubscribes_cleanly() {
+        // The per-turn pattern: subscribe for turn N, drop receiver at
+        // turn end, subscribe again for turn N+1. The new receiver
+        // must work, and receiver_count transitions cleanly.
+        let (em, _rx) = AgentEventEmitter::channel(16);
+        {
+            let mut sub = em.subscribe();
+            em.emit_error("turn-n").await;
+            assert!(matches!(
+                sub.recv().await.unwrap(),
+                AgentEvent::Error { .. }
+            ));
+            // sub dropped here
+        }
+        // Give tokio a tick so receiver_count observes the drop. Not
+        // strictly required (subscribe works regardless) but documents
+        // the invariant.
+        tokio::task::yield_now().await;
+        let mut sub2 = em.subscribe();
+        em.emit_error("turn-n+1").await;
+        match sub2.recv().await.unwrap() {
+            AgentEvent::Error { message } => assert_eq!(message, "turn-n+1"),
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[tokio::test]
