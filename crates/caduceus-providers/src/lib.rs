@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use caduceus_core::{
-    AuthStore, CaduceusError, ImageContent, ImageSource, ModelId, ProviderId, Result, ToolResult,
-    ToolSpec, ToolUse,
+    AuthStore, CaduceusError, ContentBlock, ImageContent, ImageSource, LlmMessage, ModelId,
+    ProviderId, Result, Role, ToolResult, ToolSpec, ToolUse,
 };
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
@@ -146,6 +146,184 @@ impl Message {
     pub fn with_cache_breakpoint(mut self) -> Self {
         self.cache_breakpoint = true;
         self
+    }
+}
+
+// ── ST-C2 Phase 1 — storage/wire conversion ───────────────────────────────
+//
+// `caduceus_core::LlmMessage` is the *canonical storage* shape (role + content
+// blocks). `providers::Message` is the *wire* shape — role-as-string plus
+// flattened tool-call / tool-result fields, serde-shaped for provider APIs.
+//
+// These `From` impls let callers convert at the adapter boundary without
+// leaking wire concerns into storage. The conversion is lossy in both
+// directions:
+//
+//   * wire → storage: drops `cache_breakpoint` (wire-only hint) and the
+//     duplicate `content: String` (content_blocks is authoritative).
+//   * storage → wire: rebuilds `content: String` by joining text blocks;
+//     `cache_breakpoint` defaults to false.
+//
+// These conversions materialise a fresh `Vec<MessageContentBlock>`, so they
+// are NOT free — they exist to enable Phase 2 (switching
+// `ConversationHistory` storage to `LlmMessage`) and Phase 3 (Arc-sharing
+// the content slice on the hot path). Until then, call sites still use
+// `providers::Message` directly.
+
+fn role_to_str(role: Role) -> &'static str {
+    match role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::System => "system",
+    }
+}
+
+fn role_from_str(s: &str) -> Role {
+    match s {
+        "assistant" => Role::Assistant,
+        "system" => Role::System,
+        // Default unknown roles (including "tool") to User — matches the
+        // provider wire convention where tool-result messages are sent with
+        // role=user and the tool payload in tool_result.
+        _ => Role::User,
+    }
+}
+
+impl From<&LlmMessage> for Message {
+    fn from(m: &LlmMessage) -> Self {
+        let mut content_text = String::new();
+        let mut blocks: Vec<MessageContentBlock> = Vec::new();
+        let mut tool_calls: Vec<ToolUse> = Vec::new();
+        let mut tool_result: Option<ToolResult> = None;
+
+        for block in &m.content {
+            match block {
+                ContentBlock::Text(s) => {
+                    content_text.push_str(s);
+                    blocks.push(MessageContentBlock::text(s.clone()));
+                }
+                ContentBlock::Image(img) => match &img.source {
+                    ImageSource::Base64 { media_type, data } => {
+                        blocks.push(MessageContentBlock::Image {
+                            base64: data.clone(),
+                            media_type: media_type.clone(),
+                        });
+                    }
+                    ImageSource::Url(_) => {
+                        // Wire `MessageContentBlock::Image` is base64-only
+                        // today; drop URL-sourced images rather than fail.
+                        // Adapters that care (Anthropic, OpenAI vision) must
+                        // resolve URLs upstream of the wire boundary.
+                    }
+                },
+                ContentBlock::ToolUse { id, name, input } => {
+                    tool_calls.push(ToolUse {
+                        id: id.0.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    });
+                }
+                ContentBlock::ToolResult {
+                    tool_call_id,
+                    content,
+                    is_error,
+                } => {
+                    // Wire Message holds at most one tool_result; if the
+                    // storage message contains multiple, we keep the first
+                    // and warn. Callers that need one-per-tool-result must
+                    // split the storage message upstream.
+                    if tool_result.is_some() {
+                        tracing::warn!(
+                            tool_call_id = %tool_call_id.0,
+                            "LlmMessage → providers::Message: dropped second tool_result; \
+                             wire Message holds only one. Split storage message upstream."
+                        );
+                    } else {
+                        tool_result = Some(
+                            if *is_error {
+                                ToolResult::error(content.clone())
+                            } else {
+                                ToolResult::success(content.clone())
+                            }
+                            .with_tool_use_id(tool_call_id.0.clone()),
+                        );
+                    }
+                }
+            }
+        }
+
+        Message {
+            role: role_to_str(m.role).into(),
+            content: content_text,
+            content_blocks: if blocks.is_empty() { None } else { Some(blocks) },
+            tool_calls,
+            tool_result,
+            cache_breakpoint: false,
+        }
+    }
+}
+
+impl From<LlmMessage> for Message {
+    fn from(m: LlmMessage) -> Self {
+        Self::from(&m)
+    }
+}
+
+impl From<&Message> for LlmMessage {
+    fn from(m: &Message) -> Self {
+        let role = role_from_str(&m.role);
+        let mut content: Vec<ContentBlock> = Vec::new();
+
+        // Prefer structured content_blocks when present; fall back to the
+        // plain `content` string for legacy call sites.
+        if let Some(blocks) = &m.content_blocks {
+            for b in blocks {
+                match b {
+                    MessageContentBlock::Text { text, .. } => {
+                        content.push(ContentBlock::Text(text.clone()));
+                    }
+                    MessageContentBlock::Image { base64, media_type } => {
+                        content.push(ContentBlock::Image(ImageContent {
+                            source: ImageSource::Base64 {
+                                media_type: media_type.clone(),
+                                data: base64.clone(),
+                            },
+                            detail: None,
+                        }));
+                    }
+                }
+            }
+        } else if !m.content.is_empty() {
+            content.push(ContentBlock::Text(m.content.clone()));
+        }
+
+        for tc in &m.tool_calls {
+            content.push(ContentBlock::ToolUse {
+                id: caduceus_core::ToolCallId::new(tc.id.clone()),
+                name: tc.name.clone(),
+                input: tc.input.clone(),
+            });
+        }
+
+        if let Some(tr) = &m.tool_result {
+            content.push(ContentBlock::ToolResult {
+                tool_call_id: tr
+                    .tool_use_id
+                    .clone()
+                    .map(caduceus_core::ToolCallId::new)
+                    .unwrap_or_else(|| caduceus_core::ToolCallId::new("")),
+                content: tr.content.clone(),
+                is_error: tr.is_error,
+            });
+        }
+
+        LlmMessage { role, content }
+    }
+}
+
+impl From<Message> for LlmMessage {
+    fn from(m: Message) -> Self {
+        Self::from(&m)
     }
 }
 
@@ -2288,6 +2466,121 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::Mutex;
     use std::thread;
+
+    // ── ST-C2 Phase 1 — LlmMessage ↔ Message conversions ────────────────────
+
+    #[test]
+    fn c2_llm_to_wire_user_text_roundtrip() {
+        let storage = LlmMessage::user("hello world");
+        let wire: Message = (&storage).into();
+        assert_eq!(wire.role, "user");
+        assert_eq!(wire.content, "hello world");
+        let back: LlmMessage = (&wire).into();
+        assert_eq!(back.role, Role::User);
+        assert_eq!(back.content.len(), 1);
+        match &back.content[0] {
+            ContentBlock::Text(s) => assert_eq!(s, "hello world"),
+            _ => panic!("expected Text block"),
+        }
+    }
+
+    #[test]
+    fn c2_wire_to_llm_assistant_roundtrip() {
+        let wire = Message::assistant("sure thing");
+        let storage: LlmMessage = (&wire).into();
+        assert_eq!(storage.role, Role::Assistant);
+        assert_eq!(storage.content.len(), 1);
+        let back: Message = storage.into();
+        assert_eq!(back.role, "assistant");
+        assert!(back.content.contains("sure thing"));
+    }
+
+    #[test]
+    fn c2_llm_to_wire_tool_use_preserved() {
+        let storage = LlmMessage {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text("let me check".into()),
+                ContentBlock::ToolUse {
+                    id: caduceus_core::ToolCallId::new("tc_1"),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "/tmp/x"}),
+                },
+            ],
+        };
+        let wire: Message = (&storage).into();
+        assert_eq!(wire.tool_calls.len(), 1);
+        assert_eq!(wire.tool_calls[0].id, "tc_1");
+        assert_eq!(wire.tool_calls[0].name, "read_file");
+        let back: LlmMessage = (&wire).into();
+        // text + tool-use round-trip preserves block count & order
+        assert_eq!(back.content.len(), 2);
+        assert!(matches!(back.content[0], ContentBlock::Text(_)));
+        assert!(matches!(back.content[1], ContentBlock::ToolUse { .. }));
+    }
+
+    #[test]
+    fn c2_llm_to_wire_tool_result_preserved() {
+        let storage = LlmMessage::tool_result(
+            caduceus_core::ToolCallId::new("tc_42"),
+            "file contents",
+            false,
+        );
+        let wire: Message = (&storage).into();
+        let tr = wire.tool_result.as_ref().expect("tool_result set");
+        assert_eq!(tr.content, "file contents");
+        assert!(!tr.is_error);
+        assert_eq!(tr.tool_use_id.as_deref(), Some("tc_42"));
+
+        let back: LlmMessage = (&wire).into();
+        // Expect a ToolResult block (plus no Text since wire.content is empty
+        // for tool_result-only messages built by LlmMessage::tool_result).
+        let tool_results: Vec<&ContentBlock> = back
+            .content
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            .collect();
+        assert_eq!(tool_results.len(), 1);
+    }
+
+    #[test]
+    fn c2_llm_to_wire_error_tool_result() {
+        let storage = LlmMessage::tool_result(
+            caduceus_core::ToolCallId::new("tc_err"),
+            "permission denied",
+            true,
+        );
+        let wire: Message = (&storage).into();
+        let tr = wire.tool_result.as_ref().expect("tool_result set");
+        assert!(tr.is_error);
+        assert_eq!(tr.content, "permission denied");
+    }
+
+    #[test]
+    fn c2_wire_to_llm_system_role() {
+        let wire = Message::system("you are helpful");
+        let storage: LlmMessage = (&wire).into();
+        assert_eq!(storage.role, Role::System);
+    }
+
+    #[test]
+    fn c2_wire_to_llm_unknown_role_defaults_user() {
+        let mut wire = Message::user("hi");
+        wire.role = "tool".into();
+        let storage: LlmMessage = (&wire).into();
+        // role=tool maps to User (wire convention: tool-result on user role)
+        assert_eq!(storage.role, Role::User);
+    }
+
+    #[test]
+    fn c2_llm_to_wire_drops_cache_breakpoint() {
+        let storage = LlmMessage::user("cached");
+        let wire: Message = (&storage).into();
+        // storage has no cache_breakpoint field, wire default is false
+        assert!(!wire.cache_breakpoint);
+    }
+
+    // ── end ST-C2 Phase 1 tests ─────────────────────────────────────────────
 
     struct TestServer {
         base_url: String,
