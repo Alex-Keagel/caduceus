@@ -62,3 +62,16 @@ impl PairAwareMessage for caduceus_providers::Message {
         self.tool_result.as_ref()?.tool_use_id.as_deref()
     }
 }
+
+/// Transparent pairing view through any smart pointer (Arc / Rc / Box) so
+/// `ConversationHistory` can store `Arc<Message>` without reimplementing the
+/// trait for each wrapper (ST-C2 Phase 2).
+impl<M: PairAwareMessage> PairAwareMessage for std::sync::Arc<M> {
+    fn tool_request_ids(&self) -> Option<Vec<&str>> {
+        (**self).tool_request_ids()
+    }
+
+    fn tool_result_id(&self) -> Option<&str> {
+        (**self).tool_result_id()
+    }
+}

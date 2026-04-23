@@ -18,6 +18,7 @@
 
 use async_trait::async_trait;
 use caduceus_providers::Message;
+use std::sync::Arc;
 
 /// What the critic decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +41,7 @@ pub trait Critic: Send + Sync {
     /// including) the assistant message under review — useful for
     /// detecting "the model just repeated itself" or "ignored a tool
     /// result".
-    async fn judge(&self, task: &str, response: &str, history: &[Message]) -> Verdict;
+    async fn judge(&self, task: &str, response: &str, history: &[Arc<Message>]) -> Verdict;
 }
 
 /// No‑LLM critic that rejects obvious cop‑outs and trivially short
@@ -72,7 +73,7 @@ impl Default for HeuristicCritic {
 
 #[async_trait]
 impl Critic for HeuristicCritic {
-    async fn judge(&self, _task: &str, response: &str, _history: &[Message]) -> Verdict {
+    async fn judge(&self, _task: &str, response: &str, _history: &[Arc<Message>]) -> Verdict {
         let trimmed = response.trim();
         if trimmed.len() < self.min_chars {
             return Verdict::Reject {
@@ -117,7 +118,7 @@ impl ScriptedCritic {
 
 #[async_trait]
 impl Critic for ScriptedCritic {
-    async fn judge(&self, _task: &str, _response: &str, _history: &[Message]) -> Verdict {
+    async fn judge(&self, _task: &str, _response: &str, _history: &[Arc<Message>]) -> Verdict {
         self.verdicts
             .lock()
             .unwrap()

@@ -218,9 +218,15 @@ pub use caduceus_core::{LoopCheckResult, LoopDetector};
 // ── Conversation history ───────────────────────────────────────────────────────
 
 /// Manages an ordered list of provider-level messages for the conversation.
+///
+/// Messages are stored as `Arc<Message>` (ST-C2 Phase 2) so that cloning the
+/// history — which happens on every turn to feed the provider — is O(messages)
+/// pointer copies instead of deep content clones. External callers still see
+/// `&[Arc<Message>]`; treat each element as if it were a `&Message` (Arc
+/// auto-derefs on field access).
 #[derive(Debug, Clone, Default)]
 pub struct ConversationHistory {
-    messages: Vec<caduceus_providers::Message>,
+    messages: Vec<Arc<caduceus_providers::Message>>,
 }
 
 impl ConversationHistory {
@@ -230,11 +236,17 @@ impl ConversationHistory {
         }
     }
 
+    /// Append a fresh message; wraps it in `Arc` internally.
     pub fn append(&mut self, message: caduceus_providers::Message) {
+        self.messages.push(Arc::new(message));
+    }
+
+    /// Append a message that is already `Arc`-wrapped (sharing scenarios).
+    pub fn append_arc(&mut self, message: Arc<caduceus_providers::Message>) {
         self.messages.push(message);
     }
 
-    pub fn messages(&self) -> &[caduceus_providers::Message] {
+    pub fn messages(&self) -> &[Arc<caduceus_providers::Message>] {
         &self.messages
     }
 
@@ -300,7 +312,7 @@ impl ConversationHistory {
                 };
                 let tokens: u32 = slice
                     .iter()
-                    .map(crate::MessageAssembler::message_tokens)
+                    .map(|m| crate::MessageAssembler::message_tokens(m.as_ref()))
                     .sum();
                 caduceus_core::EvictedGroupRef {
                     kind: kind.to_string(),
@@ -321,13 +333,21 @@ impl ConversationHistory {
     }
 
     pub fn serialize(&self) -> Result<String> {
-        serde_json::to_string(&self.messages).map_err(|e| CaduceusError::Config(e.to_string()))
+        // Build a view of &Message refs so serde can serialize without
+        // requiring the serde `rc` feature for Arc<T>.
+        let view: Vec<&caduceus_providers::Message> =
+            self.messages.iter().map(|a| a.as_ref()).collect();
+        serde_json::to_string(&view).map_err(|e| CaduceusError::Config(e.to_string()))
     }
 
     pub fn deserialize(json: &str) -> Result<Self> {
-        let messages: Vec<caduceus_providers::Message> =
+        // Deserialize into owned Messages then wrap in Arc — avoids needing
+        // serde's `rc` feature flag.
+        let raw: Vec<caduceus_providers::Message> =
             serde_json::from_str(json).map_err(|e| CaduceusError::Config(e.to_string()))?;
-        Ok(Self { messages })
+        Ok(Self {
+            messages: raw.into_iter().map(Arc::new).collect(),
+        })
     }
 }
 
@@ -403,7 +423,10 @@ impl MessageAssembler {
         // Walk units newest-first, stop when next unit doesn't fit.
         let mut included_units: Vec<(usize, usize)> = Vec::new();
         for &(start, end) in units.iter().rev() {
-            let unit_cost: u32 = messages[start..end].iter().map(Self::message_tokens).sum();
+            let unit_cost: u32 = messages[start..end]
+                .iter()
+                .map(|m| Self::message_tokens(m.as_ref()))
+                .sum();
             if budget_used + unit_cost > available {
                 // Stop on first non-fitting unit so chronological order is
                 // preserved (we never want a gap in the middle of history).
@@ -417,7 +440,7 @@ impl MessageAssembler {
         included_units.reverse();
         for (start, end) in included_units {
             for msg in &messages[start..end] {
-                result.push(msg.clone());
+                result.push(msg.as_ref().clone());
             }
         }
 
@@ -1392,7 +1415,7 @@ impl AgentHarness {
         &self,
         persona: &str,
         project_context: &str,
-        messages: &[caduceus_providers::Message],
+        messages: &[Arc<caduceus_providers::Message>],
     ) -> Option<crate::memory_blocks::CompactionReport> {
         let blocks_arc = self.memory_blocks.as_ref()?;
         let mut g = blocks_arc.lock().ok()?;
@@ -8720,8 +8743,8 @@ mod feature_tests_259_261 {
         let h = make_test_harness().with_memory_blocks(Arc::clone(&mb));
 
         let msgs = vec![
-            caduceus_providers::Message::user("hello"),
-            caduceus_providers::Message::assistant("hi there"),
+            Arc::new(caduceus_providers::Message::user("hello")),
+            Arc::new(caduceus_providers::Message::assistant("hi there")),
         ];
         let report = h
             .sync_memory_blocks("you are caduceus", "open: src/lib.rs", &msgs)
@@ -8763,7 +8786,7 @@ mod feature_tests_259_261 {
             cache_breakpoint: false,
         };
 
-        h.sync_memory_blocks("p", "c", &[assistant, tool_msg])
+        h.sync_memory_blocks("p", "c", &[Arc::new(assistant), Arc::new(tool_msg)])
             .expect("blocks attached");
 
         let g = mb.lock().unwrap();
@@ -8787,9 +8810,9 @@ mod feature_tests_259_261 {
 
         // Each message is ~6 chars => ~2 tokens. 3 messages => ~6 tokens > 4.
         let msgs = vec![
-            caduceus_providers::Message::user("aaaaaa"),
-            caduceus_providers::Message::user("bbbbbb"),
-            caduceus_providers::Message::user("cccccc"),
+            Arc::new(caduceus_providers::Message::user("aaaaaa")),
+            Arc::new(caduceus_providers::Message::user("bbbbbb")),
+            Arc::new(caduceus_providers::Message::user("cccccc")),
         ];
         let report = h
             .sync_memory_blocks("p", "c", &msgs)
