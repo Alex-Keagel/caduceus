@@ -52,6 +52,16 @@ pub use task_hierarchy::{HierarchicalTask, TaskTree};
 pub use task_recommender::{TaskRecommendation, TaskRecommender};
 pub use time_tracking::{TimeEntry, TimeTracker};
 
+// ST-B1 Wave 0c — extracted modules.
+mod config_loader;
+mod effort_levels;
+mod execution_tree;
+mod query_config;
+pub use config_loader::ConfigLoader;
+pub use effort_levels::EffortLevel;
+pub use execution_tree::{ExecutionTreeViz, VizTreeNode};
+pub use query_config::QueryConfig;
+
 pub use branching_planner::PlannerConfig;
 pub use context::{AssembledContext, ContextSource};
 pub use critique_fanout::IntrospectionSink;
@@ -73,7 +83,6 @@ use caduceus_permissions::envelope::{
 };
 use caduceus_providers::{ChatRequest, LlmAdapter};
 use caduceus_tools::ToolRegistry;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -88,125 +97,6 @@ enum ToolSpawnOutcome {
     Cancelled,
 }
 
-// ── Config loader ──────────────────────────────────────────────────────────────
-
-pub struct ConfigLoader {
-    config_path: std::path::PathBuf,
-}
-
-impl ConfigLoader {
-    pub fn new(config_path: impl Into<std::path::PathBuf>) -> Self {
-        Self {
-            config_path: config_path.into(),
-        }
-    }
-
-    pub fn load(&self) -> Result<caduceus_core::CaduceusConfig> {
-        if self.config_path.exists() {
-            let content = std::fs::read_to_string(&self.config_path)
-                .map_err(|e| CaduceusError::Config(e.to_string()))?;
-            serde_json::from_str(&content).map_err(|e| CaduceusError::Config(e.to_string()))
-        } else {
-            Ok(caduceus_core::CaduceusConfig::default())
-        }
-    }
-
-    pub fn save(&self, config: &caduceus_core::CaduceusConfig) -> Result<()> {
-        if let Some(parent) = self.config_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| CaduceusError::Config(e.to_string()))?;
-        }
-        let json = serde_json::to_string_pretty(config)?;
-        std::fs::write(&self.config_path, json).map_err(|e| CaduceusError::Config(e.to_string()))
-    }
-}
-
-// ── P1: Effort Levels ──────────────────────────────────────────────────────────
-
-/// Controls the detail level of LLM interactions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EffortLevel {
-    Min,
-    Low,
-    Medium,
-    High,
-    Max,
-}
-
-impl EffortLevel {
-    pub fn from_str_loose(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "min" | "minimum" => Some(Self::Min),
-            "low" => Some(Self::Low),
-            "medium" | "med" => Some(Self::Medium),
-            "high" => Some(Self::High),
-            "max" | "maximum" => Some(Self::Max),
-            _ => None,
-        }
-    }
-
-    /// System prompt detail level description.
-    pub fn system_prompt_detail(&self) -> &'static str {
-        match self {
-            Self::Min => "Be extremely concise. One sentence max.",
-            Self::Low => "Be brief. Short paragraphs only.",
-            Self::Medium => "Provide balanced detail with examples when helpful.",
-            Self::High => "Be thorough. Include examples, edge cases, and alternatives.",
-            Self::Max => {
-                "Be exhaustive. Cover every detail, edge case, alternative, and implication."
-            }
-        }
-    }
-
-    /// Suggested max_tokens for this effort level.
-    pub fn max_tokens(&self) -> u32 {
-        match self {
-            Self::Min => 256,
-            Self::Low => 1024,
-            Self::Medium => 8192,
-            Self::High => 16384,
-            Self::Max => 32768,
-        }
-    }
-
-    /// Suggested temperature for this effort level.
-    pub fn temperature(&self) -> f32 {
-        match self {
-            Self::Min => 0.0,
-            Self::Low => 0.2,
-            Self::Medium => 0.5,
-            Self::High => 0.7,
-            Self::Max => 0.8,
-        }
-    }
-}
-
-// ── P1: Query Configuration ────────────────────────────────────────────────────
-
-/// Per-query overrides for model parameters.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct QueryConfig {
-    pub model: Option<ModelId>,
-    pub temperature: Option<f32>,
-    pub max_tokens: Option<u32>,
-}
-
-impl QueryConfig {
-    /// Parse from `/config` command args like `model=gpt-4 temp=0.5 tokens=8192`.
-    pub fn parse(args: &str) -> Self {
-        let mut config = Self::default();
-        for part in args.split_whitespace() {
-            if let Some((key, value)) = part.split_once('=') {
-                match key {
-                    "model" => config.model = Some(ModelId::new(value)),
-                    "temp" | "temperature" => config.temperature = value.parse().ok(),
-                    "tokens" | "max_tokens" => config.max_tokens = value.parse().ok(),
-                    _ => {}
-                }
-            }
-        }
-        config
-    }
-}
 
 // ── P1: Loop Detection ─────────────────────────────────────────────────────────
 // F2: unified implementation lives in caduceus-core. The engine re-exports
@@ -4258,109 +4148,6 @@ fn extract_host(url: &str) -> Option<String> {
         None
     } else {
         Some(host.to_string())
-    }
-}
-
-// ── #234: Agent Execution Tree Visualizer ─────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VizTreeNode {
-    pub id: String,
-    pub label: String,
-    /// One of: "active", "succeeded", "failed", "pruned"
-    pub status: String,
-    pub parent: Option<String>,
-    pub error: Option<String>,
-    pub depth: usize,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ExecutionTreeViz {
-    pub nodes: Vec<VizTreeNode>,
-}
-
-impl ExecutionTreeViz {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn add_node(&mut self, node: VizTreeNode) {
-        self.nodes.push(node);
-    }
-
-    pub fn node_color(status: &str) -> &'static str {
-        match status {
-            "active" => "#f59e0b",    // amber / yellow
-            "succeeded" => "#10b981", // green
-            "failed" => "#ef4444",    // red
-            "pruned" => "#6b7280",    // gray
-            _ => "#6b7280",
-        }
-    }
-
-    /// Emit React Flow nodes + edges JSON.
-    pub fn to_react_flow_json(&self) -> serde_json::Value {
-        let rf_nodes: Vec<serde_json::Value> = self
-            .nodes
-            .iter()
-            .map(|n| {
-                serde_json::json!({
-                    "id": n.id,
-                    "type": "default",
-                    "data": {
-                        "label": n.label,
-                        "status": n.status,
-                        "error": n.error,
-                    },
-                    "style": {
-                        "background": Self::node_color(&n.status),
-                        "color": "#fff",
-                        "borderRadius": "8px",
-                    },
-                    "position": {
-                        "x": (n.depth as f64) * 200.0,
-                        "y": 0.0,  // caller is responsible for layout
-                    }
-                })
-            })
-            .collect();
-
-        let rf_edges: Vec<serde_json::Value> = self
-            .nodes
-            .iter()
-            .filter_map(|n| {
-                n.parent.as_ref().map(|p| {
-                    serde_json::json!({
-                        "id": format!("{}->{}", p, n.id),
-                        "source": p,
-                        "target": n.id,
-                        "type": "smoothstep",
-                    })
-                })
-            })
-            .collect();
-
-        serde_json::json!({ "nodes": rf_nodes, "edges": rf_edges })
-    }
-
-    /// Emit Mermaid `graph TD` flowchart syntax.
-    pub fn to_mermaid(&self) -> String {
-        let mut out = String::from("graph TD\n");
-        for node in &self.nodes {
-            let safe_label = node.label.replace('"', "'");
-            out.push_str(&format!("    {}[\"{}\"]\n", node.id, safe_label));
-            let color = match node.status.as_str() {
-                "succeeded" => "fill:#10b981,color:#fff",
-                "failed" => "fill:#ef4444,color:#fff",
-                "active" => "fill:#f59e0b,color:#fff",
-                _ => "fill:#6b7280,color:#fff",
-            };
-            out.push_str(&format!("    style {} {}\n", node.id, color));
-            if let Some(parent) = &node.parent {
-                out.push_str(&format!("    {} --> {}\n", parent, node.id));
-            }
-        }
-        out
     }
 }
 
