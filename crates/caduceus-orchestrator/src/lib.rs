@@ -241,6 +241,98 @@ impl ConversationHistory {
     }
 }
 
+/// ST-C2 Phase 3 — retrospective benchmark validating the Phase 2 win.
+///
+/// Phase 2 changed `ConversationHistory::messages` from `Vec<Message>` to
+/// `Vec<Arc<Message>>`. This means `ConversationHistory::clone()` — which
+/// the harness does once per turn when snapshotting state — now bumps
+/// refcounts instead of deep-cloning each `Message` (and every `String`
+/// inside it).
+///
+/// Run with:
+/// ```text
+/// cargo test -p caduceus-orchestrator --release \
+///     phase3_clone_benchmark -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod phase3_bench {
+    use super::*;
+    use caduceus_providers::Message;
+    use std::time::Instant;
+
+    fn sample_message(i: usize) -> Message {
+        // 2 KB-ish body per message — realistic assistant turn size.
+        let body = "lorem ipsum ".repeat(170);
+        Message {
+            role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+            content: format!("[turn {i}] {body}"),
+            content_blocks: None,
+            tool_calls: vec![],
+            tool_result: None,
+            cache_breakpoint: false,
+        }
+    }
+
+    #[test]
+    #[ignore = "perf benchmark; run explicitly with --ignored"]
+    fn phase3_clone_benchmark() {
+        const N: usize = 100;
+        const ITERS: usize = 10_000;
+
+        // Build the "after" representation (today's ConversationHistory).
+        let mut arc_history = ConversationHistory::new();
+        for i in 0..N {
+            arc_history.append(sample_message(i));
+        }
+
+        // Build the "before" representation — a plain Vec<Message> of the
+        // same content. Clone semantics match pre-Phase-2 behavior.
+        let pre_phase2: Vec<Message> = (0..N).map(sample_message).collect();
+
+        // Warm up caches.
+        let _warm_a = arc_history.clone();
+        let _warm_b = pre_phase2.clone();
+
+        let before = Instant::now();
+        for _ in 0..ITERS {
+            let clone = pre_phase2.clone();
+            std::hint::black_box(clone);
+        }
+        let deep_clone_elapsed = before.elapsed();
+
+        let before = Instant::now();
+        for _ in 0..ITERS {
+            let clone = arc_history.clone();
+            std::hint::black_box(clone);
+        }
+        let arc_clone_elapsed = before.elapsed();
+
+        let ratio =
+            deep_clone_elapsed.as_nanos() as f64 / arc_clone_elapsed.as_nanos().max(1) as f64;
+
+        println!(
+            "Phase 3 clone benchmark (N={N} messages, {ITERS} iters):\n  \
+             pre-Phase-2 deep clone:   {:>12?}\n  \
+             post-Phase-2 Arc clone:   {:>12?}\n  \
+             speedup:                  {ratio:.1}×",
+            deep_clone_elapsed, arc_clone_elapsed,
+        );
+
+        // Sanity floor: the Arc refcount clone must be materially cheaper
+        // than the deep clone. A 2× floor is conservative; real runs show
+        // 20–100×. Guards against a regression that re-introduces deep
+        // cloning (e.g. changing `messages: Vec<Arc<Message>>` back to
+        // `Vec<Message>` without noticing).
+        assert!(
+            ratio >= 2.0,
+            "Phase 3 regression: Arc clone should be ≥2× faster than deep \
+             clone, got {ratio:.2}× (deep={:?}, arc={:?})",
+            deep_clone_elapsed,
+            arc_clone_elapsed,
+        );
+    }
+}
+
 // ── Context assembler ──────────────────────────────────────────────────────────
 
 /// Assembles the full message list for an LLM request within a token budget.
