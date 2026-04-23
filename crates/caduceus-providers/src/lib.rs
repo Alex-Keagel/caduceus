@@ -363,6 +363,13 @@ pub struct ChatResponse {
     /// "unsupported / not requested", not as "low confidence".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<LogprobsSummary>,
+    /// ST-A6: opaque reasoning/thinking text emitted separately from
+    /// `content`. Serde-default so existing callers and on-disk
+    /// payloads that predate ST-A6 deserialise as `""` (empty). UIs
+    /// that want to render a "thinking" pane read this field; legacy
+    /// text-only consumers remain untouched.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thinking: String,
 }
 
 // StopReason is re-exported from caduceus_core — canonical definition lives there.
@@ -713,6 +720,7 @@ fn parse_anthropic_chat_response(body: &str) -> Result<ChatResponse> {
         stop_reason,
         tool_calls,
         logprobs: None,
+        thinking: String::new(),
     })
 }
 
@@ -1260,6 +1268,7 @@ fn parse_openai_chat_response(body: &str) -> Result<ChatResponse> {
         stop_reason,
         tool_calls,
         logprobs,
+        thinking: String::new(),
     })
 }
 
@@ -3305,6 +3314,7 @@ mod tests {
             stop_reason: StopReason::EndTurn,
             tool_calls: vec![],
             logprobs: None,
+            thinking: String::new(),
         };
 
         let mock = MockLlmAdapter::new(vec![success_response.clone()]);
@@ -3378,6 +3388,7 @@ mod tests {
             stop_reason: StopReason::EndTurn,
             tool_calls: vec![],
             logprobs: None,
+            thinking: String::new(),
         };
 
         let mock = MockLlmAdapter::new(vec![empty_response]);

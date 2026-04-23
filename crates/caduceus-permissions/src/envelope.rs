@@ -438,11 +438,7 @@ impl PermissionEnvelope {
     /// to `plan_preset()` (the safest preset — no writes). This is the
     /// single entry point `EnvelopeDefaults` delegates to; all other preset
     /// helpers MUST remain equivalent to the per-mode functions they call.
-    pub fn from_mode_name(
-        mode: &str,
-        write_allow: Vec<String>,
-        write_deny: Vec<String>,
-    ) -> Self {
+    pub fn from_mode_name(mode: &str, write_allow: Vec<String>, write_deny: Vec<String>) -> Self {
         match mode {
             "plan" | "Plan" => Self::plan_preset(),
             "research" | "Research" => Self::research_preset(),
@@ -773,8 +769,7 @@ mod tests {
     fn from_mode_name_matches_act_preset() {
         let allow = vec!["src/**".to_string(), "tests/**".to_string()];
         let deny = vec!["src/secrets/**".to_string()];
-        let via_builder =
-            PermissionEnvelope::from_mode_name("act", allow.clone(), deny.clone());
+        let via_builder = PermissionEnvelope::from_mode_name("act", allow.clone(), deny.clone());
         let direct = PermissionEnvelope::act_preset(allow, deny);
         assert_eq!(
             serde_json::to_string(&via_builder).unwrap(),

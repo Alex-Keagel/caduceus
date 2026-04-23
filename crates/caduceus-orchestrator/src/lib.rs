@@ -3864,6 +3864,7 @@ impl AgentHarness {
                     cache_read_tokens: cache_read,
                     cache_creation_tokens: cache_create,
                     logprobs: None,
+                    thinking: String::new(),
                 })
             }
             Err(_) => {
@@ -4871,6 +4872,7 @@ mod tests {
             stop_reason: StopReason::EndTurn,
             tool_calls: vec![],
             logprobs: None,
+            thinking: String::new(),
         }
     }
     /// 1. read_only_tool_execution — read_file works without write permission
@@ -5390,6 +5392,7 @@ mod tests {
                 input: serde_json::json!({"path": "test.txt"}),
             }],
             logprobs: None,
+            thinking: String::new(),
         };
         let final_response = make_chat_response("Done reading the file.");
 
@@ -5430,6 +5433,7 @@ mod tests {
                     input: serde_json::json!({}),
                 }],
                 logprobs: None,
+                thinking: String::new(),
             });
         }
         let adapter = Arc::new(MockLlmAdapter::new(responses));
@@ -5460,6 +5464,7 @@ mod tests {
             stop_reason: StopReason::ToolUse,
             tool_calls: vec![], // empty!,
             logprobs: None,
+            thinking: String::new(),
         };
         let adapter = Arc::new(MockLlmAdapter::new(vec![response]));
         let registry = caduceus_tools::ToolRegistry::new();
@@ -5509,6 +5514,7 @@ mod tests {
                 input: serde_json::json!({"path": "nonexistent_file_xyz.txt"}),
             }],
             logprobs: None,
+            thinking: String::new(),
         };
         let final_response = make_chat_response("File not found.");
 
@@ -5602,6 +5608,7 @@ mod tests {
                 input: serde_json::json!({"path": "hello.txt"}),
             }],
             logprobs: None,
+            thinking: String::new(),
         };
         let final_response = ChatResponse {
             content: "The file contains: world".to_string(),
@@ -5612,6 +5619,7 @@ mod tests {
             stop_reason: StopReason::EndTurn,
             tool_calls: vec![],
             logprobs: None,
+            thinking: String::new(),
         };
 
         let adapter = Arc::new(MockLlmAdapter::new(vec![tool_response, final_response]));
@@ -5764,6 +5772,7 @@ mod tests {
                 input: serde_json::json!({"path": "hello.txt"}),
             }],
             logprobs: None,
+            thinking: String::new(),
         };
         let final_response = make_chat_response("Here is the file content.");
 
@@ -5806,6 +5815,7 @@ mod tests {
                     input: serde_json::json!({}),
                 }],
                 logprobs: None,
+                thinking: String::new(),
             })
             .collect();
 
@@ -5846,6 +5856,7 @@ mod tests {
                 input: serde_json::json!({"path": "test.txt"}),
             }],
             logprobs: None,
+            thinking: String::new(),
         };
         let final_response = make_chat_response("Done!");
 
@@ -5998,6 +6009,7 @@ mod tests {
                 input: serde_json::json!({"path": "out.txt", "content": "data"}),
             }],
             logprobs: None,
+            thinking: String::new(),
         };
         let final_response = make_chat_response("Acknowledged.");
         let adapter = Arc::new(MockLlmAdapter::new(vec![tool_response, final_response]));
@@ -6466,6 +6478,7 @@ mod tests {
                     input: serde_json::json!({"path": "x", "content": "y"}),
                 }],
                 logprobs: None,
+                thinking: String::new(),
             });
         }
         responses.push(make_chat_response("All denied — done."));
@@ -6524,6 +6537,7 @@ mod tests {
                 input: serde_json::json!({"path": "malicious.txt"}),
             }],
             logprobs: None,
+            thinking: String::new(),
         };
         let final_resp = make_chat_response("Refused; output flagged.");
         let adapter = Arc::new(MockLlmAdapter::new(vec![tool_resp, final_resp]));
@@ -6582,6 +6596,7 @@ mod tests {
                 input: serde_json::json!({"path": "big.txt"}),
             }],
             logprobs: None,
+            thinking: String::new(),
         };
         let final_resp = make_chat_response("done");
         let adapter = Arc::new(MockLlmAdapter::new(vec![tool_resp, final_resp]));
@@ -6638,6 +6653,7 @@ mod tests {
                     input: serde_json::json!({"path": "x.txt"}),
                 }],
                 logprobs: None,
+                thinking: String::new(),
             });
         }
         // Append a never-reached final response to prove we DON'T fall
@@ -6698,6 +6714,7 @@ mod tests {
                     input: serde_json::json!({"path": "payload.txt"}),
                 }],
                 logprobs: None,
+                thinking: String::new(),
             });
         }
         responses.push(make_chat_response("never reached"));
@@ -6746,6 +6763,7 @@ mod tests {
                     input: serde_json::json!({"path": "x", "content": "y"}),
                 }],
                 logprobs: None,
+                thinking: String::new(),
             });
         }
         responses.push(make_chat_response("All denied — done."));
@@ -7298,6 +7316,7 @@ mod tests {
                 min_token_p: mean_p,
                 confidence: caduceus_providers::Confidence::from_min_p(mean_p),
             }),
+            thinking: String::new(),
         }
     }
 
@@ -7693,6 +7712,7 @@ mod tests {
                 input: serde_json::json!({"duration_ms": 1}),
             }],
             logprobs: None,
+            thinking: String::new(),
         };
         let final_resp = make_chat_response("ok");
         let adapter = Arc::new(MockLlmAdapter::new(vec![tool_use_resp, final_resp]));
@@ -10034,6 +10054,7 @@ mod feature_tests_259_261 {
             stop_reason: caduceus_providers::StopReason::EndTurn,
             tool_calls: vec![],
             logprobs: None,
+            thinking: String::new(),
         }
     }
 
@@ -10051,6 +10072,7 @@ mod feature_tests_259_261 {
                 input: serde_json::json!({}),
             }],
             logprobs: None,
+            thinking: String::new(),
         }
     }
 
@@ -10565,6 +10587,7 @@ mod feature_tests_259_261 {
                 stop_reason: StopReason::EndTurn,
                 tool_calls: vec![],
                 logprobs: None,
+                thinking: String::new(),
             }
         }
         fn session() -> caduceus_core::SessionState {
@@ -10588,6 +10611,7 @@ mod feature_tests_259_261 {
                 input: serde_json::json!({"path": "definitely_missing_p13_2.txt"}),
             }],
             logprobs: None,
+            thinking: String::new(),
         };
 
         let adapter = Arc::new(MockLlmAdapter::new(vec![tool_call, final_resp("done")]));
@@ -10641,6 +10665,7 @@ mod feature_tests_259_261 {
                 stop_reason: StopReason::EndTurn,
                 tool_calls: vec![],
                 logprobs: None,
+                thinking: String::new(),
             }
         }
         fn session() -> caduceus_core::SessionState {
@@ -10664,6 +10689,7 @@ mod feature_tests_259_261 {
                 input: serde_json::json!({"path": "missing_p13_2_b.txt"}),
             }],
             logprobs: None,
+            thinking: String::new(),
         };
         let adapter = Arc::new(MockLlmAdapter::new(vec![tool_call, final_resp("done")]));
         let dir = tempfile::tempdir().unwrap();
@@ -10783,6 +10809,7 @@ mod feature_tests_259_261 {
                 stop_reason: StopReason::EndTurn,
                 tool_calls: vec![],
                 logprobs: None,
+                thinking: String::new(),
             }
         }
         fn session() -> caduceus_core::SessionState {
@@ -10850,6 +10877,7 @@ mod feature_tests_259_261 {
                 stop_reason: StopReason::EndTurn,
                 tool_calls: vec![],
                 logprobs: None,
+                thinking: String::new(),
             }
         }
         fn session() -> caduceus_core::SessionState {
@@ -10895,6 +10923,7 @@ mod feature_tests_259_261 {
                 stop_reason: StopReason::EndTurn,
                 tool_calls: vec![],
                 logprobs: None,
+                thinking: String::new(),
             }
         }
         fn session() -> caduceus_core::SessionState {

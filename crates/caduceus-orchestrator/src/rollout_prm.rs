@@ -203,6 +203,7 @@ mod tests {
             stop_reason: caduceus_core::StopReason::EndTurn,
             tool_calls: Vec::new(),
             logprobs: None,
+            thinking: String::new(),
         }
     }
     fn make_verifier(scripted: Vec<ChatResponse>) -> RolloutPrmVerifier {

@@ -365,6 +365,7 @@ mod tests {
             stop_reason: caduceus_core::StopReason::EndTurn,
             tool_calls: vec![],
             logprobs: None,
+            thinking: String::new(),
         }
     }
 

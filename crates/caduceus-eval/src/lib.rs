@@ -282,6 +282,7 @@ pub fn scripted(content: &str, output_tokens: u32) -> ChatResponse {
         stop_reason: caduceus_core::StopReason::EndTurn,
         tool_calls: vec![],
         logprobs: None,
+        thinking: String::new(),
     }
 }
 

@@ -3969,6 +3969,7 @@ Here is the task plan:
             stop_reason: caduceus_core::StopReason::EndTurn,
             tool_calls: vec![],
                 logprobs: None,
+                thinking: String::new(),
         }]));
 
         let ctx = SharedContext::new();
@@ -4018,6 +4019,7 @@ Here is the task plan:
             stop_reason: caduceus_core::StopReason::EndTurn,
             tool_calls: vec![],
             logprobs: None,
+            thinking: String::new(),
         }]));
 
         let ctx = SharedContext::new();
@@ -4046,6 +4048,7 @@ Here is the task plan:
             stop_reason: caduceus_core::StopReason::EndTurn,
             tool_calls: vec![],
             logprobs: None,
+            thinking: String::new(),
         }]));
         let ctx = SharedContext::new();
         ctx.write("leaf1", "x").await;
@@ -4168,6 +4171,7 @@ Here is the task plan:
             stop_reason: caduceus_core::StopReason::EndTurn,
             tool_calls: vec![],
             logprobs: None,
+            thinking: String::new(),
         }]));
         let ctx = SharedContext::new();
         ctx.write("leaf1", "x").await;
@@ -4241,6 +4245,7 @@ Here is the task plan:
             stop_reason: caduceus_core::StopReason::EndTurn,
             tool_calls: vec![],
             logprobs: None,
+            thinking: String::new(),
         }]));
 
         let ctx = SharedContext::new();
@@ -4310,6 +4315,7 @@ Here is the task plan:
             stop_reason: caduceus_core::StopReason::EndTurn,
             tool_calls: vec![],
             logprobs: None,
+            thinking: String::new(),
         }]));
 
         let ctx = SharedContext::new();
@@ -4371,6 +4377,7 @@ Here is the task plan:
             stop_reason: caduceus_core::StopReason::EndTurn,
             tool_calls: vec![],
             logprobs: None,
+            thinking: String::new(),
         }]));
 
         let ctx = SharedContext::new();
@@ -4407,6 +4414,7 @@ Here is the task plan:
             stop_reason: caduceus_core::StopReason::EndTurn,
             tool_calls: vec![],
             logprobs: None,
+            thinking: String::new(),
         }]));
 
         let ctx = SharedContext::new();

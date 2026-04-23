@@ -444,6 +444,7 @@ mod tests {
             stop_reason: StopReason::EndTurn,
             tool_calls: vec![],
             logprobs: None,
+            thinking: String::new(),
         }
     }
 
