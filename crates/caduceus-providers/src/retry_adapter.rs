@@ -125,6 +125,9 @@ impl RetryAdapter {
 pub fn is_transient_error(err: &CaduceusError) -> bool {
     match err {
         CaduceusError::RateLimited { .. } => true,
+        // T1 (Audit C3): provider-bounded timeout is transient by
+        // definition — retry against same or next adapter in chain.
+        CaduceusError::ProviderTimeout { .. } => true,
         CaduceusError::Provider(msg) => {
             let lower = msg.to_lowercase();
             // Match any of the canonical transient signals across

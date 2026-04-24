@@ -1442,7 +1442,7 @@ impl AgentHarness {
                 intent: Some(CompletionIntent::VerificationRollout),
                 stop: vec![],
             };
-            match self.provider.chat(req).await {
+            match self.provider_chat_bounded(req, "verification-rollout").await {
                 Ok(resp) if !resp.content.trim().is_empty() => {
                     ballot_logprobs.push(resp.logprobs.as_ref().map(|s| s.mean_token_p));
                     ballots.push(resp.content);
@@ -2005,7 +2005,7 @@ impl AgentHarness {
 
             // Call LLM — always use chat() for tool loops. Streaming happens
             // via event emission (text_delta events) regardless.
-            let response = match self.provider.chat(request).await {
+            let response = match self.provider_chat_bounded(request, "main-turn").await {
                 Ok(r) => {
                     // Emit text deltas for smooth UI streaming
                     if !r.content.is_empty() {
@@ -2910,7 +2910,10 @@ impl AgentHarness {
                 intent: Some(CompletionIntent::SummarizationFallback),
                 stop: vec![],
             };
-            match self.provider.chat(summary_request).await {
+            match self
+                .provider_chat_bounded(summary_request, "summary-fallback")
+                .await
+            {
                 Ok(summary) if !summary.content.is_empty() => {
                     final_text = summary.content;
                     if let Some(ref em) = self.emitter {
@@ -3021,6 +3024,84 @@ impl AgentHarness {
         Ok(final_text)
     }
 
+    // ── T1 (Audit C3): provider-call timeouts ────────────────────────────
+    //
+    // Every `provider.chat` / `provider.stream` / `stream.next` must be
+    // wrapped in a `tokio::time::timeout` so a stalled provider can't
+    // hang the agent loop indefinitely (TCP half-open, model deadlock,
+    // OS keepalive is hours). Limits are deliberately generous —
+    // they're upper bounds to bound worst-case blast radius, not
+    // normal-case SLAs.
+    //
+    // Override via env: CADUCEUS_CHAT_TIMEOUT_MS (default 180_000),
+    // CADUCEUS_STREAM_CONNECT_TIMEOUT_MS (default 60_000),
+    // CADUCEUS_STREAM_IDLE_TIMEOUT_MS (default 60_000).
+
+    fn chat_timeout_ms() -> u64 {
+        std::env::var("CADUCEUS_CHAT_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(180_000)
+    }
+
+    fn stream_connect_timeout_ms() -> u64 {
+        std::env::var("CADUCEUS_STREAM_CONNECT_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60_000)
+    }
+
+    fn stream_idle_timeout_ms() -> u64 {
+        std::env::var("CADUCEUS_STREAM_IDLE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60_000)
+    }
+
+    async fn provider_chat_bounded(
+        &self,
+        req: ChatRequest,
+        context: &'static str,
+    ) -> Result<caduceus_providers::ChatResponse> {
+        let limit_ms = Self::chat_timeout_ms();
+        let t0 = std::time::Instant::now();
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(limit_ms),
+            self.provider.chat(req),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(_elapsed) => Err(caduceus_core::CaduceusError::ProviderTimeout {
+                elapsed_ms: t0.elapsed().as_millis() as u64,
+                limit_ms,
+                context: context.into(),
+            }),
+        }
+    }
+
+    async fn provider_stream_bounded(
+        &self,
+        req: ChatRequest,
+        context: &'static str,
+    ) -> Result<caduceus_providers::StreamResult> {
+        let limit_ms = Self::stream_connect_timeout_ms();
+        let t0 = std::time::Instant::now();
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(limit_ms),
+            self.provider.stream(req),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(_elapsed) => Err(caduceus_core::CaduceusError::ProviderTimeout {
+                elapsed_ms: t0.elapsed().as_millis() as u64,
+                limit_ms,
+                context: context.into(),
+            }),
+        }
+    }
+
     /// Try streaming first for real-time text delivery, fall back to chat().
     /// Streaming gives us token-by-token text, but tool calls still need the
     /// full response. So we stream text deltas then use chat() for tool loops.
@@ -3031,7 +3112,10 @@ impl AgentHarness {
         use futures::StreamExt;
 
         // Try streaming for real-time text delivery
-        match self.provider.stream(request.clone()).await {
+        match self
+            .provider_stream_bounded(request.clone(), "stream-connect")
+            .await
+        {
             Ok(mut stream) => {
                 let mut content = String::new();
                 let mut thinking = String::new();
@@ -3046,8 +3130,30 @@ impl AgentHarness {
                 // before the error are ephemeral (caller will re-emit on retry).
                 let mut stream_error: Option<String> = None;
                 let mut bytes_received = 0usize;
+                let idle_limit_ms = Self::stream_idle_timeout_ms();
+                let idle_limit = std::time::Duration::from_millis(idle_limit_ms);
 
-                while let Some(chunk_result) = stream.next().await {
+                loop {
+                    // T1 (Audit C3): bound per-chunk idle time. If the provider
+                    // stops sending data mid-stream (half-open TCP, model stall)
+                    // we must give up rather than block forever.
+                    let idle_start = std::time::Instant::now();
+                    let next_opt =
+                        match tokio::time::timeout(idle_limit, stream.next()).await {
+                            Ok(opt) => opt,
+                            Err(_elapsed) => {
+                                stream_error = Some(format!(
+                                    "stream idle timeout after {}ms (limit {}ms)",
+                                    idle_start.elapsed().as_millis(),
+                                    idle_limit_ms
+                                ));
+                                break;
+                            }
+                        };
+                    let chunk_result = match next_opt {
+                        Some(c) => c,
+                        None => break,
+                    };
                     match chunk_result {
                         Ok(chunk) => {
                             if !chunk.delta.is_empty() {
@@ -3116,7 +3222,9 @@ impl AgentHarness {
             Err(_) => {
                 // Streaming not supported — fall back to non-streaming
                 // Also emit text in manual chunks for UI smoothness
-                let response = self.provider.chat(request.clone()).await?;
+                let response = self
+                    .provider_chat_bounded(request.clone(), "stream-fallback-chat")
+                    .await?;
                 if !response.content.is_empty() {
                     if let Some(ref em) = self.emitter {
                         let content = &response.content;

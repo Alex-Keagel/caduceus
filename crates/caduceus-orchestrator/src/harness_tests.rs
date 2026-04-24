@@ -3566,3 +3566,75 @@ async fn audit_c5_clean_stream_still_succeeds() {
     assert!(result.is_ok(), "clean stream must succeed: {:?}", result.err());
     assert_eq!(result.unwrap(), "Hello world");
 }
+
+// ── Audit C3 / T1: provider-call timeouts ─────────────────────────────────
+
+#[tokio::test]
+async fn audit_c3_chat_timeout_surfaces_as_provider_timeout() {
+    use caduceus_providers::mock::MockLlmAdapter;
+
+    // Tight env ceiling: 50ms. Mock sleeps 500ms. Harness must bail
+    // after ~50ms with CaduceusError::ProviderTimeout (not hang for
+    // 500ms silently + return truncated Ok).
+    // SAFETY: test-only env mutation; tests are single-threaded for
+    // this file's tokio executor in terms of env reads at harness
+    // call time, but we hold the value live for the whole call.
+    // SAFETY: test-only env var mutation. Single process, single test.
+    unsafe {
+        std::env::set_var("CADUCEUS_CHAT_TIMEOUT_MS", "50");
+    }
+
+    let adapter = Arc::new(
+        MockLlmAdapter::new(vec![caduceus_providers::ChatResponse {
+            content: "should never arrive".into(),
+            tool_calls: vec![],
+            stop_reason: caduceus_core::StopReason::EndTurn,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            logprobs: None,
+            thinking: String::new(),
+        }])
+        .with_chat_delay(std::time::Duration::from_millis(500)),
+    );
+    let harness =
+        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+    let mut state = make_session();
+
+    let t0 = std::time::Instant::now();
+    let mut history = crate::ConversationHistory::new();
+    let result = harness.run(&mut state, &mut history, "hi").await;
+    let elapsed = t0.elapsed();
+
+    unsafe {
+        std::env::remove_var("CADUCEUS_CHAT_TIMEOUT_MS");
+    }
+
+    assert!(
+        elapsed < std::time::Duration::from_millis(400),
+        "timeout wrapper must bail <400ms, took {elapsed:?}"
+    );
+    assert!(result.is_err(), "must be Err, got Ok: {:?}", result.ok());
+    let err = result.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        matches!(err, caduceus_core::CaduceusError::ProviderTimeout { .. })
+            || msg.to_lowercase().contains("timeout"),
+        "expected ProviderTimeout-shaped error, got: {msg}"
+    );
+}
+
+#[test]
+fn audit_c3_provider_timeout_is_transient_for_retry_adapter() {
+    use caduceus_providers::retry_adapter::is_transient_error;
+    let err = caduceus_core::CaduceusError::ProviderTimeout {
+        elapsed_ms: 60_000,
+        limit_ms: 30_000,
+        context: "main-turn".into(),
+    };
+    assert!(
+        is_transient_error(&err),
+        "ProviderTimeout must classify as transient so RetryAdapter will retry/failover"
+    );
+}

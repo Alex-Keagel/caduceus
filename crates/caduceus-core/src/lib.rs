@@ -1912,6 +1912,16 @@ pub enum CaduceusError {
     Storage(String),
     #[error("Provider error: {0}")]
     Provider(String),
+    /// Provider call exceeded its time budget. Treated as transient
+    /// by `RetryAdapter` (mirrors rate-limit/network-class errors)
+    /// so the caller can re-run the turn; distinct variant so UI and
+    /// telemetry can render a timeout-specific diagnostic.
+    #[error("Provider timeout after {elapsed_ms}ms (limit {limit_ms}ms): {context}")]
+    ProviderTimeout {
+        elapsed_ms: u64,
+        limit_ms: u64,
+        context: String,
+    },
     #[error("Rate limited: retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
     #[error("Context overflow: {used} tokens used, limit is {limit}")]

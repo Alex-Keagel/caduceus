@@ -12,6 +12,10 @@ pub struct MockLlmAdapter {
     /// Audit C5 test support: scripted streams that can inject mid-stream errors.
     /// Takes precedence over `scripted_streams` when non-empty.
     scripted_fallible_streams: Mutex<VecDeque<Vec<Result<StreamChunk>>>>,
+    /// Audit C3/T1 test support: injected chat() pre-response delay.
+    /// When set, chat() awaits `tokio::time::sleep(delay)` before popping
+    /// a scripted response, letting tests exercise the timeout wrapper.
+    chat_delay: Mutex<Option<std::time::Duration>>,
     requests: Mutex<Vec<ChatRequest>>,
 }
 
@@ -22,6 +26,7 @@ impl MockLlmAdapter {
             scripted_responses: Mutex::new(VecDeque::from(scripted_responses)),
             scripted_streams: Mutex::new(VecDeque::new()),
             scripted_fallible_streams: Mutex::new(VecDeque::new()),
+            chat_delay: Mutex::new(None),
             requests: Mutex::new(Vec::new()),
         }
     }
@@ -38,6 +43,14 @@ impl MockLlmAdapter {
         scripted_streams: Vec<Vec<Result<StreamChunk>>>,
     ) -> Self {
         self.scripted_fallible_streams = Mutex::new(VecDeque::from(scripted_streams));
+        self
+    }
+
+    /// Audit C3/T1 test support: delay each `chat()` by the given
+    /// duration before popping a scripted response. Lets tests
+    /// assert that the harness-level timeout wrapper fires.
+    pub fn with_chat_delay(mut self, delay: std::time::Duration) -> Self {
+        self.chat_delay = Mutex::new(Some(delay));
         self
     }
 
@@ -60,6 +73,15 @@ impl LlmAdapter for MockLlmAdapter {
             .lock()
             .expect("mock requests mutex poisoned")
             .push(request);
+
+        // T1 test support: honor injected delay before responding.
+        let delay = *self
+            .chat_delay
+            .lock()
+            .expect("mock chat_delay mutex poisoned");
+        if let Some(d) = delay {
+            tokio::time::sleep(d).await;
+        }
 
         self.scripted_responses
             .lock()
