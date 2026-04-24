@@ -111,6 +111,10 @@ impl AsyncBranchExpander<String> for LlmExpander {
             tool_choice: None,
             response_format: None,
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
         let resp = self.adapter.chat(req).await?;
         Ok(parse_expansion(&resp.content, branching_factor))
@@ -183,6 +187,10 @@ impl AsyncBranchScorer<String> for LlmScorer {
             tool_choice: None,
             response_format: None,
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
         let resp = self.adapter.chat(req).await?;
         Ok(parse_score(&resp.content))

@@ -1437,6 +1437,10 @@ impl AgentHarness {
                 tools: vec![].into(),
                 response_format: None,
                 logprobs: if is_cisc { Some(5) } else { None },
+                thread_id: None,
+                prompt_id: None,
+                intent: None,
+                stop: vec![],
             };
             match self.provider.chat(req).await {
                 Ok(resp) if !resp.content.trim().is_empty() => {
@@ -1993,6 +1997,10 @@ impl AgentHarness {
                 tools: Arc::clone(&tool_specs),
                 response_format: None,
                 logprobs: self.request_logprobs.then_some(5),
+                thread_id: None,
+                prompt_id: None,
+                intent: None,
+                stop: vec![],
             };
 
             // Call LLM — always use chat() for tool loops. Streaming happens
@@ -2897,6 +2905,10 @@ impl AgentHarness {
                 tools: vec![].into(), // No tools — force text response
                 response_format: None,
                 logprobs: None,
+                thread_id: None,
+                prompt_id: None,
+                intent: None,
+                stop: vec![],
             };
             match self.provider.chat(summary_request).await {
                 Ok(summary) if !summary.content.is_empty() => {
@@ -3125,6 +3137,10 @@ impl AgentHarness {
             tools: vec![].into(),
             response_format: None,
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         let response = self.try_stream_or_chat(&request).await?;

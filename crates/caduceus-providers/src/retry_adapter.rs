@@ -304,6 +304,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         }
     }
 

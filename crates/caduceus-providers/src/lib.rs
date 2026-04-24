@@ -438,6 +438,89 @@ pub struct ChatRequest {
     /// response as "unsupported", NOT as "high confidence".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<u8>,
+    /// A3: cross-repo thread identity (Zed thread / caduceus session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    /// A3: cross-repo prompt identity. One user turn may fan out to
+    /// several ChatRequests (verification rollouts, summarization,
+    /// critique) that share the same `prompt_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<String>,
+    /// A3: why this request was issued. Drives `validate()` invariants
+    /// and is forwarded to provider analytics. `None` = legacy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<CompletionIntent>,
+    /// A3: custom stop sequences. Empty vec = unset.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
+}
+
+/// A3: why a ChatRequest was issued. Mirrors Zed's `CompletionIntent`
+/// (verbatim 10 variants) plus 3 caduceus-only variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionIntent {
+    UserPrompt,
+    Subagent,
+    ToolResults,
+    ThreadSummarization,
+    ThreadContextSummarization,
+    CreateFile,
+    EditFile,
+    InlineAssist,
+    TerminalInlineAssist,
+    GenerateGitCommitMessage,
+    /// Caduceus-only: verification rollouts (PRM scoring, re-runs).
+    /// MUST NOT carry tools — enforced by `ChatRequest::validate()`.
+    VerificationRollout,
+    /// Caduceus-only: fallback summarization when primary path fails.
+    SummarizationFallback,
+    /// Caduceus-only: single-shot tool-free completion.
+    OneShot,
+}
+
+impl CompletionIntent {
+    /// Returns true if this intent is incompatible with tool invocation.
+    pub fn forbids_tools(self) -> bool {
+        matches!(
+            self,
+            CompletionIntent::VerificationRollout
+                | CompletionIntent::ThreadSummarization
+                | CompletionIntent::ThreadContextSummarization
+                | CompletionIntent::SummarizationFallback
+                | CompletionIntent::GenerateGitCommitMessage
+        )
+    }
+}
+
+/// A3: structured error for [`ChatRequest::validate`].
+#[derive(Debug, thiserror::Error)]
+pub enum ChatRequestError {
+    #[error("intent {intent:?} forbids tools, but {count} tool(s) were attached")]
+    IntentForbidsTools {
+        intent: CompletionIntent,
+        count: usize,
+    },
+}
+
+impl ChatRequest {
+    /// A3: fail-closed invariants on the ChatRequest shape.
+    pub fn validate(&self) -> std::result::Result<(), ChatRequestError> {
+        if let Some(intent) = self.intent {
+            if intent.forbids_tools() && !self.tools.is_empty() {
+                debug_assert!(
+                    false,
+                    "ChatRequest invariant: intent {intent:?} forbids tools but {} were attached",
+                    self.tools.len()
+                );
+                return Err(ChatRequestError::IntentForbidsTools {
+                    intent,
+                    count: self.tools.len(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// UX-friendly confidence bucket derived from token logprobs (G10 / P3.2).
@@ -2008,6 +2091,10 @@ where
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         match provider_id.0.as_str() {
@@ -2472,6 +2559,136 @@ mod tests {
     use std::sync::Mutex;
     use std::thread;
 
+    // ── A3 — CompletionIntent + ChatRequest::validate ───────────────────────
+
+    fn a3_mk_req(intent: Option<CompletionIntent>, tools: Vec<ToolSpec>) -> ChatRequest {
+        ChatRequest {
+            model: caduceus_core::ModelId("m".into()),
+            messages: vec![],
+            system: None,
+            max_tokens: 128,
+            temperature: None,
+            thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
+            tools: tools.into(),
+            logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent,
+            stop: vec![],
+        }
+    }
+
+    #[test]
+    fn a3_completion_intent_serde_roundtrip_snake_case() {
+        // Wire format must be snake_case so it matches Zed's
+        // LanguageModelRequest.intent encoding verbatim.
+        let cases = [
+            (CompletionIntent::UserPrompt, "\"user_prompt\""),
+            (CompletionIntent::ThreadSummarization, "\"thread_summarization\""),
+            (CompletionIntent::VerificationRollout, "\"verification_rollout\""),
+            (CompletionIntent::GenerateGitCommitMessage, "\"generate_git_commit_message\""),
+            (CompletionIntent::OneShot, "\"one_shot\""),
+        ];
+        for (variant, expected) in cases {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected, "intent {variant:?} serialization");
+            let back: CompletionIntent = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant, "intent {variant:?} roundtrip");
+        }
+    }
+
+    #[test]
+    fn a3_validate_rejects_verification_rollout_with_tools() {
+        let tool = ToolSpec {
+            name: "t".into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({}),
+            required_capability: None,
+        };
+        let req = a3_mk_req(Some(CompletionIntent::VerificationRollout), vec![tool]);
+        // Use catch_unwind to bypass debug_assert! panic in debug builds.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| req.validate()));
+        match result {
+            Ok(Err(ChatRequestError::IntentForbidsTools { intent, count })) => {
+                assert_eq!(intent, CompletionIntent::VerificationRollout);
+                assert_eq!(count, 1);
+            }
+            Ok(Ok(())) => panic!("expected validate() to reject verification rollout with tools"),
+            Err(_) => {} // debug_assert panic is also acceptable (fail-closed in debug)
+        }
+    }
+
+    #[test]
+    fn a3_validate_accepts_user_prompt_with_tools() {
+        let tool = ToolSpec {
+            name: "t".into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({}),
+            required_capability: None,
+        };
+        let req = a3_mk_req(Some(CompletionIntent::UserPrompt), vec![tool]);
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn a3_validate_accepts_none_intent_with_or_without_tools() {
+        // Legacy path: intent=None must always pass.
+        assert!(a3_mk_req(None, vec![]).validate().is_ok());
+        let tool = ToolSpec {
+            name: "t".into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({}),
+            required_capability: None,
+        };
+        assert!(a3_mk_req(None, vec![tool]).validate().is_ok());
+    }
+
+    #[test]
+    fn a3_validate_accepts_tool_forbidding_intent_when_tools_empty() {
+        // The failure mode is the combination; forbidding intent alone is fine.
+        for intent in [
+            CompletionIntent::VerificationRollout,
+            CompletionIntent::ThreadSummarization,
+            CompletionIntent::SummarizationFallback,
+            CompletionIntent::GenerateGitCommitMessage,
+        ] {
+            assert!(
+                a3_mk_req(Some(intent), vec![]).validate().is_ok(),
+                "intent {intent:?} with empty tools should validate"
+            );
+        }
+    }
+
+    #[test]
+    fn a3_forbids_tools_table() {
+        assert!(CompletionIntent::VerificationRollout.forbids_tools());
+        assert!(CompletionIntent::ThreadSummarization.forbids_tools());
+        assert!(CompletionIntent::ThreadContextSummarization.forbids_tools());
+        assert!(CompletionIntent::SummarizationFallback.forbids_tools());
+        assert!(CompletionIntent::GenerateGitCommitMessage.forbids_tools());
+        assert!(!CompletionIntent::UserPrompt.forbids_tools());
+        assert!(!CompletionIntent::Subagent.forbids_tools());
+        assert!(!CompletionIntent::ToolResults.forbids_tools());
+        assert!(!CompletionIntent::EditFile.forbids_tools());
+        assert!(!CompletionIntent::OneShot.forbids_tools());
+    }
+
+    #[test]
+    fn a3_chatrequest_skip_serializing_empty_a3_fields() {
+        // intent=None / thread_id=None / prompt_id=None / stop=[] should
+        // NOT appear on the wire — preserves byte-compat with servers that
+        // don't know about the A3 extensions.
+        let req = a3_mk_req(None, vec![]);
+        let json = serde_json::to_value(&req).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(!obj.contains_key("thread_id"));
+        assert!(!obj.contains_key("prompt_id"));
+        assert!(!obj.contains_key("intent"));
+        assert!(!obj.contains_key("stop"));
+    }
+
     // ── ST-C2 Phase 1 — LlmMessage ↔ Message conversions ────────────────────
 
     #[test]
@@ -2871,6 +3088,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         let body = adapter.build_request_body(&request, false);
@@ -2901,6 +3122,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
         let body = adapter.build_request_body(&request, false);
         let msgs = body["messages"].as_array().unwrap();
@@ -2946,6 +3171,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
         let body = adapter.build_request_body(&request, false);
         let block = &body["messages"][0]["content"][0];
@@ -2998,6 +3227,10 @@ mod tests {
             response_format: None,
             tools: Arc::from([tool_spec]),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         let body = adapter.build_request_body(&request, false);
@@ -3046,6 +3279,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         let body = adapter.build_request_body(&request, true);
@@ -3125,6 +3362,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         let body = adapter.build_request_body(&request, true);
@@ -3225,6 +3466,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
         assert!(req.thinking_mode);
         let json = serde_json::to_string(&req).unwrap();
@@ -3262,6 +3507,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         let body = adapter.build_request_body(&request, true);
@@ -3291,6 +3540,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         let resp = adapter.chat(request).await.unwrap();
@@ -3385,6 +3638,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
         let body = adapter.build_request_body(&request, false);
         let content = &body["messages"][0]["content"];
@@ -3412,6 +3669,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
         let body = build_openai_request_body(&request, false, true);
         let content = &body["messages"][0]["content"];
@@ -3462,6 +3723,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
         let body = adapter.build_request_body(&request, false);
         assert_eq!(body["tool_choice"]["type"], "any");
@@ -3477,6 +3742,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
         let body2 = adapter.build_request_body(&request2, false);
         assert_eq!(body2["tool_choice"]["type"], "tool");
@@ -3496,6 +3765,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
         let body = build_openai_request_body(&request, false, true);
         assert_eq!(body["tool_choice"], "required");
@@ -3511,6 +3784,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
         let body2 = build_openai_request_body(&request2, false, true);
         assert_eq!(body2["tool_choice"]["type"], "function");
@@ -3607,6 +3884,10 @@ mod tests {
             response_format: Some(ResponseFormat::JsonObject),
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
         let body = build_openai_request_body(&request, false, true);
         assert_eq!(body["response_format"]["type"], "json_object");
@@ -3641,6 +3922,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         let response = mock.chat(request).await.unwrap();
@@ -3664,6 +3949,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         let result = mock.chat(request).await;
@@ -3715,6 +4004,10 @@ mod tests {
             response_format: None,
             tools: vec![].into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         let response = mock.chat(request).await.unwrap();
@@ -4033,6 +4326,10 @@ mod tests {
             temperature: None,
             logprobs: Some(3),
             thinking_mode: false,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
         let body = build_openai_request_body(&req, false, true);
         assert_eq!(body["logprobs"], serde_json::json!(true));

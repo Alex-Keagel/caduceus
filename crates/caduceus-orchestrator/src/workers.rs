@@ -732,6 +732,10 @@ impl Coordinator {
             tools: vec![].into(),
             response_format: None,
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         let raw = match provider.chat(req).await {
@@ -871,6 +875,10 @@ impl Coordinator {
             tools: vec![].into(),
             response_format: None,
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         provider
@@ -923,6 +931,10 @@ impl Coordinator {
             tools: vec![].into(),
             response_format: None,
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
         let started = Instant::now();
         let resp = provider
@@ -1081,6 +1093,10 @@ async fn run_task(
             tools: task_tools.clone().into(),
             response_format: None,
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         match provider.chat(req).await {

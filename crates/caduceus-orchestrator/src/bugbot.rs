@@ -244,6 +244,10 @@ impl BugBot {
             tools: vec![].into(),
             response_format: None,
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         self.provider.chat(request).await.ok().map(|r| r.content)
@@ -261,6 +265,10 @@ impl BugBot {
             tools: vec![].into(),
             response_format: None,
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         let response = self.provider.chat(request).await?;

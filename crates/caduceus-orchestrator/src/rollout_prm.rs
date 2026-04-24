@@ -102,6 +102,10 @@ impl StepVerifier for RolloutPrmVerifier {
             response_format: Some(ResponseFormat::JsonObject),
             tools: Vec::new().into(),
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         };
 
         let source = format!("rollout-prm:{}", self.model);

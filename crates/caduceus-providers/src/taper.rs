@@ -275,6 +275,10 @@ mod tests {
             tools: vec![].into(),
             response_format: None,
             logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: vec![],
         }
     }
 
