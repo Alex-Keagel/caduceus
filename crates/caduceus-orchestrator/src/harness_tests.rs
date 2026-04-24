@@ -3491,6 +3491,7 @@ async fn audit_c5_mid_stream_error_surfaces_as_err() {
         output_tokens: None,
         cache_read_tokens: None,
         cache_creation_tokens: None,
+        thinking: String::new(),
     };
     // Emit 9 bytes successfully, then a mid-stream error. Pre-audit the harness
     // would return Ok(ChatResponse{content: "Hello wor", stop_reason: EndTurn});
@@ -3542,6 +3543,7 @@ async fn audit_c5_clean_stream_still_succeeds() {
             output_tokens: None,
             cache_read_tokens: None,
             cache_creation_tokens: None,
+            thinking: String::new(),
         },
         StreamChunk {
             delta: "world".to_string(),
@@ -3550,6 +3552,7 @@ async fn audit_c5_clean_stream_still_succeeds() {
             output_tokens: Some(2),
             cache_read_tokens: None,
             cache_creation_tokens: None,
+            thinking: String::new(),
         },
     ];
 

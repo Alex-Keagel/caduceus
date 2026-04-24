@@ -3034,6 +3034,7 @@ impl AgentHarness {
         match self.provider.stream(request.clone()).await {
             Ok(mut stream) => {
                 let mut content = String::new();
+                let mut thinking = String::new();
                 let mut input_tokens = 0u32;
                 let mut output_tokens = 0u32;
                 let mut cache_read = 0u32;
@@ -3054,6 +3055,15 @@ impl AgentHarness {
                                 content.push_str(&chunk.delta);
                                 if let Some(ref em) = self.emitter {
                                     em.emit_text_delta(&chunk.delta).await;
+                                }
+                            }
+                            // T3/I9: surface thinking deltas to the
+                            // emitter + aggregate on the response so
+                            // streaming mode is no longer text-only.
+                            if !chunk.thinking.is_empty() {
+                                thinking.push_str(&chunk.thinking);
+                                if let Some(ref em) = self.emitter {
+                                    em.emit_reasoning_delta(chunk.thinking.clone()).await;
                                 }
                             }
                             if let Some(t) = chunk.input_tokens {
@@ -3089,7 +3099,7 @@ impl AgentHarness {
                     )));
                 }
 
-                // Streaming delivers text only — no tool calls.
+                // Streaming delivers text + thinking only — no tool calls.
                 // If no content came through, the response is empty (not an error).
                 Ok(caduceus_providers::ChatResponse {
                     content,
@@ -3100,7 +3110,7 @@ impl AgentHarness {
                     cache_read_tokens: cache_read,
                     cache_creation_tokens: cache_create,
                     logprobs: None,
-                    thinking: String::new(),
+                    thinking,
                 })
             }
             Err(_) => {

@@ -648,6 +648,14 @@ pub struct StreamChunk {
     pub output_tokens: Option<u32>,
     pub cache_read_tokens: Option<u32>,
     pub cache_creation_tokens: Option<u32>,
+    /// Reasoning / thinking delta produced by the provider during
+    /// streaming. Empty for providers that don't emit interleaved
+    /// thinking or when the chunk is a pure text/usage/final chunk.
+    /// Wire-compat: `#[serde(default)]` so providers unaware of this
+    /// field decode cleanly, and `skip_serializing_if` keeps the wire
+    /// byte-identical when there is no thinking.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thinking: String,
 }
 
 pub type StreamResult = Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>;
@@ -1015,6 +1023,7 @@ fn parse_anthropic_sse_event(event_type: &str, data: &str) -> Option<Result<Stre
                 cache_creation_tokens: val["message"]["usage"]["cache_creation_input_tokens"]
                     .as_u64()
                     .map(|n| n as u32),
+                thinking: String::new(),
             }))
         }
         "content_block_delta" => {
@@ -1033,6 +1042,7 @@ fn parse_anthropic_sse_event(event_type: &str, data: &str) -> Option<Result<Stre
                         output_tokens: None,
                         cache_read_tokens: None,
                         cache_creation_tokens: None,
+                        thinking: String::new(),
                     }))
                 }
                 _ => None,
@@ -1052,6 +1062,7 @@ fn parse_anthropic_sse_event(event_type: &str, data: &str) -> Option<Result<Stre
                 cache_creation_tokens: val["usage"]["cache_creation_input_tokens"]
                     .as_u64()
                     .map(|n| n as u32),
+                thinking: String::new(),
             }))
         }
         "message_stop" => Some(Ok(StreamChunk {
@@ -1061,6 +1072,7 @@ fn parse_anthropic_sse_event(event_type: &str, data: &str) -> Option<Result<Stre
             output_tokens: None,
             cache_read_tokens: None,
             cache_creation_tokens: None,
+            thinking: String::new(),
         })),
         _ => None,
     }
@@ -1562,6 +1574,7 @@ fn parse_openai_sse_event(data: &str) -> Option<Result<StreamChunk>> {
             output_tokens: None,
             cache_read_tokens: None,
             cache_creation_tokens: None,
+            thinking: String::new(),
         }));
     }
 
@@ -1598,6 +1611,7 @@ fn parse_openai_sse_event(data: &str) -> Option<Result<StreamChunk>> {
         output_tokens,
         cache_read_tokens,
         cache_creation_tokens: Some(0),
+        thinking: String::new(),
     }))
 }
 
