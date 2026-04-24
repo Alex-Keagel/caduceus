@@ -19,7 +19,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use caduceus_core::{ObservedToolCall, StepScore, StepVerifier, StepView};
 use caduceus_providers::{
-    ChatRequest, LlmAdapter, Message, ResponseFormat, StopReason as ProviderStopReason,
+    ChatRequest, CompletionIntent, LlmAdapter, Message, ResponseFormat,
+    StopReason as ProviderStopReason,
 };
 
 /// LLM-as-judge step verifier.
@@ -104,7 +105,7 @@ impl StepVerifier for RolloutPrmVerifier {
             logprobs: None,
             thread_id: None,
             prompt_id: None,
-            intent: None,
+            intent: Some(CompletionIntent::VerificationRollout),
             stop: vec![],
         };
 

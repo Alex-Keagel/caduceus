@@ -8,7 +8,7 @@
 //! - `Team` / `run_team`: top-level entry point
 
 use caduceus_core::{AgentEvent, ModelId, ProviderId, TokenUsage};
-use caduceus_providers::{ChatRequest, LlmAdapter, Message};
+use caduceus_providers::{ChatRequest, CompletionIntent, LlmAdapter, Message};
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet, VecDeque},
@@ -734,7 +734,7 @@ impl Coordinator {
             logprobs: None,
             thread_id: None,
             prompt_id: None,
-            intent: None,
+            intent: Some(CompletionIntent::OneShot),
             stop: vec![],
         };
 
@@ -877,7 +877,7 @@ impl Coordinator {
             logprobs: None,
             thread_id: None,
             prompt_id: None,
-            intent: None,
+            intent: Some(CompletionIntent::OneShot),
             stop: vec![],
         };
 
@@ -933,7 +933,7 @@ impl Coordinator {
             logprobs: None,
             thread_id: None,
             prompt_id: None,
-            intent: None,
+            intent: Some(CompletionIntent::OneShot),
             stop: vec![],
         };
         let started = Instant::now();
@@ -1095,7 +1095,7 @@ async fn run_task(
             logprobs: None,
             thread_id: None,
             prompt_id: None,
-            intent: None,
+            intent: Some(CompletionIntent::Subagent),
             stop: vec![],
         };
 

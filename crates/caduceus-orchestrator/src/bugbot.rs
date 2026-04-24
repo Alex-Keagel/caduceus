@@ -1,5 +1,5 @@
 use caduceus_core::{ModelId, Result};
-use caduceus_providers::{ChatRequest, LlmAdapter, Message};
+use caduceus_providers::{ChatRequest, CompletionIntent, LlmAdapter, Message};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -246,7 +246,7 @@ impl BugBot {
             logprobs: None,
             thread_id: None,
             prompt_id: None,
-            intent: None,
+            intent: Some(CompletionIntent::OneShot),
             stop: vec![],
         };
 
@@ -267,7 +267,7 @@ impl BugBot {
             logprobs: None,
             thread_id: None,
             prompt_id: None,
-            intent: None,
+            intent: Some(CompletionIntent::OneShot),
             stop: vec![],
         };
 

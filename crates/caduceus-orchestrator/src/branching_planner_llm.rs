@@ -23,7 +23,7 @@
 use crate::branching_planner::{PlanResult, PlannerConfig, ThoughtNode};
 use anyhow::Result;
 use async_trait::async_trait;
-use caduceus_providers::{ChatRequest, LlmAdapter, Message};
+use caduceus_providers::{ChatRequest, CompletionIntent, LlmAdapter, Message};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
@@ -113,7 +113,7 @@ impl AsyncBranchExpander<String> for LlmExpander {
             logprobs: None,
             thread_id: None,
             prompt_id: None,
-            intent: None,
+            intent: Some(CompletionIntent::OneShot),
             stop: vec![],
         };
         let resp = self.adapter.chat(req).await?;
@@ -189,7 +189,7 @@ impl AsyncBranchScorer<String> for LlmScorer {
             logprobs: None,
             thread_id: None,
             prompt_id: None,
-            intent: None,
+            intent: Some(CompletionIntent::OneShot),
             stop: vec![],
         };
         let resp = self.adapter.chat(req).await?;

@@ -27,7 +27,7 @@ use caduceus_core::{
 use caduceus_permissions::envelope::{
     Decision, DenyReason, ExpansionCapability, PermissionEnvelope,
 };
-use caduceus_providers::{ChatRequest, LlmAdapter};
+use caduceus_providers::{ChatRequest, CompletionIntent, LlmAdapter};
 use caduceus_tools::ToolRegistry;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1439,7 +1439,7 @@ impl AgentHarness {
                 logprobs: if is_cisc { Some(5) } else { None },
                 thread_id: None,
                 prompt_id: None,
-                intent: None,
+                intent: Some(CompletionIntent::VerificationRollout),
                 stop: vec![],
             };
             match self.provider.chat(req).await {
@@ -1999,7 +1999,7 @@ impl AgentHarness {
                 logprobs: self.request_logprobs.then_some(5),
                 thread_id: None,
                 prompt_id: None,
-                intent: None,
+                intent: Some(CompletionIntent::UserPrompt),
                 stop: vec![],
             };
 
@@ -2907,7 +2907,7 @@ impl AgentHarness {
                 logprobs: None,
                 thread_id: None,
                 prompt_id: None,
-                intent: None,
+                intent: Some(CompletionIntent::SummarizationFallback),
                 stop: vec![],
             };
             match self.provider.chat(summary_request).await {
@@ -3139,7 +3139,7 @@ impl AgentHarness {
             logprobs: None,
             thread_id: None,
             prompt_id: None,
-            intent: None,
+            intent: Some(CompletionIntent::OneShot),
             stop: vec![],
         };
 
