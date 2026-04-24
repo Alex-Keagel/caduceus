@@ -248,6 +248,8 @@ impl BugBot {
             prompt_id: None,
             intent: Some(CompletionIntent::OneShot),
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         self.provider.chat(request).await.ok().map(|r| r.content)
@@ -269,6 +271,8 @@ impl BugBot {
             prompt_id: None,
             intent: Some(CompletionIntent::OneShot),
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         let response = self.provider.chat(request).await?;

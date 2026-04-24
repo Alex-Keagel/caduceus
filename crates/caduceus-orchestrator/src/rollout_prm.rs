@@ -107,6 +107,8 @@ impl StepVerifier for RolloutPrmVerifier {
             prompt_id: None,
             intent: Some(CompletionIntent::VerificationRollout),
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         let source = format!("rollout-prm:{}", self.model);

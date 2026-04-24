@@ -370,6 +370,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         }
     }
 
@@ -611,6 +613,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: Vec::new(),
+            thinking_effort: None,
+            speed: None,
         };
         let arc_ptr_before = req.messages.as_ptr();
         let cloned = req.clone();

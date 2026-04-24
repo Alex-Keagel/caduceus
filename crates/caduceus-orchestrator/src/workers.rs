@@ -736,6 +736,8 @@ impl Coordinator {
             prompt_id: None,
             intent: Some(CompletionIntent::OneShot),
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         let raw = match provider.chat(req).await {
@@ -879,6 +881,8 @@ impl Coordinator {
             prompt_id: None,
             intent: Some(CompletionIntent::OneShot),
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         provider
@@ -935,6 +939,8 @@ impl Coordinator {
             prompt_id: None,
             intent: Some(CompletionIntent::OneShot),
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
         let started = Instant::now();
         let resp = provider
@@ -1097,6 +1103,8 @@ async fn run_task(
             prompt_id: None,
             intent: Some(CompletionIntent::Subagent),
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         match provider.chat(req).await {

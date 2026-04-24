@@ -464,6 +464,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         }
     }
     #[test]

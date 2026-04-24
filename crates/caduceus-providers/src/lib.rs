@@ -460,6 +460,24 @@ pub struct ChatRequest {
     /// A3: custom stop sequences. Empty vec = unset.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop: Vec<String>,
+    /// A3 FU#2: reasoning effort hint (e.g. "low" / "medium" / "high") for
+    /// models that expose a thinking-effort knob. Mirrors Zed's
+    /// `LanguageModelRequest::thinking_effort`. `None` = provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_effort: Option<String>,
+    /// A3 FU#2: latency/quality hint. Mirrors Zed's
+    /// `LanguageModelRequest::speed`. `None` = provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<Speed>,
+}
+
+/// A3 FU#2: request-speed hint. Byte-for-byte serde compatible with Zed's
+/// `language_model_core::Speed` (`standard` | `fast`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Speed {
+    Standard,
+    Fast,
 }
 
 /// A3: why a ChatRequest was issued. Mirrors Zed's `CompletionIntent`
@@ -2116,6 +2134,8 @@ where
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         match provider_id.0.as_str() {
@@ -2598,6 +2618,8 @@ mod tests {
             prompt_id: None,
             intent,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         }
     }
 
@@ -3113,6 +3135,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         let body = adapter.build_request_body(&request, false);
@@ -3147,6 +3171,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
         let body = adapter.build_request_body(&request, false);
         let msgs = body["messages"].as_array().unwrap();
@@ -3196,6 +3222,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
         let body = adapter.build_request_body(&request, false);
         let block = &body["messages"][0]["content"][0];
@@ -3252,6 +3280,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         let body = adapter.build_request_body(&request, false);
@@ -3304,6 +3334,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         let body = adapter.build_request_body(&request, true);
@@ -3387,6 +3419,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         let body = adapter.build_request_body(&request, true);
@@ -3491,6 +3525,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
         assert!(req.thinking_mode);
         let json = serde_json::to_string(&req).unwrap();
@@ -3532,6 +3568,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         let body = adapter.build_request_body(&request, true);
@@ -3565,6 +3603,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         let resp = adapter.chat(request).await.unwrap();
@@ -3663,6 +3703,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
         let body = adapter.build_request_body(&request, false);
         let content = &body["messages"][0]["content"];
@@ -3694,6 +3736,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
         let body = build_openai_request_body(&request, false, true);
         let content = &body["messages"][0]["content"];
@@ -3748,6 +3792,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
         let body = adapter.build_request_body(&request, false);
         assert_eq!(body["tool_choice"]["type"], "any");
@@ -3767,6 +3813,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
         let body2 = adapter.build_request_body(&request2, false);
         assert_eq!(body2["tool_choice"]["type"], "tool");
@@ -3790,6 +3838,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
         let body = build_openai_request_body(&request, false, true);
         assert_eq!(body["tool_choice"], "required");
@@ -3809,6 +3859,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
         let body2 = build_openai_request_body(&request2, false, true);
         assert_eq!(body2["tool_choice"]["type"], "function");
@@ -3909,6 +3961,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
         let body = build_openai_request_body(&request, false, true);
         assert_eq!(body["response_format"]["type"], "json_object");
@@ -3947,6 +4001,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         let response = mock.chat(request).await.unwrap();
@@ -3974,6 +4030,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         let result = mock.chat(request).await;
@@ -4029,6 +4087,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         let response = mock.chat(request).await.unwrap();
@@ -4351,6 +4411,8 @@ mod tests {
             prompt_id: None,
             intent: None,
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
         let body = build_openai_request_body(&req, false, true);
         assert_eq!(body["logprobs"], serde_json::json!(true));

@@ -1457,6 +1457,8 @@ impl AgentHarness {
                 prompt_id: Some(uuid::Uuid::new_v4().to_string()),
                 intent: Some(CompletionIntent::VerificationRollout),
                 stop: vec![],
+                thinking_effort: None,
+                speed: None,
             };
             match self.provider_chat_bounded(req, "verification-rollout").await {
                 Ok(resp) if !resp.content.trim().is_empty() => {
@@ -2017,6 +2019,8 @@ impl AgentHarness {
                 prompt_id: Some(uuid::Uuid::new_v4().to_string()),
                 intent: Some(CompletionIntent::UserPrompt),
                 stop: vec![],
+            thinking_effort: None,
+            speed: None,
             };
 
             // Call LLM — always use chat() for tool loops. Streaming happens
@@ -2925,6 +2929,8 @@ impl AgentHarness {
                 prompt_id: Some(uuid::Uuid::new_v4().to_string()),
                 intent: Some(CompletionIntent::SummarizationFallback),
                 stop: vec![],
+                thinking_effort: None,
+                speed: None,
             };
             match self
                 .provider_chat_bounded(summary_request, "summary-fallback")
@@ -3297,6 +3303,8 @@ impl AgentHarness {
             prompt_id: Some(uuid::Uuid::new_v4().to_string()),
             intent: Some(CompletionIntent::OneShot),
             stop: vec![],
+            thinking_effort: None,
+            speed: None,
         };
 
         let response = self.try_stream_or_chat(&request).await?;
