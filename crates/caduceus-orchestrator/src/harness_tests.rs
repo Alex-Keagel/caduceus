@@ -3476,3 +3476,90 @@ async fn agent_loop_emits_balanced_step_bracket() {
     // Step counter must have advanced past PRELOOP.
     assert!(state.current_step().raw() >= 1);
 }
+
+// ── Audit C5: mid-stream error must surface, not silently truncate ─────────
+
+#[tokio::test]
+async fn audit_c5_mid_stream_error_surfaces_as_err() {
+    use caduceus_providers::mock::MockLlmAdapter;
+    use caduceus_providers::StreamChunk;
+
+    let ok_chunk = StreamChunk {
+        delta: "Hello wor".to_string(),
+        is_final: false,
+        input_tokens: None,
+        output_tokens: None,
+        cache_read_tokens: None,
+        cache_creation_tokens: None,
+    };
+    // Emit 9 bytes successfully, then a mid-stream error. Pre-audit the harness
+    // would return Ok(ChatResponse{content: "Hello wor", stop_reason: EndTurn});
+    // post-audit it must return Err so the caller can retry.
+    let fallible_stream = vec![
+        Ok(ok_chunk),
+        Err(caduceus_core::CaduceusError::Provider(
+            "connection reset mid-stream".to_string(),
+        )),
+    ];
+
+    let adapter = Arc::new(
+        MockLlmAdapter::new(vec![]).with_fallible_stream_chunks(vec![fallible_stream]),
+    );
+    let harness =
+        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+    let mut state = make_session();
+
+    let result = harness.stream_turn(&mut state, "hello").await;
+
+    assert!(
+        result.is_err(),
+        "mid-stream error must surface as Err, got Ok({:?}) — audit C5 regression",
+        result.as_ref().ok()
+    );
+    let err = result.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("stream truncated after 9 bytes"),
+        "error should mention bytes received and root cause, got: {msg}"
+    );
+    assert!(
+        msg.contains("connection reset mid-stream"),
+        "error should preserve underlying provider error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn audit_c5_clean_stream_still_succeeds() {
+    use caduceus_providers::mock::MockLlmAdapter;
+    use caduceus_providers::StreamChunk;
+
+    // Baseline: a clean stream with no errors should still return Ok.
+    let chunks = vec![
+        StreamChunk {
+            delta: "Hello ".to_string(),
+            is_final: false,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+        },
+        StreamChunk {
+            delta: "world".to_string(),
+            is_final: true,
+            input_tokens: Some(5),
+            output_tokens: Some(2),
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+        },
+    ];
+
+    let adapter = Arc::new(MockLlmAdapter::new(vec![]).with_stream_chunks(vec![chunks]));
+    let harness =
+        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+    let mut state = make_session();
+
+    let result = harness.stream_turn(&mut state, "hello").await;
+
+    assert!(result.is_ok(), "clean stream must succeed: {:?}", result.err());
+    assert_eq!(result.unwrap(), "Hello world");
+}

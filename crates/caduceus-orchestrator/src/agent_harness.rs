@@ -3038,11 +3038,19 @@ impl AgentHarness {
                 let mut output_tokens = 0u32;
                 let mut cache_read = 0u32;
                 let mut cache_create = 0u32;
+                // Audit C5 fix: track mid-stream errors so a truncated response
+                // is not returned as a successful EndTurn. Any mid-stream error
+                // propagates as Err so the retry adapter / caller can decide
+                // whether to re-run the turn. Emitted text deltas on the UI
+                // before the error are ephemeral (caller will re-emit on retry).
+                let mut stream_error: Option<String> = None;
+                let mut bytes_received = 0usize;
 
                 while let Some(chunk_result) = stream.next().await {
                     match chunk_result {
                         Ok(chunk) => {
                             if !chunk.delta.is_empty() {
+                                bytes_received += chunk.delta.len();
                                 content.push_str(&chunk.delta);
                                 if let Some(ref em) = self.emitter {
                                     em.emit_text_delta(&chunk.delta).await;
@@ -3062,9 +3070,23 @@ impl AgentHarness {
                             }
                         }
                         Err(e) => {
-                            tracing::warn!("Stream error: {e}");
+                            tracing::warn!(
+                                bytes_received,
+                                "Stream error (audit C5: surfacing as Err, was silently truncated): {e}"
+                            );
+                            stream_error = Some(e.to_string());
+                            break;
                         }
                     }
+                }
+
+                if let Some(err_msg) = stream_error {
+                    // Audit C5: mid-stream error must not masquerade as a
+                    // successful EndTurn. Return Err so RetryAdapter + caller
+                    // can retry. Partial UI text already emitted is ephemeral.
+                    return Err(caduceus_core::CaduceusError::Provider(format!(
+                        "stream truncated after {bytes_received} bytes: {err_msg}"
+                    )));
                 }
 
                 // Streaming delivers text only — no tool calls.

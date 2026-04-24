@@ -9,6 +9,9 @@ pub struct MockLlmAdapter {
     provider_id: ProviderId,
     scripted_responses: Mutex<VecDeque<ChatResponse>>,
     scripted_streams: Mutex<VecDeque<Vec<StreamChunk>>>,
+    /// Audit C5 test support: scripted streams that can inject mid-stream errors.
+    /// Takes precedence over `scripted_streams` when non-empty.
+    scripted_fallible_streams: Mutex<VecDeque<Vec<Result<StreamChunk>>>>,
     requests: Mutex<Vec<ChatRequest>>,
 }
 
@@ -18,12 +21,23 @@ impl MockLlmAdapter {
             provider_id: ProviderId::new("mock"),
             scripted_responses: Mutex::new(VecDeque::from(scripted_responses)),
             scripted_streams: Mutex::new(VecDeque::new()),
+            scripted_fallible_streams: Mutex::new(VecDeque::new()),
             requests: Mutex::new(Vec::new()),
         }
     }
 
     pub fn with_stream_chunks(mut self, scripted_streams: Vec<Vec<StreamChunk>>) -> Self {
         self.scripted_streams = Mutex::new(VecDeque::from(scripted_streams));
+        self
+    }
+
+    /// Audit C5 test support: script a stream that emits N Ok chunks then an Err.
+    /// The harness must surface this as an `Err`, not as a truncated `Ok(EndTurn)`.
+    pub fn with_fallible_stream_chunks(
+        mut self,
+        scripted_streams: Vec<Vec<Result<StreamChunk>>>,
+    ) -> Self {
+        self.scripted_fallible_streams = Mutex::new(VecDeque::from(scripted_streams));
         self
     }
 
@@ -61,6 +75,16 @@ impl LlmAdapter for MockLlmAdapter {
             .lock()
             .expect("mock requests mutex poisoned")
             .push(request);
+
+        // Audit C5: if a fallible stream is queued, prefer it.
+        if let Some(fallible) = self
+            .scripted_fallible_streams
+            .lock()
+            .expect("mock fallible stream mutex poisoned")
+            .pop_front()
+        {
+            return Ok(Box::pin(stream::iter(fallible)));
+        }
 
         let chunks = self
             .scripted_streams
