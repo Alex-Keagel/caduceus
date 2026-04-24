@@ -723,7 +723,7 @@ impl Coordinator {
         let prompt = build_decompose_prompt(goal, &self.agents);
         let req = ChatRequest {
             model: model.clone(),
-            messages: vec![Message::user(&prompt)],
+            messages: vec![Message::user(&prompt)].into(),
             system: Some(coordinator_system_prompt()),
             max_tokens: 4096,
             temperature: None,
@@ -866,7 +866,7 @@ impl Coordinator {
         let prompt = build_synthesis_prompt(goal, &outputs);
         let req = ChatRequest {
             model: model.clone(),
-            messages: vec![Message::user(&prompt)],
+            messages: vec![Message::user(&prompt)].into(),
             system: Some(coordinator_system_prompt()),
             max_tokens: 4096,
             temperature: None,
@@ -918,7 +918,7 @@ impl Coordinator {
         let prompt = build_critique_prompt(goal, &outputs);
         let req = ChatRequest {
             model: critic_model.clone(),
-            messages: vec![Message::user(&prompt)],
+            messages: vec![Message::user(&prompt)].into(),
             system: Some(critic_system_prompt()),
             max_tokens: 4096,
             // G31 / P10.2 — temperature was historically pinned at 0.0
@@ -1084,7 +1084,7 @@ async fn run_task(
     for turn in 0..max_turns {
         let req = ChatRequest {
             model: used_model.clone(),
-            messages: history.clone(),
+            messages: history.clone().into(),
             system: Some(system.clone()),
             max_tokens: 4096,
             temperature: None,

@@ -411,7 +411,14 @@ pub enum ResponseFormat {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
     pub model: ModelId,
-    pub messages: Vec<Message>,
+    /// Conversation history for this request.
+    ///
+    /// Stored as `Arc<[Message]>` (ST-C2 Phase 3 / audit finding C1) so
+    /// that cloning a ChatRequest for retry/failover is O(1) (refcount
+    /// bump) instead of O(N × message-size). Previously `Vec<Message>`;
+    /// the serde surface is unchanged — `Arc<[T]>` serialises to the
+    /// same JSON array as `Vec<T>`.
+    pub messages: Arc<[Message]>,
     pub system: Option<String>,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
@@ -1657,7 +1664,7 @@ fn build_openai_request_body(
         }));
     }
 
-    for msg in &request.messages {
+    for msg in request.messages.iter() {
         let blocks = msg.content_blocks();
         let has_images = blocks
             .iter()
@@ -2096,7 +2103,7 @@ where
             model: config
                 .model
                 .unwrap_or_else(|| default_validation_model(provider_id)),
-            messages: vec![Message::user("ping")],
+            messages: vec![Message::user("ping")].into(),
             system: Some("Reply with pong.".into()),
             max_tokens: 8,
             temperature: Some(0.0),
@@ -2578,7 +2585,7 @@ mod tests {
     fn a3_mk_req(intent: Option<CompletionIntent>, tools: Vec<ToolSpec>) -> ChatRequest {
         ChatRequest {
             model: caduceus_core::ModelId("m".into()),
-            messages: vec![],
+            messages: vec![].into(),
             system: None,
             max_tokens: 128,
             temperature: None,
@@ -3093,7 +3100,7 @@ mod tests {
         let adapter = AnthropicAdapter::new("test-key");
         let request = ChatRequest {
             model: ModelId::new("claude-sonnet-4-5"),
-            messages: vec![Message::user("Hello")],
+            messages: vec![Message::user("Hello")].into(),
             system: Some("You are helpful.".into()),
             max_tokens: 1024,
             temperature: Some(0.7),
@@ -3127,7 +3134,7 @@ mod tests {
             messages: vec![
                 Message::user("first turn — long stable prefix").with_cache_breakpoint(),
                 Message::user("second turn — fresh"),
-            ],
+            ].into(),
             system: None,
             max_tokens: 1024,
             temperature: None,
@@ -3176,7 +3183,7 @@ mod tests {
         tool_msg.cache_breakpoint = true;
         let request = ChatRequest {
             model: ModelId::new("claude-sonnet-4-5"),
-            messages: vec![tool_msg],
+            messages: vec![tool_msg].into(),
             system: None,
             max_tokens: 1024,
             temperature: None,
@@ -3232,7 +3239,7 @@ mod tests {
                 assistant_msg,
                 tool_msg,
                 Message::user("What did the file say?"),
-            ],
+            ].into(),
             system: Some("You are helpful.".into()),
             max_tokens: 1024,
             temperature: None,
@@ -3284,7 +3291,7 @@ mod tests {
         let adapter = OpenAiCompatibleAdapter::new("openai", "key", "https://api.openai.com/v1");
         let request = ChatRequest {
             model: ModelId::new("gpt-4"),
-            messages: vec![Message::user("Hello")],
+            messages: vec![Message::user("Hello")].into(),
             system: Some("You are helpful.".into()),
             max_tokens: 1024,
             temperature: None,
@@ -3367,7 +3374,7 @@ mod tests {
         let adapter = AzureOpenAiAdapter::new("resource-name", "deployment-a", "key");
         let request = ChatRequest {
             model: ModelId::new("ignored"),
-            messages: vec![Message::user("Hello Azure")],
+            messages: vec![Message::user("Hello Azure")].into(),
             system: Some("Stay concise".into()),
             max_tokens: 128,
             temperature: Some(0.2),
@@ -3471,7 +3478,7 @@ mod tests {
     fn test_chat_request_thinking_mode_enabled() {
         let req = ChatRequest {
             model: ModelId::new("test"),
-            messages: vec![],
+            messages: vec![].into(),
             system: Some("sys".into()),
             max_tokens: 100,
             temperature: None,
@@ -3512,7 +3519,7 @@ mod tests {
         let adapter = CopilotLmAdapter::new("token");
         let request = ChatRequest {
             model: ModelId::new("gpt-4o"),
-            messages: vec![Message::user("Hello")],
+            messages: vec![Message::user("Hello")].into(),
             system: Some("You are helpful.".into()),
             max_tokens: 1024,
             temperature: Some(0.5),
@@ -3545,7 +3552,7 @@ mod tests {
         let adapter = CopilotLmAdapter::new("test-token").with_base_url(server.base_url);
         let request = ChatRequest {
             model: ModelId::new("gpt-4o"),
-            messages: vec![Message::user("Hi")],
+            messages: vec![Message::user("Hi")].into(),
             system: None,
             max_tokens: 64,
             temperature: None,
@@ -3643,7 +3650,7 @@ mod tests {
         ]);
         let request = ChatRequest {
             model: ModelId::new("claude-sonnet-4-5"),
-            messages: vec![msg],
+            messages: vec![msg].into(),
             system: None,
             max_tokens: 1024,
             temperature: None,
@@ -3674,7 +3681,7 @@ mod tests {
         ]);
         let request = ChatRequest {
             model: ModelId::new("gpt-4o"),
-            messages: vec![msg],
+            messages: vec![msg].into(),
             system: None,
             max_tokens: 1024,
             temperature: None,
@@ -3728,7 +3735,7 @@ mod tests {
         let adapter = AnthropicAdapter::new("test-key");
         let request = ChatRequest {
             model: ModelId::new("claude-sonnet-4-5"),
-            messages: vec![Message::user("Hello")],
+            messages: vec![Message::user("Hello")].into(),
             system: None,
             max_tokens: 1024,
             temperature: None,
@@ -3747,7 +3754,7 @@ mod tests {
 
         let request2 = ChatRequest {
             model: ModelId::new("claude-sonnet-4-5"),
-            messages: vec![Message::user("Hello")],
+            messages: vec![Message::user("Hello")].into(),
             system: None,
             max_tokens: 1024,
             temperature: None,
@@ -3770,7 +3777,7 @@ mod tests {
     fn test_tool_choice_openai_body() {
         let request = ChatRequest {
             model: ModelId::new("gpt-4"),
-            messages: vec![Message::user("Hello")],
+            messages: vec![Message::user("Hello")].into(),
             system: None,
             max_tokens: 1024,
             temperature: None,
@@ -3789,7 +3796,7 @@ mod tests {
 
         let request2 = ChatRequest {
             model: ModelId::new("gpt-4"),
-            messages: vec![Message::user("Hello")],
+            messages: vec![Message::user("Hello")].into(),
             system: None,
             max_tokens: 1024,
             temperature: None,
@@ -3889,7 +3896,7 @@ mod tests {
     fn test_response_format_openai() {
         let request = ChatRequest {
             model: ModelId::new("gpt-4"),
-            messages: vec![Message::user("Hello")],
+            messages: vec![Message::user("Hello")].into(),
             system: None,
             max_tokens: 1024,
             temperature: None,
@@ -3927,7 +3934,7 @@ mod tests {
         let mock = MockLlmAdapter::new(vec![success_response.clone()]);
         let request = ChatRequest {
             model: ModelId::new("mock-model"),
-            messages: vec![Message::user("test")],
+            messages: vec![Message::user("test")].into(),
             system: None,
             max_tokens: 100,
             temperature: None,
@@ -3954,7 +3961,7 @@ mod tests {
         let mock = MockLlmAdapter::new(vec![]);
         let request = ChatRequest {
             model: ModelId::new("mock-model"),
-            messages: vec![Message::user("test")],
+            messages: vec![Message::user("test")].into(),
             system: None,
             max_tokens: 100,
             temperature: None,
@@ -4009,7 +4016,7 @@ mod tests {
         let mock = MockLlmAdapter::new(vec![empty_response]);
         let request = ChatRequest {
             model: ModelId::new("mock-model"),
-            messages: vec![Message::user("test")],
+            messages: vec![Message::user("test")].into(),
             system: None,
             max_tokens: 100,
             temperature: None,
@@ -4331,7 +4338,7 @@ mod tests {
     fn openai_request_body_includes_logprobs_when_requested() {
         let req = ChatRequest {
             model: ModelId::new("gpt-4"),
-            messages: vec![],
+            messages: vec![].into(),
             system: None,
             tools: vec![].into(),
             tool_choice: None,

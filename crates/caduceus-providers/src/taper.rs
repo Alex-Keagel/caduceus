@@ -266,7 +266,7 @@ mod tests {
     fn mk_request(model: &str, user: &str) -> ChatRequest {
         ChatRequest {
             model: ModelId::new(model),
-            messages: vec![crate::Message::user(user)],
+            messages: vec![crate::Message::user(user)].into(),
             system: None,
             max_tokens: 1024,
             temperature: None,

@@ -357,7 +357,7 @@ mod tests {
     fn req() -> ChatRequest {
         ChatRequest {
             model: ModelId::new("m"),
-            messages: vec![],
+            messages: vec![].into(),
             system: None,
             max_tokens: 8,
             temperature: None,
@@ -587,5 +587,34 @@ mod tests {
         // Caps at max_delay.
         assert_eq!(p.delay_before(4), Duration::from_millis(40));
         assert_eq!(p.delay_before(10), Duration::from_millis(40));
+    }
+
+    /// T7 ST-C2 Phase 3: ChatRequest.messages is Arc<[Message]>, so cloning
+    /// a ChatRequest must NOT deep-copy the messages slice. This matters on
+    /// the retry/failover hot path where every attempt clones the request.
+    #[test]
+    fn chat_request_clone_shares_messages_arc() {
+        use crate::Message;
+        let msgs: Vec<Message> = (0..64).map(|i| Message::user(format!("msg {i}"))).collect();
+        let req = ChatRequest {
+            model: crate::ModelId::new("test"),
+            messages: msgs.into(),
+            system: None,
+            max_tokens: 1024,
+            temperature: None,
+            thinking_mode: false,
+            tool_choice: None,
+            response_format: None,
+            tools: std::sync::Arc::from(Vec::<crate::ToolSpec>::new()),
+            logprobs: None,
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            stop: Vec::new(),
+        };
+        let arc_ptr_before = req.messages.as_ptr();
+        let cloned = req.clone();
+        assert_eq!(arc_ptr_before, cloned.messages.as_ptr());
+        assert_eq!(req.messages.len(), cloned.messages.len());
     }
 }

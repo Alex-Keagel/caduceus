@@ -451,7 +451,7 @@ mod tests {
     fn sample_request() -> ChatRequest {
         ChatRequest {
             model: ModelId::new("mock-model"),
-            messages: vec![],
+            messages: vec![].into(),
             system: None,
             max_tokens: 100,
             temperature: None,

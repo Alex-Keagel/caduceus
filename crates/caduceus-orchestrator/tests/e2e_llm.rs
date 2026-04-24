@@ -83,7 +83,7 @@ async fn e2e_anthropic_simple_chat() {
         model: ModelId::new("claude-sonnet-4-20250514"),
         messages: vec![caduceus_providers::Message::user(
             "What is 2+2? Answer with just the number.",
-        )],
+        )].into(),
         system: None,
         max_tokens: 32,
         temperature: Some(0.0),
@@ -131,7 +131,7 @@ async fn e2e_anthropic_tool_call() {
         model: ModelId::new("claude-sonnet-4-20250514"),
         messages: vec![caduceus_providers::Message::user(
             "What's the weather in Tokyo?",
-        )],
+        )].into(),
         system: None,
         max_tokens: 256,
         temperature: Some(0.0),
@@ -214,7 +214,7 @@ async fn e2e_openai_simple_chat() {
         model: ModelId::new("gpt-4o-mini"),
         messages: vec![caduceus_providers::Message::user(
             "What is 3+3? Answer with just the number.",
-        )],
+        )].into(),
         system: None,
         max_tokens: 32,
         temperature: Some(0.0),
@@ -258,7 +258,7 @@ async fn e2e_openai_tool_call() {
 
     let request = caduceus_providers::ChatRequest {
         model: ModelId::new("gpt-4o-mini"),
-        messages: vec![caduceus_providers::Message::user("Calculate 15 * 7")],
+        messages: vec![caduceus_providers::Message::user("Calculate 15 * 7")].into(),
         system: None,
         max_tokens: 256,
         temperature: Some(0.0),
@@ -295,7 +295,7 @@ async fn e2e_copilot_simple_chat() {
         model: ModelId::new("gpt-4o"),
         messages: vec![caduceus_providers::Message::user(
             "What is 5+5? Answer with just the number.",
-        )],
+        )].into(),
         system: None,
         max_tokens: 32,
         temperature: Some(0.0),

@@ -1442,7 +1442,7 @@ impl AgentHarness {
             }
             let req = ChatRequest {
                 model: self.effective_model(state),
-                messages: assembler.assemble(history),
+                messages: assembler.assemble(history).into(),
                 system: Some(verification_system.clone()),
                 max_tokens: self.effective_max_tokens(),
                 // Use the configured temperature; provider sampling
@@ -2004,7 +2004,7 @@ impl AgentHarness {
 
             let request = ChatRequest {
                 model: effective,
-                messages,
+                messages: messages.into(),
                 system: Some(system_prompt.clone()),
                 max_tokens: self.effective_max_tokens(),
                 temperature: self.effective_temperature(),
@@ -2907,7 +2907,7 @@ impl AgentHarness {
             // Try to get a summary from the LLM with accumulated context
             let summary_request = ChatRequest {
                 model: self.effective_model(state),
-                messages: assembler.assemble(history),
+                messages: assembler.assemble(history).into(),
                 system: Some(format!(
                     "{}\n\nYou have used all {} tool iterations. \
                      Summarize what you found and provide your answer now. \
@@ -3284,7 +3284,7 @@ impl AgentHarness {
         let system_prompt = self.effective_system_prompt();
         let request = ChatRequest {
             model: self.effective_model(state),
-            messages: vec![caduceus_providers::Message::user(user_input)],
+            messages: vec![caduceus_providers::Message::user(user_input)].into(),
             system: Some(system_prompt),
             max_tokens: self.effective_max_tokens(),
             temperature: self.effective_temperature(),

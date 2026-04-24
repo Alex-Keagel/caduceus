@@ -98,7 +98,7 @@ impl AsyncBranchExpander<String> for LlmExpander {
 
         let req = ChatRequest {
             model: caduceus_core::ModelId::new(&self.model),
-            messages: vec![Message::user(prompt)],
+            messages: vec![Message::user(prompt)].into(),
             system: Some(
                 "You are a planning module. Be concise and concrete. \
                  Each step you produce should be actionable in one tool call."
@@ -176,7 +176,7 @@ impl AsyncBranchScorer<String> for LlmScorer {
         );
         let req = ChatRequest {
             model: caduceus_core::ModelId::new(&self.model),
-            messages: vec![Message::user(prompt)],
+            messages: vec![Message::user(prompt)].into(),
             system: Some(
                 "You are a plan critic. Output a single decimal number in [0.0, 1.0].".into(),
             ),

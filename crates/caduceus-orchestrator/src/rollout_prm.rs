@@ -94,7 +94,7 @@ impl StepVerifier for RolloutPrmVerifier {
     async fn score(&self, step: &StepView) -> StepScore {
         let request = ChatRequest {
             model: self.model.clone(),
-            messages: vec![Message::user(self.render_user_prompt(step))],
+            messages: vec![Message::user(self.render_user_prompt(step))].into(),
             system: Some(self.system_prompt.clone()),
             max_tokens: 256,
             temperature: Some(0.0),

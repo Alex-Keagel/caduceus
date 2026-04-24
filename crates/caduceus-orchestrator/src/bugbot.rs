@@ -235,7 +235,7 @@ impl BugBot {
 
         let request = ChatRequest {
             model: self.model.clone(),
-            messages: vec![Message::user(&prompt)],
+            messages: vec![Message::user(&prompt)].into(),
             system: Some("You are a code fix generator. Output only corrected code.".into()),
             max_tokens: 1024,
             temperature: Some(0.1),
@@ -256,7 +256,7 @@ impl BugBot {
     async fn call_llm(&self, prompt: &str) -> Result<String> {
         let request = ChatRequest {
             model: self.model.clone(),
-            messages: vec![Message::user(prompt)],
+            messages: vec![Message::user(prompt)].into(),
             system: Some(REVIEW_SYSTEM_PROMPT.into()),
             max_tokens: 4096,
             temperature: Some(0.1),
