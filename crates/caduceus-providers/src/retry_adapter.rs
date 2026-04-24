@@ -202,10 +202,49 @@ impl LlmAdapter for RetryAdapter {
     }
 
     async fn stream(&self, request: ChatRequest) -> Result<StreamResult> {
-        // Streaming retry is genuinely tricky (partial output already
-        // flushed), so for now we delegate to primary only and let
-        // upper layers handle stream-restart policy.
-        self.primary.stream(request).await
+        // T5 (Audit C4): retry + failover on CONNECT failure only.
+        // Once `adapter.stream()` returns `Ok(stream)`, we're
+        // committed — mid-stream failures are the caller's problem
+        // (idle timeout from T1 / C5 error propagation handles those
+        // structurally). But a transient failure BEFORE first byte
+        // (connection refused, 503, rate-limit on stream endpoint)
+        // is exactly the same retry/failover opportunity we give
+        // `chat()`, so mirror that logic here.
+        let mut last_err: Option<CaduceusError> = None;
+
+        let chain: Vec<&Arc<dyn LlmAdapter>> = std::iter::once(&self.primary)
+            .chain(self.backups.iter())
+            .collect();
+
+        for (chain_idx, adapter) in chain.iter().enumerate() {
+            let attempts = self.policy.max_attempts.max(1);
+            for attempt in 0..attempts {
+                if attempt > 0 {
+                    tokio::time::sleep(self.policy.delay_before(attempt)).await;
+                }
+                match adapter.stream(request.clone()).await {
+                    Ok(stream) => return Ok(stream),
+                    Err(e) => {
+                        let transient = is_transient_error(&e);
+                        last_err = Some(e);
+                        if !transient {
+                            break;
+                        }
+                    }
+                }
+            }
+            if chain_idx + 1 < chain.len() {
+                if let Some(hook) = &self.on_failover {
+                    let from = adapter.provider_id().0.as_str();
+                    let to = chain[chain_idx + 1].provider_id().0.as_str();
+                    hook(from, to, attempts);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or(CaduceusError::Provider(
+            "RetryAdapter::stream: no attempts made (empty chain?)".into(),
+        )))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelId>> {
@@ -226,7 +265,9 @@ mod tests {
     struct ScriptedAdapter {
         id: ProviderId,
         results: Mutex<Vec<Result<ChatResponse>>>,
+        stream_results: Mutex<Vec<Result<StreamResult>>>,
         calls: AtomicUsize,
+        stream_calls: AtomicUsize,
     }
 
     impl ScriptedAdapter {
@@ -234,11 +275,20 @@ mod tests {
             Self {
                 id: ProviderId::new(id),
                 results: Mutex::new(results),
+                stream_results: Mutex::new(Vec::new()),
                 calls: AtomicUsize::new(0),
+                stream_calls: AtomicUsize::new(0),
             }
+        }
+        fn with_stream_results(self, sr: Vec<Result<StreamResult>>) -> Self {
+            *self.stream_results.lock().unwrap() = sr;
+            self
         }
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+        fn stream_calls(&self) -> usize {
+            self.stream_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -265,7 +315,16 @@ mod tests {
                 .unwrap_or_else(|| Err(CaduceusError::Provider("ScriptedAdapter exhausted".into())))
         }
         async fn stream(&self, _req: ChatRequest) -> Result<StreamResult> {
-            unimplemented!("streaming not used in retry tests")
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            self.stream_results
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap_or_else(|| {
+                    Err(CaduceusError::Provider(
+                        "ScriptedAdapter stream exhausted".into(),
+                    ))
+                })
         }
         async fn list_models(&self) -> Result<Vec<ModelId>> {
             Ok(vec![])
@@ -437,6 +496,80 @@ mod tests {
             s.contains("backup down"),
             "must surface LAST error, got: {s}"
         );
+    }
+
+    #[tokio::test]
+    async fn audit_c4_stream_retries_transient_connect_failure() {
+        // Stream connect fails twice (transient), then succeeds.
+        let empty_stream: StreamResult = Box::pin(futures::stream::empty());
+        let primary = Arc::new(
+            ScriptedAdapter::new("primary", vec![]).with_stream_results(vec![
+                Ok(empty_stream),
+                Err(CaduceusError::Provider("503 service unavailable".into())),
+                Err(CaduceusError::RateLimited {
+                    retry_after_secs: 0,
+                }),
+            ]),
+        );
+        let retry = RetryAdapter::new(primary.clone()).with_policy(fast_policy());
+        let _stream = retry.stream(req()).await.expect("should succeed after retries");
+        assert_eq!(
+            primary.stream_calls(),
+            3,
+            "stream() must have retried twice before success"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_c4_stream_fails_over_after_primary_exhausted() {
+        let empty_stream: StreamResult = Box::pin(futures::stream::empty());
+        let primary = Arc::new(
+            ScriptedAdapter::new("primary", vec![]).with_stream_results(vec![
+                Err(CaduceusError::RateLimited {
+                    retry_after_secs: 0,
+                }),
+                Err(CaduceusError::RateLimited {
+                    retry_after_secs: 0,
+                }),
+                Err(CaduceusError::RateLimited {
+                    retry_after_secs: 0,
+                }),
+            ]),
+        );
+        let backup = Arc::new(
+            ScriptedAdapter::new("backup", vec![])
+                .with_stream_results(vec![Ok(empty_stream)]),
+        );
+        let retry = RetryAdapter::new(primary.clone())
+            .with_policy(fast_policy())
+            .with_failover(backup.clone());
+        let _stream = retry.stream(req()).await.expect("backup should serve");
+        assert_eq!(primary.stream_calls(), 3);
+        assert_eq!(backup.stream_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn audit_c4_stream_non_transient_short_circuits() {
+        let empty_stream: StreamResult = Box::pin(futures::stream::empty());
+        let primary = Arc::new(
+            ScriptedAdapter::new("primary", vec![]).with_stream_results(vec![Err(
+                CaduceusError::Provider("400 bad request".into()),
+            )]),
+        );
+        let backup = Arc::new(
+            ScriptedAdapter::new("backup", vec![])
+                .with_stream_results(vec![Ok(empty_stream)]),
+        );
+        let retry = RetryAdapter::new(primary.clone())
+            .with_policy(fast_policy())
+            .with_failover(backup.clone());
+        let _stream = retry.stream(req()).await.expect("backup should serve");
+        assert_eq!(
+            primary.stream_calls(),
+            1,
+            "non-transient stream connect must not retry"
+        );
+        assert_eq!(backup.stream_calls(), 1);
     }
 
     #[test]
