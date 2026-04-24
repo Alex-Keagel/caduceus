@@ -3638,3 +3638,119 @@ fn audit_c3_provider_timeout_is_transient_for_retry_adapter() {
         "ProviderTimeout must classify as transient so RetryAdapter will retry/failover"
     );
 }
+
+// ── Audit C2 / T8: thread_id + prompt_id plumbing ────────────────────────
+
+#[tokio::test]
+async fn audit_c2_harness_forwards_thread_id_and_mints_prompt_id() {
+    use caduceus_providers::mock::MockLlmAdapter;
+
+    let adapter = Arc::new(MockLlmAdapter::new(vec![caduceus_providers::ChatResponse {
+        content: "done".into(),
+        tool_calls: vec![],
+        stop_reason: caduceus_core::StopReason::EndTurn,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        logprobs: None,
+        thinking: String::new(),
+    }]));
+    let adapter_clone = adapter.clone();
+
+    let harness = AgentHarness::new(
+        adapter,
+        caduceus_tools::ToolRegistry::new(),
+        4096,
+        "system",
+    )
+    .with_thread_id("thread-abc-123");
+    let mut state = make_session();
+    let mut history = crate::ConversationHistory::new();
+    let _ = harness.run(&mut state, &mut history, "hi").await;
+
+    let recorded = adapter_clone.recorded_requests();
+    assert!(!recorded.is_empty(), "adapter must have been called");
+    let req = &recorded[0];
+    assert_eq!(
+        req.thread_id.as_deref(),
+        Some("thread-abc-123"),
+        "thread_id must be forwarded verbatim from HarnessBuilder"
+    );
+    assert!(
+        req.prompt_id.is_some(),
+        "prompt_id must be minted fresh per ChatRequest"
+    );
+    // Validate mint is UUID-shaped (36 chars with hyphens).
+    let pid = req.prompt_id.as_deref().unwrap();
+    assert_eq!(
+        pid.len(),
+        36,
+        "prompt_id should be a UUIDv4 string (36 chars), got len={} ({pid})",
+        pid.len()
+    );
+    assert_eq!(
+        pid.chars().filter(|c| *c == '-').count(),
+        4,
+        "UUIDv4 has 4 hyphens, got: {pid}"
+    );
+}
+
+#[tokio::test]
+async fn audit_c2_unique_prompt_id_per_request() {
+    use caduceus_providers::mock::MockLlmAdapter;
+
+    // Two separate turns → two distinct prompt_ids.
+    let adapter = Arc::new(MockLlmAdapter::new(vec![
+        caduceus_providers::ChatResponse {
+            content: "turn-1".into(),
+            tool_calls: vec![],
+            stop_reason: caduceus_core::StopReason::EndTurn,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            logprobs: None,
+            thinking: String::new(),
+        },
+        caduceus_providers::ChatResponse {
+            content: "turn-2".into(),
+            tool_calls: vec![],
+            stop_reason: caduceus_core::StopReason::EndTurn,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            logprobs: None,
+            thinking: String::new(),
+        },
+    ]));
+    let adapter_clone = adapter.clone();
+    let harness = AgentHarness::new(
+        adapter,
+        caduceus_tools::ToolRegistry::new(),
+        4096,
+        "system",
+    )
+    .with_thread_id("thread-xyz");
+    let mut state = make_session();
+    let mut history = crate::ConversationHistory::new();
+    let _ = harness.run(&mut state, &mut history, "a").await;
+    let _ = harness.run(&mut state, &mut history, "b").await;
+
+    let recorded = adapter_clone.recorded_requests();
+    assert!(
+        recorded.len() >= 2,
+        "two turns -> at least two recorded requests, got {}",
+        recorded.len()
+    );
+    let pid1 = recorded[0].prompt_id.as_deref().expect("pid1");
+    let pid2 = recorded[recorded.len() - 1].prompt_id.as_deref().expect("pid2");
+    assert_ne!(pid1, pid2, "prompt_id must differ across turns");
+    // Both turns use the same thread_id.
+    assert_eq!(recorded[0].thread_id.as_deref(), Some("thread-xyz"));
+    assert_eq!(
+        recorded[recorded.len() - 1].thread_id.as_deref(),
+        Some("thread-xyz")
+    );
+}

@@ -215,6 +215,12 @@ pub struct AgentHarness {
     /// builders produce harnesses with `None` here so byte-for-byte
     /// behaviour is preserved (contract-tested; see ST-B3 tests).
     context_injector: Option<Arc<dyn crate::scoped_context::ContextInjector>>,
+    /// T8 (Audit C2): stable thread identifier tied to the owning
+    /// session. Forwarded into every `ChatRequest.thread_id` the
+    /// harness constructs, so provider-side analytics / routing /
+    /// prompt caching can group requests from the same thread.
+    /// `None` preserves pre-T8 behaviour (wire field omitted).
+    thread_id: Option<Arc<str>>,
 }
 
 /// Configuration for the post-loop test-gate (gap G3 / P2.2).
@@ -400,6 +406,7 @@ impl AgentHarness {
             permission_envelope: None,
             introspection_sink: None,
             context_injector: None,
+            thread_id: None,
         }
     }
 
@@ -1045,6 +1052,15 @@ impl AgentHarness {
         self
     }
 
+    /// T8 (Audit C2): set the stable thread identifier that the
+    /// harness forwards into every `ChatRequest.thread_id`. Upstream
+    /// IDE sessions should pass the session/thread id so provider
+    /// analytics can group requests.
+    pub fn with_thread_id(mut self, thread_id: impl Into<Arc<str>>) -> Self {
+        self.thread_id = Some(thread_id.into());
+        self
+    }
+
     /// P5: Set the Act-mode lens. No-op for non-Act modes (the lens is
     /// rendered only when the mode is Act). Defaults to `Normal`.
     pub fn with_mode_lens(mut self, lens: modes::ActLens) -> Self {
@@ -1437,8 +1453,8 @@ impl AgentHarness {
                 tools: vec![].into(),
                 response_format: None,
                 logprobs: if is_cisc { Some(5) } else { None },
-                thread_id: None,
-                prompt_id: None,
+                thread_id: self.thread_id.as_deref().map(ToOwned::to_owned),
+                prompt_id: Some(uuid::Uuid::new_v4().to_string()),
                 intent: Some(CompletionIntent::VerificationRollout),
                 stop: vec![],
             };
@@ -1997,8 +2013,8 @@ impl AgentHarness {
                 tools: Arc::clone(&tool_specs),
                 response_format: None,
                 logprobs: self.request_logprobs.then_some(5),
-                thread_id: None,
-                prompt_id: None,
+                thread_id: self.thread_id.as_deref().map(ToOwned::to_owned),
+                prompt_id: Some(uuid::Uuid::new_v4().to_string()),
                 intent: Some(CompletionIntent::UserPrompt),
                 stop: vec![],
             };
@@ -2905,8 +2921,8 @@ impl AgentHarness {
                 tools: vec![].into(), // No tools — force text response
                 response_format: None,
                 logprobs: None,
-                thread_id: None,
-                prompt_id: None,
+                thread_id: self.thread_id.as_deref().map(ToOwned::to_owned),
+                prompt_id: Some(uuid::Uuid::new_v4().to_string()),
                 intent: Some(CompletionIntent::SummarizationFallback),
                 stop: vec![],
             };
@@ -3277,8 +3293,8 @@ impl AgentHarness {
             tools: vec![].into(),
             response_format: None,
             logprobs: None,
-            thread_id: None,
-            prompt_id: None,
+            thread_id: self.thread_id.as_deref().map(ToOwned::to_owned),
+            prompt_id: Some(uuid::Uuid::new_v4().to_string()),
             intent: Some(CompletionIntent::OneShot),
             stop: vec![],
         };
