@@ -100,6 +100,20 @@ fn p10_03_behavior_rules_preamble_present() {
             "behavior_rules missing anchor '{anchor}':\n{prompt}"
         );
     }
+    // Sweep #2 (post nanoreason-thread review) — five new rules must be
+    // present so future edits don't silently drop them.
+    for anchor in [
+        "Match response length",   // PB1 brevity
+        "/dev/null",               // PB2 fake-path ban
+        "ONE clarifying question", // PB3 stop padding
+        "Before citing",           // PB4 cite-then-fetch
+        "empty `<thinking>",       // PB5 no empty thinking
+    ] {
+        assert!(
+            prompt.contains(anchor),
+            "sweep-#2 behavior rule missing: '{anchor}':\n{prompt}"
+        );
+    }
 }
 
 // ── 4 & 5. No-hallucination and fallback instructions live in the preamble ───
