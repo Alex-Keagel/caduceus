@@ -126,6 +126,18 @@ fn p10_03_behavior_rules_preamble_present() {
             "phase-3 PB6 rule missing: '{anchor}':\n{prompt}"
         );
     }
+    // Sweep #3 (post nanoTeacher-thread dead-end) — PB7 forbids treating an
+    // empty target directory as a blocker when the user asked to create
+    // files there. Two anchors guarantee the wording survives edits.
+    for anchor in [
+        "Empty target is a green light",
+        "is empty\" and stop",
+    ] {
+        assert!(
+            prompt.contains(anchor),
+            "PB7 empty-target rule missing: '{anchor}':\n{prompt}"
+        );
+    }
 }
 
 // ── 3b. Phase-3 autonomy thresholds block is rendered with env-overridable ──

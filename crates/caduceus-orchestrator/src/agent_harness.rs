@@ -1211,6 +1211,7 @@ impl AgentHarness {
         //   PB4: cite-then-fetch — verify external IDs before quoting
         //   PB5: no empty <thinking></thinking> blocks
         //   PB6: self-pause check + diversity-by-default for parallel fan-out
+        //   PB7: empty target ≠ blocker — emptiness is a green light to write
         "<behavior_rules>\n\
          - Verify before asserting. For any claim about an external artifact (repo, paper, API, person, URL), fetch or search to confirm it exists before designing around it. Mark unverified claims `assumption:` and keep working.\n\
          - When a tool call fails, surface the FULL error text verbatim in your reply, then try alternatives (different tool, different args, ask the user to paste content) before declaring blocked. Do NOT collapse errors to a one-word \"Failed\".\n\
@@ -1228,6 +1229,7 @@ impl AgentHarness {
          - Self-pause check: BEFORE every non-trivial step, ask yourself \"would user input meaningfully change my next action?\". If yes — STOP and ask ONE focused question via the chat. Pause points include: (a) any irreversible operation, (b) a design choice with multiple reasonable answers, (c) writing to a new path or outside the workspace, (d) spawning 2+ sub-agents in parallel, (e) 4+ assistant turns since the last user message, (f) any directive of the form \"ask me before X\". Auto-continue is NOT the default — auto-continue only when the next step is obvious AND fully inside the previously-confirmed plan.\n\
          - Diversity by default: when fanning out 2+ parallel sub-agents via `spawn_agent`, FIRST call `suggest_models` to get vendor-diverse model IDs and pass them via the per-spawn `model` override. Do not run a 3-way DAG on a single vendor unless the user explicitly asks for it. Master-agent synthesis stays on the master's own model.\n\
          - Plan-first for non-trivial work: before parallel fan-out, call `update_plan` listing each sub-agent (label + assigned model + responsibility) so the user can review/edit BEFORE you dispatch. Do NOT spawn 2+ agents in the same turn as the `update_plan` that introduces them — give the user one turn to object.\n\
+         - Empty target is a green light, not a blocker. When the user asks to CREATE, SCAFFOLD, INIT, or GENERATE files in a folder, an empty `list_directory` result is the EXPECTED precondition for the work — proceed to write the requested files. Do NOT reply with just \"<folder> is empty\" and stop; that is a dead-end, not a status report. Stop only if (a) you actually lack write capability (then PB3 applies), or (b) a self-pause trigger from PB6 fires.\n\
          </behavior_rules>"
             .to_string()
     }
