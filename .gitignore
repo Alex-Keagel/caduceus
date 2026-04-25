@@ -44,3 +44,4 @@ dist-ssr/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+ai-readiness-full-caduceus.json
