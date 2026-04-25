@@ -1129,6 +1129,27 @@ impl AgentHarness {
         //    keep working on what remains in scope.
         parts.push(Self::behavior_rules_preamble());
 
+        // 1b. Phase-3 autonomy / spawn-count knobs (PB6 enforcement). These
+        // emit advisory thresholds the LLM can self-check against. Hard
+        // runtime intercepts intentionally live downstream — keeping the
+        // rule visible here lets the model self-throttle BEFORE the
+        // interceptor fires.
+        let autonomy_budget = std::env::var("CADUCEUS_AUTONOMY_BUDGET")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(4);
+        let parallel_spawn_limit = std::env::var("CADUCEUS_PARALLEL_SPAWN_LIMIT")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(2);
+        parts.push(format!(
+            "<autonomy_thresholds>\n\
+             - Pause and ask the user after {autonomy_budget} consecutive assistant turns with no user input.\n\
+             - Pause and surface the proposed DAG before spawning more than {parallel_spawn_limit} sub-agents in a single turn.\n\
+             - These are ceilings, not targets. Pause earlier whenever PB6 self-pause triggers.\n\
+             </autonomy_thresholds>"
+        ));
+
         // 2. Mode + lens prompt.
         if let Some(ref mode) = self.mode {
             let mode_config = mode.config_with_lens(self.mode_lens);
@@ -1189,6 +1210,7 @@ impl AgentHarness {
         //   PB3: when blocked (no workspace, denied perm), STOP padding
         //   PB4: cite-then-fetch — verify external IDs before quoting
         //   PB5: no empty <thinking></thinking> blocks
+        //   PB6: self-pause check + diversity-by-default for parallel fan-out
         "<behavior_rules>\n\
          - Verify before asserting. For any claim about an external artifact (repo, paper, API, person, URL), fetch or search to confirm it exists before designing around it. Mark unverified claims `assumption:` and keep working.\n\
          - When a tool call fails, surface the FULL error text verbatim in your reply, then try alternatives (different tool, different args, ask the user to paste content) before declaring blocked. Do NOT collapse errors to a one-word \"Failed\".\n\
@@ -1203,6 +1225,9 @@ impl AgentHarness {
          - When you cannot write a file (no workspace, denied permission, missing tool), say so in ONE line, ask ONE clarifying question, and STOP. Do NOT compensate by emitting ever-larger inline content as a workaround. If a `/init` command exists, suggest it.\n\
          - Before citing an arXiv ID, paper title, GitHub repo, or other external identifier, fetch the canonical page to verify title and authors. Snippet titles from search results are not enough.\n\
          - Do NOT emit empty `<thinking></thinking>` blocks. Either think substantively or omit the block.\n\
+         - Self-pause check: BEFORE every non-trivial step, ask yourself \"would user input meaningfully change my next action?\". If yes — STOP and ask ONE focused question via the chat. Pause points include: (a) any irreversible operation, (b) a design choice with multiple reasonable answers, (c) writing to a new path or outside the workspace, (d) spawning 2+ sub-agents in parallel, (e) 4+ assistant turns since the last user message, (f) any directive of the form \"ask me before X\". Auto-continue is NOT the default — auto-continue only when the next step is obvious AND fully inside the previously-confirmed plan.\n\
+         - Diversity by default: when fanning out 2+ parallel sub-agents via `spawn_agent`, FIRST call `suggest_models` to get vendor-diverse model IDs and pass them via the per-spawn `model` override. Do not run a 3-way DAG on a single vendor unless the user explicitly asks for it. Master-agent synthesis stays on the master's own model.\n\
+         - Plan-first for non-trivial work: before parallel fan-out, call `update_plan` listing each sub-agent (label + assigned model + responsibility) so the user can review/edit BEFORE you dispatch. Do NOT spawn 2+ agents in the same turn as the `update_plan` that introduces them — give the user one turn to object.\n\
          </behavior_rules>"
             .to_string()
     }

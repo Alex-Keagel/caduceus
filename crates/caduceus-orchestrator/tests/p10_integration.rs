@@ -114,6 +114,65 @@ fn p10_03_behavior_rules_preamble_present() {
             "sweep-#2 behavior rule missing: '{anchor}':\n{prompt}"
         );
     }
+    // Phase 3 (DAG orchestration) — PB6 self-pause + diversity-by-default
+    // + plan-first-for-non-trivial. Three anchors must be present.
+    for anchor in [
+        "Self-pause check",       // PB6a self-pause
+        "Diversity by default",   // PB6b diversity-by-default
+        "Plan-first",             // PB6c plan-first for non-trivial
+    ] {
+        assert!(
+            prompt.contains(anchor),
+            "phase-3 PB6 rule missing: '{anchor}':\n{prompt}"
+        );
+    }
+}
+
+// ── 3b. Phase-3 autonomy thresholds block is rendered with env-overridable ──
+//        defaults (CADUCEUS_AUTONOMY_BUDGET, CADUCEUS_PARALLEL_SPAWN_LIMIT).
+//        Tests run in parallel and share process env, so we keep a single
+//        serial test that checks both default and override paths.
+
+#[test]
+fn p10_03b_autonomy_thresholds_block_default_and_override() {
+    // SAFETY: the test mutates process-global env. Run --test-threads=1 if
+    // failing in parallel — but we keep both checks in one test so we do
+    // not race ourselves.
+    unsafe {
+        std::env::remove_var("CADUCEUS_AUTONOMY_BUDGET");
+        std::env::remove_var("CADUCEUS_PARALLEL_SPAWN_LIMIT");
+    }
+    let prompt = behavior_rules_and_mode_prompt(AgentMode::Plan, ActLens::Normal);
+    assert!(
+        prompt.contains("<autonomy_thresholds>"),
+        "missing autonomy_thresholds block:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("after 4 consecutive assistant turns"),
+        "default autonomy budget (4) not rendered:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("more than 2 sub-agents"),
+        "default parallel-spawn limit (2) not rendered:\n{prompt}"
+    );
+
+    unsafe {
+        std::env::set_var("CADUCEUS_AUTONOMY_BUDGET", "7");
+        std::env::set_var("CADUCEUS_PARALLEL_SPAWN_LIMIT", "5");
+    }
+    let prompt = behavior_rules_and_mode_prompt(AgentMode::Plan, ActLens::Normal);
+    unsafe {
+        std::env::remove_var("CADUCEUS_AUTONOMY_BUDGET");
+        std::env::remove_var("CADUCEUS_PARALLEL_SPAWN_LIMIT");
+    }
+    assert!(
+        prompt.contains("after 7 consecutive assistant turns"),
+        "env override of autonomy budget not honored:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("more than 5 sub-agents"),
+        "env override of parallel-spawn limit not honored:\n{prompt}"
+    );
 }
 
 // ── 4 & 5. No-hallucination and fallback instructions live in the preamble ───
