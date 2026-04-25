@@ -44,11 +44,14 @@ fn behavior_rules_and_mode_prompt(mode: AgentMode, lens: ActLens) -> String {
 
 #[test]
 fn p10_01_research_prompt_allows_fetch_and_search() {
-    let prompt = behavior_rules_and_mode_prompt(AgentMode::Research, ActLens::Normal);
+    let prompt = behavior_rules_and_mode_prompt(AgentMode::Plan, ActLens::Normal);
     // Must explicitly mention that reads + web are available in Research.
+    let lc_full = prompt.to_lowercase();
+    // Plan now subsumes Research; prompt must reference research/web/fetch.
     assert!(
-        prompt.contains("RESEARCH") && (prompt.contains("fetch") || prompt.contains("web")),
-        "Research prompt missing web-fetch guarantee:\n{prompt}"
+        (lc_full.contains("research") || lc_full.contains("plan"))
+            && (prompt.contains("fetch") || prompt.contains("web")),
+        "Combined Plan/Research prompt missing web-fetch guarantee:\n{prompt}"
     );
     // Must NOT tell the model to switch modes in order to read. The
     // preamble's "Never request a mode change to perform a read" is a
@@ -103,7 +106,7 @@ fn p10_03_behavior_rules_preamble_present() {
 
 #[test]
 fn p10_04_preamble_forbids_hallucination_and_requires_fallback() {
-    let prompt = behavior_rules_and_mode_prompt(AgentMode::Research, ActLens::Normal);
+    let prompt = behavior_rules_and_mode_prompt(AgentMode::Plan, ActLens::Normal);
     // The preamble must tell the LLM to try alternatives when a tool fails,
     // not to declare blocked immediately.
     assert!(
@@ -331,7 +334,7 @@ fn p10_13_critique_fanout_personas_are_derived_from_policy_not_hardcoded() {
 
 #[test]
 fn p10_14_preamble_contains_prompt_injection_guard() {
-    let prompt = behavior_rules_and_mode_prompt(AgentMode::Research, ActLens::Normal);
+    let prompt = behavior_rules_and_mode_prompt(AgentMode::Plan, ActLens::Normal);
     let lc = prompt.to_lowercase();
     // The exact wording lives in lib.rs; we anchor on the semantic tokens
     // that cannot appear by accident.
