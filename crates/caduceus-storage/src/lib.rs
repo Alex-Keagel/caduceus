@@ -3088,7 +3088,7 @@ fn validate_slug(slug: &str) -> std::result::Result<(), CaduceusError> {
     // `foo..bar`. Splitting on the path separators above already forbids real
     // segment traversal; this catches a lone literal `..` that bypassed the
     // earlier explicit check (e.g. `..` with surrounding whitespace).
-    if slug.split(|c| c == '/' || c == '\\').any(|s| s == "..") {
+    if slug.split(['/', '\\']).any(|s| s == "..") {
         return Err(CaduceusError::Storage(format!(
             "wiki slug {slug:?} contains parent-directory traversal"
         )));
