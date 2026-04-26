@@ -704,14 +704,14 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 | 248 | WebAuthn/FIDO2 passkey authentication | Passwordless authentication for cloud deployment using hardware security keys | OpenCode-Cloud | 💡 | P3 | `caduceus-permissions` |
 | 249 | Two-factor authentication (2FA) | TOTP/SMS second factor for enterprise deployments | OpenCode-Cloud | 💡 | P3 | `caduceus-permissions` |
 | 250 | Wiki engine | Persistent project wiki in .caduceus/wiki/ — CRUD, search, [[links]], git-tracked markdown (exposed via zed `caduceus_project_wiki` LLM tool) | Karpathy | ✅ | P1 | `caduceus-storage` |
-| 251 | Wiki index | Auto-maintained index.md — catalog of all pages with categories, summaries, orphan detection | Karpathy | 🟡 | P1 | `caduceus-storage` |
-| 252 | Wiki log | Append-only log.md — chronological record of ingests, queries, lints with parseable format | Karpathy | 🟡 | P1 | `caduceus-storage` |
-| 253 | Wiki ingestor | Extract entities/claims from sources → generate summary + entity pages + cross-references | Karpathy | 🟡 | P1 | `caduceus-storage` |
+| 251 | Wiki index | `WikiIndex` — in-memory catalog with category buckets and markdown round-trip; constructed by zed bridge for `WikiLinter::find_orphans`. `orphan_pages`/`find_by_query` removed in Phase C (broken/duplicate). | Karpathy | 🟡 | P1 | `caduceus-storage` |
+| 252 | Wiki log | _Removed in Phase C._ `WikiLog`/`WikiOperation`/`LogEntry` deleted — only runtime use was a one-shot `log.md` placeholder, replaced by a static schema-versioned header. | Karpathy | 💡 | P3 | _(removed)_ |
+| 253 | Wiki ingestor | _Removed in Phase C._ `WikiIngestor` deleted — heuristic entity/claim extraction was never wired to a real pipeline. Future ingestion should call the LLM directly. | Karpathy | 💡 | P3 | _(removed)_ |
 | 254 | Wiki linter | Health check — orphan pages, broken links, empty pages, stale content detection | Karpathy | 🟡 | P1 | `caduceus-storage` |
-| 255 | Wiki query engine | Search pages by TF-relevance, gather context, extract [[citations]] | Karpathy | 🟡 | P1 | `caduceus-storage` |
-| 256 | Wiki watcher | File change detection with FNV-1a hashing, extension filtering, ignore patterns | Karpathy | 🟡 | P1 | `caduceus-storage` |
-| 257 | Wiki maintenance agent | Auto-plans and executes wiki updates: create/update/delete pages, rebuild index, lint | Karpathy | 🟡 | P1 | `caduceus-storage` |
-| 258 | Wiki auto-trigger | Hooks into agent lifecycle — auto-maintenance on every turn, session start/end | Karpathy | 🟡 | P1 | `caduceus-storage` |
+| 255 | Wiki query engine | _Removed in Phase C._ `WikiQueryEngine` deleted — duplicated `WikiEngine::search_pages` (the path zed actually calls). | Karpathy | 💡 | P3 | _(removed)_ |
+| 256 | Wiki watcher | _Removed in Phase C._ `WikiWatcher`, `FileChange`, and `FileChangeType` deleted alongside `StorageOperation::SnapshotProject` (zed PR #5). Rebuild at orchestrator layer when auto-maintenance is wired. | Karpathy | 💡 | P3 | _(removed)_ |
+| 257 | Wiki maintenance agent | _Removed in Phase C._ `WikiMaintenanceAgent` deleted — never invoked at runtime. Will be reintroduced at the orchestrator layer once auto-maintenance is wired. | Karpathy | 💡 | P3 | _(removed)_ |
+| 258 | Wiki auto-trigger | _Removed in Phase C._ `WikiAutoTrigger` deleted — never invoked at runtime. Tightly coupled to the maintenance agent; both are deferred to a future orchestrator-layer rebuild. | Karpathy | 💡 | P3 | _(removed)_ |
 | 259 | Agent scaffolder | Generate .agent.md with persona, triggers, tools, checklist via /create agent | New | ✅ | P1 | `caduceus-orchestrator` |
 | 260 | Skill scaffolder | Generate SKILL.md with steps, triggers, examples via /create skill | New | ✅ | P1 | `caduceus-orchestrator` |
 | 261 | Instructions scaffolder | Generate CADUCEUS.md with auto-detect (language, framework) via /create instructions | New | ✅ | P1 | `caduceus-orchestrator` |
