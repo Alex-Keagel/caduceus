@@ -2888,7 +2888,8 @@ impl WikiEngine {
         }
         let log_path = self.wiki_dir.join("log.md");
         if !log_path.exists() {
-            atomic_write(&log_path, WikiLog::new().to_markdown().as_bytes())?;
+            let placeholder = format!("{WIKI_SCHEMA_HEADER}# Wiki Log\n\n");
+            atomic_write(&log_path, placeholder.as_bytes())?;
         }
         Ok(())
     }
@@ -3287,158 +3288,6 @@ fn parse_index_counts(s: &str) -> Option<(usize, usize)> {
     let src = parts.next()?.split(':').nth(1)?.trim().parse().ok()?;
     let lnk = parts.next()?.split(':').nth(1)?.trim().parse().ok()?;
     Some((src, lnk))
-}
-
-// ── #252: WikiLog ─────────────────────────────────────────────────────────────
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum WikiOperation {
-    Ingest,
-    Query,
-    Lint,
-    Update,
-    Create,
-    Delete,
-}
-
-impl WikiOperation {
-    fn as_str(&self) -> &'static str {
-        match self {
-            WikiOperation::Ingest => "Ingest",
-            WikiOperation::Query => "Query",
-            WikiOperation::Lint => "Lint",
-            WikiOperation::Update => "Update",
-            WikiOperation::Create => "Create",
-            WikiOperation::Delete => "Delete",
-        }
-    }
-
-    fn from_str(s: &str) -> Option<Self> {
-        match s.trim() {
-            "Ingest" => Some(WikiOperation::Ingest),
-            "Query" => Some(WikiOperation::Query),
-            "Lint" => Some(WikiOperation::Lint),
-            "Update" => Some(WikiOperation::Update),
-            "Create" => Some(WikiOperation::Create),
-            "Delete" => Some(WikiOperation::Delete),
-            _ => None,
-        }
-    }
-}
-
-pub struct LogEntry {
-    /// ISO 8601 timestamp.
-    pub timestamp: String,
-    pub operation: WikiOperation,
-    pub description: String,
-    pub pages_touched: Vec<String>,
-}
-
-pub struct LogStats {
-    pub total_operations: usize,
-    pub ingests: usize,
-    pub queries: usize,
-    pub lints: usize,
-    pub pages_created: usize,
-}
-
-#[derive(Default)]
-pub struct WikiLog {
-    entries: Vec<LogEntry>,
-}
-
-impl WikiLog {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn append(&mut self, entry: LogEntry) {
-        self.entries.push(entry);
-    }
-
-    pub fn recent(&self, n: usize) -> Vec<&LogEntry> {
-        self.entries.iter().rev().take(n).collect()
-    }
-
-    pub fn by_operation(&self, op: &WikiOperation) -> Vec<&LogEntry> {
-        self.entries.iter().filter(|e| &e.operation == op).collect()
-    }
-
-    /// Render as `log.md`.  Each entry: `## [timestamp] Op | description`
-    pub fn to_markdown(&self) -> String {
-        let mut out = String::from(WIKI_SCHEMA_HEADER);
-        out.push_str("# Wiki Log\n\n");
-        for e in &self.entries {
-            out.push_str(&format!(
-                "## [{}] {} | {}\n",
-                e.timestamp,
-                e.operation.as_str(),
-                e.description
-            ));
-            if !e.pages_touched.is_empty() {
-                out.push_str(&format!("Pages: {}\n", e.pages_touched.join(", ")));
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    /// Parse `log.md` back into a `WikiLog`.
-    pub fn from_markdown(content: &str) -> Self {
-        let mut log = WikiLog::new();
-        let mut lines = content.lines().peekable();
-        while let Some(line) = lines.next() {
-            let trimmed = line.trim();
-            // "## [timestamp] Op | description"
-            if let Some(rest) = trimmed.strip_prefix("## [") {
-                if let Some(close) = rest.find(']') {
-                    let timestamp = rest[..close].to_string();
-                    let after = rest[close + 1..].trim();
-                    let (op_str, desc) = if let Some(pipe) = after.find('|') {
-                        (after[..pipe].trim(), after[pipe + 1..].trim())
-                    } else {
-                        (after, "")
-                    };
-                    let operation =
-                        WikiOperation::from_str(op_str).unwrap_or(WikiOperation::Update);
-                    let mut pages_touched = Vec::new();
-                    if let Some(next) = lines.peek() {
-                        if let Some(p) = next.trim().strip_prefix("Pages: ") {
-                            pages_touched = p.split(", ").map(str::to_string).collect();
-                            lines.next();
-                        }
-                    }
-                    log.append(LogEntry {
-                        timestamp,
-                        operation,
-                        description: desc.to_string(),
-                        pages_touched,
-                    });
-                }
-            }
-        }
-        log
-    }
-
-    pub fn stats(&self) -> LogStats {
-        let mut stats = LogStats {
-            total_operations: self.entries.len(),
-            ingests: 0,
-            queries: 0,
-            lints: 0,
-            pages_created: 0,
-        };
-        for e in &self.entries {
-            match e.operation {
-                WikiOperation::Ingest => stats.ingests += 1,
-                WikiOperation::Query => stats.queries += 1,
-                WikiOperation::Lint => stats.lints += 1,
-                WikiOperation::Create => stats.pages_created += 1,
-                _ => {}
-            }
-        }
-        stats
-    }
 }
 
 // ── #254: WikiLinter ──────────────────────────────────────────────────────────
@@ -3873,91 +3722,6 @@ mod feature_tests_250_255 {
         assert!(orphans.contains(&"lonely".to_string()) || orphans.contains(&"linked".to_string()));
     }
 
-    // ── #252 WikiLog ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn wiki_log_append_and_recent() {
-        let mut log = WikiLog::new();
-        log.append(LogEntry {
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            operation: WikiOperation::Create,
-            description: "Created page".to_string(),
-            pages_touched: vec!["page1".to_string()],
-        });
-        log.append(LogEntry {
-            timestamp: "2024-01-02T00:00:00Z".to_string(),
-            operation: WikiOperation::Query,
-            description: "Searched wiki".to_string(),
-            pages_touched: vec![],
-        });
-        assert_eq!(log.recent(1).len(), 1);
-        assert_eq!(log.recent(1)[0].operation, WikiOperation::Query);
-        assert_eq!(log.recent(10).len(), 2);
-    }
-
-    #[test]
-    fn wiki_log_by_operation() {
-        let mut log = WikiLog::new();
-        log.append(LogEntry {
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            operation: WikiOperation::Ingest,
-            description: "Ingested doc".to_string(),
-            pages_touched: vec![],
-        });
-        log.append(LogEntry {
-            timestamp: "2024-01-02T00:00:00Z".to_string(),
-            operation: WikiOperation::Lint,
-            description: "Ran lint".to_string(),
-            pages_touched: vec![],
-        });
-        assert_eq!(log.by_operation(&WikiOperation::Ingest).len(), 1);
-        assert_eq!(log.by_operation(&WikiOperation::Lint).len(), 1);
-        assert!(log.by_operation(&WikiOperation::Delete).is_empty());
-    }
-
-    #[test]
-    fn wiki_log_to_from_markdown_roundtrip() {
-        let mut log = WikiLog::new();
-        log.append(LogEntry {
-            timestamp: "2024-03-15T12:00:00Z".to_string(),
-            operation: WikiOperation::Ingest,
-            description: "Ingested paper.pdf".to_string(),
-            pages_touched: vec!["paper".to_string(), "author".to_string()],
-        });
-        let md = log.to_markdown();
-        assert!(md.contains("Ingest"));
-        assert!(md.contains("paper.pdf"));
-        let parsed = WikiLog::from_markdown(&md);
-        assert_eq!(parsed.entries.len(), 1);
-        assert_eq!(parsed.entries[0].operation, WikiOperation::Ingest);
-        assert_eq!(parsed.entries[0].pages_touched.len(), 2);
-    }
-
-    #[test]
-    fn wiki_log_stats() {
-        let mut log = WikiLog::new();
-        for op in [
-            WikiOperation::Create,
-            WikiOperation::Ingest,
-            WikiOperation::Ingest,
-            WikiOperation::Query,
-            WikiOperation::Lint,
-        ] {
-            log.append(LogEntry {
-                timestamp: "2024-01-01T00:00:00Z".to_string(),
-                operation: op,
-                description: "x".to_string(),
-                pages_touched: vec![],
-            });
-        }
-        let s = log.stats();
-        assert_eq!(s.total_operations, 5);
-        assert_eq!(s.ingests, 2);
-        assert_eq!(s.queries, 1);
-        assert_eq!(s.lints, 1);
-        assert_eq!(s.pages_created, 1);
-    }
-
     // ── #254 WikiLinter ───────────────────────────────────────────────────────
 
     fn make_page(slug: &str, size: u64, links: Vec<&str>) -> WikiPage {
@@ -4198,19 +3962,18 @@ mod feature_tests_256_258 {
 
     #[test]
     fn schema_version_header_emitted_and_round_trips() {
-        // index + log both carry the schema marker.
+        // index carries the schema marker.
         let index_md = WikiIndex::new().to_markdown();
         assert!(
             index_md.starts_with("<!-- schema_version: 1 -->\n"),
             "index missing schema header: {index_md:?}"
         );
-        let log_md = WikiLog::new().to_markdown();
-        assert!(
-            log_md.starts_with("<!-- schema_version: 1 -->\n"),
-            "log missing schema header: {log_md:?}"
-        );
 
-        // Versioned content round-trips cleanly through from_markdown.
+        // The placeholder log written by WikiEngine::init also carries it.
+        let log_placeholder = "<!-- schema_version: 1 -->\n# Wiki Log\n\n";
+        assert!(log_placeholder.starts_with("<!-- schema_version: 1 -->\n"));
+
+        // Versioned index content round-trips cleanly through from_markdown.
         let mut idx = WikiIndex::new();
         idx.update_entry(
             "page-a",
@@ -4228,20 +3991,5 @@ mod feature_tests_256_258 {
             parsed.find_by_query("page-a").len() == 1,
             "versioned index round-trip lost entry"
         );
-
-        let mut log = WikiLog::new();
-        log.append(LogEntry {
-            timestamp: "2026-04-26T00:00:00Z".into(),
-            operation: WikiOperation::Create,
-            description: "initial".into(),
-            pages_touched: vec!["page-a".into()],
-        });
-        let parsed_log = WikiLog::from_markdown(&log.to_markdown());
-        assert_eq!(parsed_log.recent(10).len(), 1);
-
-        // Legacy unversioned files still parse (forward compat).
-        let legacy = "# Wiki Log\n\n## [2025-01-01T00:00:00Z] Update | legacy entry\n";
-        let parsed_legacy = WikiLog::from_markdown(legacy);
-        assert_eq!(parsed_legacy.recent(10).len(), 1);
     }
 }
