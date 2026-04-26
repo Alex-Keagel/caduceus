@@ -2163,13 +2163,21 @@ impl ClassifyContext {
 /// `ctx` argument supplies `(provider, model)` for `ProviderError`
 /// variants (ST7 must-fix #2 — populated for ST8's vendor-rerouting
 /// decision).
+///
+/// `elapsed_secs`/`timeout_secs` are `Option<u64>` (ST7 r3 #5):
+/// callers that don't have real timing data (e.g. zed's
+/// `spawn_agent_tool` non-timeout error path, or the agent.rs
+/// task-result error arm) MUST pass `None, None` rather than
+/// fabricated zeros. Pre-fix, zero sentinels were latent traps:
+/// no current arm reads them, but a future Timeout-classification
+/// path could silently misreport `0s elapsed` as a real value.
 pub fn classify_caduceus_error(
     err: &CaduceusError,
     ctx: &ClassifyContext,
     last_phase: SubAgentPhase,
     tools_started: bool,
-    elapsed_secs: u64,
-    timeout_secs: u64,
+    elapsed_secs: Option<u64>,
+    timeout_secs: Option<u64>,
 ) -> SubAgentFailure {
     match err {
         CaduceusError::Cancelled => SubAgentFailure::UserCancel,
@@ -3318,7 +3326,7 @@ mod tests {
         let err = CaduceusError::RateLimited {
             retry_after_secs: 30,
         };
-        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, 0, 900) {
+        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(0), Some(900)) {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Backoff);
                 assert_eq!(p.retry_after_secs, Some(30));
@@ -3335,7 +3343,7 @@ mod tests {
             limit_ms: 5000,
             context: "chat".into(),
         };
-        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, 6, 900) {
+        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(6), Some(900)) {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Backoff);
             }
@@ -3349,7 +3357,7 @@ mod tests {
             tool: "read_file".into(),
             message: "boom".into(),
         };
-        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ToolExecution, true, 1, 900) {
+        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ToolExecution, true, Some(1), Some(900)) {
             SubAgentFailure::ToolError { tool_name, message } => {
                 assert_eq!(tool_name, "read_file");
                 assert_eq!(message, "boom");
@@ -3364,7 +3372,7 @@ mod tests {
             capability: "fs.write".into(),
             tool: "write_file".into(),
         };
-        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ToolExecution, true, 1, 900) {
+        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ToolExecution, true, Some(1), Some(900)) {
             SubAgentFailure::PolicyDenied {
                 capability, tool, ..
             } => {
@@ -3378,7 +3386,7 @@ mod tests {
     #[test]
     fn classify_caduceus_error_cancelled_to_user_cancel() {
         let err = CaduceusError::Cancelled;
-        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, 0, 900) {
+        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(0), Some(900)) {
             SubAgentFailure::UserCancel => {}
             other => panic!("expected UserCancel, got {other:?}"),
         }
@@ -3387,7 +3395,7 @@ mod tests {
     #[test]
     fn classify_caduceus_error_provider_string_to_immediate() {
         let err = CaduceusError::Provider("transient blip".into());
-        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, 0, 900) {
+        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(0), Some(900)) {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Immediate);
                 assert!(p.retry_after_secs.is_none());
@@ -3411,8 +3419,8 @@ mod tests {
                 &ClassifyContext::empty(),
                 SubAgentPhase::ProviderCall,
                 false,
-                0,
-                900,
+                Some(0),
+                Some(900),
             ) {
                 SubAgentFailure::ProviderError(p) => {
                     assert_eq!(
@@ -3443,8 +3451,8 @@ mod tests {
                 &ClassifyContext::empty(),
                 SubAgentPhase::ProviderCall,
                 false,
-                0,
-                900,
+                Some(0),
+                Some(900),
             ) {
                 SubAgentFailure::ProviderError(p) => {
                     assert_eq!(
@@ -3472,8 +3480,8 @@ mod tests {
                 &ClassifyContext::empty(),
                 SubAgentPhase::ProviderCall,
                 false,
-                0,
-                900,
+                Some(0),
+                Some(900),
             ) {
                 SubAgentFailure::ProviderError(p) => {
                     assert_eq!(
@@ -3507,8 +3515,8 @@ mod tests {
                 &ClassifyContext::empty(),
                 SubAgentPhase::ProviderCall,
                 false,
-                0,
-                900,
+                Some(0),
+                Some(900),
             ) {
                 SubAgentFailure::ProviderError(p) => {
                     assert_eq!(
@@ -3535,8 +3543,8 @@ mod tests {
                 &ClassifyContext::empty(),
                 SubAgentPhase::ProviderCall,
                 false,
-                0,
-                900,
+                Some(0),
+                Some(900),
             ) {
                 SubAgentFailure::ProviderError(p) => {
                     assert_eq!(
@@ -3558,8 +3566,8 @@ mod tests {
             &ClassifyContext::empty(),
             SubAgentPhase::ProviderCall,
             false,
-            0,
-            900,
+            Some(0),
+            Some(900),
         ) {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Immediate);
@@ -3583,8 +3591,8 @@ mod tests {
             &ctx,
             SubAgentPhase::ProviderCall,
             false,
-            0,
-            900,
+            Some(0),
+            Some(900),
         ) {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.provider, Some(ProviderId::new("anthropic")));
@@ -3607,8 +3615,8 @@ mod tests {
             &ctx,
             SubAgentPhase::ProviderCall,
             false,
-            6,
-            900,
+            Some(6),
+            Some(900),
         ) {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.provider, Some(ProviderId::new("anthropic")));
@@ -3623,8 +3631,8 @@ mod tests {
             &ctx,
             SubAgentPhase::ProviderCall,
             false,
-            0,
-            900,
+            Some(0),
+            Some(900),
         ) {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.provider, Some(ProviderId::new("anthropic")));
@@ -3645,8 +3653,8 @@ mod tests {
             &ClassifyContext::empty(),
             SubAgentPhase::ProviderCall,
             false,
-            0,
-            900,
+            Some(0),
+            Some(900),
         ) {
             SubAgentFailure::ProviderError(p) => {
                 assert!(p.provider.is_none());
@@ -3659,7 +3667,7 @@ mod tests {
     #[test]
     fn classify_caduceus_error_other_falls_back_to_internal() {
         let err = CaduceusError::Other(anyhow::anyhow!("synthetic"));
-        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::Unknown, false, 0, 900) {
+        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::Unknown, false, Some(0), Some(900)) {
             SubAgentFailure::InternalError { kind, .. } => {
                 assert_eq!(kind, "caduceus_error");
             }
