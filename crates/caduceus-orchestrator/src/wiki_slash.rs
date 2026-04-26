@@ -58,16 +58,13 @@ pub fn handle_init(
     _args: &[String],
 ) -> Result<WikiSlashOutput, CaduceusError> {
     let engine = WikiEngine::new(project_root);
-    let already_initialized = engine.wiki_dir().exists();
     engine.init()?;
-    let message = if already_initialized {
-        format!(
-            "Wiki already initialized at {} — no changes",
-            engine.wiki_dir().display()
-        )
-    } else {
-        format!("Wiki initialized at {}", engine.wiki_dir().display())
-    };
+    // `init` is idempotent — it fills any missing scaffold pieces (wiki_dir,
+    // index.md, log.md) without clobbering existing pages. Reporting a
+    // simple "ready" state avoids lying to the user when the directory
+    // existed but was missing scaffold files (a partial-init recovery is
+    // a no-op from the caller's point of view).
+    let message = format!("Wiki ready at {}", engine.wiki_dir().display());
     Ok(WikiSlashOutput {
         message,
         report: None,
@@ -110,7 +107,7 @@ mod tests {
         let out = handle_init(dir.path(), &[]).unwrap();
         assert!(dir.path().join(".caduceus").join("wiki").exists());
         assert!(
-            out.message.starts_with("Wiki initialized at"),
+            out.message.starts_with("Wiki ready at"),
             "got: {}",
             out.message
         );
@@ -123,20 +120,43 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // First init creates.
         let first = handle_init(dir.path(), &[]).unwrap();
-        assert!(first.message.starts_with("Wiki initialized at"));
+        assert!(first.message.starts_with("Wiki ready at"));
         // Write a page so we can prove init doesn't clobber.
         let engine = WikiEngine::new(dir.path());
         engine
             .write_page("survives", "# Survives idempotent init\n")
             .unwrap();
-        // Second init reports already-initialized and preserves the page.
+        // Second init returns the same neutral "ready" state and preserves the page.
         let second = handle_init(dir.path(), &[]).unwrap();
         assert!(
-            second.message.contains("already initialized"),
+            second.message.starts_with("Wiki ready at"),
             "got: {}",
             second.message
         );
         assert!(engine.page_exists("survives"));
+    }
+
+    #[test]
+    fn handle_init_recovers_from_partial_scaffold() {
+        // Pre-existing dir without scaffold files (simulates a partial init
+        // or a manually created directory). `handle_init` must complete the
+        // scaffold AND not lie to the user about whether work was done.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".caduceus").join("wiki")).unwrap();
+        assert!(!dir
+            .path()
+            .join(".caduceus")
+            .join("wiki")
+            .join("index.md")
+            .exists());
+        let out = handle_init(dir.path(), &[]).unwrap();
+        assert!(dir
+            .path()
+            .join(".caduceus")
+            .join("wiki")
+            .join("index.md")
+            .exists());
+        assert!(out.message.starts_with("Wiki ready at"));
     }
 
     #[test]
