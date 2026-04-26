@@ -2853,6 +2853,14 @@ pub struct WikiPage {
     pub last_modified: u64,
 }
 
+/// Schema version marker prepended to every on-disk wiki metadata file
+/// (`index.md`, `log.md`). Pages themselves remain unversioned in Phase A;
+/// page front-matter is tracked separately for a later phase.
+///
+/// The marker is an HTML comment so it renders invisibly in any markdown
+/// viewer, and `from_markdown` parsers tolerate unknown leading lines.
+const WIKI_SCHEMA_HEADER: &str = "<!-- schema_version: 1 -->\n";
+
 /// Core wiki manager – owns the wiki directory layout.
 pub struct WikiEngine {
     wiki_dir: PathBuf,
@@ -2876,11 +2884,11 @@ impl WikiEngine {
 
         let index_path = self.wiki_dir.join("index.md");
         if !index_path.exists() {
-            atomic_write(&index_path, b"# Wiki Index\n\n")?;
+            atomic_write(&index_path, WikiIndex::new().to_markdown().as_bytes())?;
         }
         let log_path = self.wiki_dir.join("log.md");
         if !log_path.exists() {
-            atomic_write(&log_path, b"# Wiki Log\n\n")?;
+            atomic_write(&log_path, WikiLog::new().to_markdown().as_bytes())?;
         }
         Ok(())
     }
@@ -3181,7 +3189,8 @@ impl WikiIndex {
 
     /// Render the index as markdown suitable for `index.md`.
     pub fn to_markdown(&self) -> String {
-        let mut out = String::from("# Wiki Index\n\n");
+        let mut out = String::from(WIKI_SCHEMA_HEADER);
+        out.push_str("# Wiki Index\n\n");
         let categories = ["entity", "concept", "source", "analysis"];
         for cat in &categories {
             let entries: Vec<_> = self.find_by_category(cat);
@@ -3357,7 +3366,8 @@ impl WikiLog {
 
     /// Render as `log.md`.  Each entry: `## [timestamp] Op | description`
     pub fn to_markdown(&self) -> String {
-        let mut out = String::from("# Wiki Log\n\n");
+        let mut out = String::from(WIKI_SCHEMA_HEADER);
+        out.push_str("# Wiki Log\n\n");
         for e in &self.entries {
             out.push_str(&format!(
                 "## [{}] {} | {}\n",
@@ -5446,7 +5456,9 @@ mod feature_tests_256_258 {
         #[cfg(windows)]
         std::os::windows::fs::symlink_file(&outside, &link_in_wiki).unwrap();
 
-        let err = wiki.read_page("trojan").expect_err("symlink read must fail");
+        let err = wiki
+            .read_page("trojan")
+            .expect_err("symlink read must fail");
         assert!(format!("{err:?}").contains("symlink"));
         assert!(wiki.delete_page("trojan").is_err());
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "TOP-SECRET");
@@ -5546,11 +5558,7 @@ mod feature_tests_256_258 {
         // auto-trigger maintenance write becomes a "file changed" event and
         // triggers another maintenance cycle, looping forever.
         std::fs::create_dir_all(dir.path().join(".caduceus/wiki")).unwrap();
-        std::fs::write(
-            dir.path().join(".caduceus/wiki/index.md"),
-            "# Wiki Index\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join(".caduceus/wiki/index.md"), "# Wiki Index\n").unwrap();
         std::fs::write(
             dir.path().join(".caduceus/wiki/whatever.md"),
             "# whatever\n",
@@ -5589,8 +5597,7 @@ mod feature_tests_256_258 {
         );
 
         // Code fence with language tag (```rust).
-        let fenced_rust =
-            "Real [[r1]]\n```rust\nlet _ = \"[[r2]]\";\n```\nAfter [[r3]]";
+        let fenced_rust = "Real [[r1]]\n```rust\nlet _ = \"[[r2]]\";\n```\nAfter [[r3]]";
         let links = super::wiki_extract_links(fenced_rust);
         assert_eq!(
             links,
@@ -5602,5 +5609,56 @@ mod feature_tests_256_258 {
         let edges = "[[]] and [[   ]] and [[real]]";
         let links = super::wiki_extract_links(edges);
         assert_eq!(links, vec!["real".to_string()]);
+    }
+
+    // ── Phase A fix #14: schema versioning on index.md and log.md ────────
+
+    #[test]
+    fn schema_version_header_emitted_and_round_trips() {
+        // index + log both carry the schema marker.
+        let index_md = WikiIndex::new().to_markdown();
+        assert!(
+            index_md.starts_with("<!-- schema_version: 1 -->\n"),
+            "index missing schema header: {index_md:?}"
+        );
+        let log_md = WikiLog::new().to_markdown();
+        assert!(
+            log_md.starts_with("<!-- schema_version: 1 -->\n"),
+            "log missing schema header: {log_md:?}"
+        );
+
+        // Versioned content round-trips cleanly through from_markdown.
+        let mut idx = WikiIndex::new();
+        idx.update_entry(
+            "page-a",
+            IndexEntry {
+                slug: "page-a".into(),
+                title: "Page A".into(),
+                summary: "summary".into(),
+                category: "entity".into(),
+                source_count: 1,
+                link_count: 0,
+            },
+        );
+        let parsed = WikiIndex::from_markdown(&idx.to_markdown());
+        assert!(
+            parsed.find_by_query("page-a").len() == 1,
+            "versioned index round-trip lost entry"
+        );
+
+        let mut log = WikiLog::new();
+        log.append(LogEntry {
+            timestamp: "2026-04-26T00:00:00Z".into(),
+            operation: WikiOperation::Create,
+            description: "initial".into(),
+            pages_touched: vec!["page-a".into()],
+        });
+        let parsed_log = WikiLog::from_markdown(&log.to_markdown());
+        assert_eq!(parsed_log.recent(10).len(), 1);
+
+        // Legacy unversioned files still parse (forward compat).
+        let legacy = "# Wiki Log\n\n## [2025-01-01T00:00:00Z] Update | legacy entry\n";
+        let parsed_legacy = WikiLog::from_markdown(legacy);
+        assert_eq!(parsed_legacy.recent(10).len(), 1);
     }
 }
