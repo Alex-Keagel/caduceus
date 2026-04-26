@@ -2857,6 +2857,10 @@ pub struct WikiPage {
 /// (`index.md`, `log.md`). Pages themselves remain unversioned in Phase A;
 /// page front-matter is tracked separately for a later phase.
 ///
+/// Schema version for wiki on-disk format and `LintReport` payloads.
+/// Bumped when the placeholder log/index format changes incompatibly.
+pub const WIKI_SCHEMA_VERSION: u32 = 1;
+
 /// The marker is an HTML comment so it renders invisibly in any markdown
 /// viewer, and `from_markdown` parsers tolerate unknown leading lines.
 const WIKI_SCHEMA_HEADER: &str = "<!-- schema_version: 1 -->\n";
@@ -3006,6 +3010,52 @@ impl WikiEngine {
         }
         Ok(matches)
     }
+
+    /// Run all lint checks and return a structured report.
+    ///
+    /// Wave-2 wiki Phase D-2c: this is the single producer of `LintReport`,
+    /// consumed by the zed turn-end hook (D2-z) and the orchestrator
+    /// `/wiki` slash command (D3). The contract is additive — new fields on
+    /// `LintReport` are added with `#[serde(default)]` and never reordered
+    /// or removed.
+    ///
+    /// Returns a `LintReport` even when the wiki directory is empty
+    /// (`pages_examined = 0`, `findings = []`); only filesystem errors
+    /// from `list_pages` propagate. This makes it safe to call from a
+    /// fire-and-forget post-turn task without special-casing missing-wiki.
+    pub fn maintain(&self) -> std::result::Result<LintReport, CaduceusError> {
+        let started = std::time::Instant::now();
+        // `list_pages` already returns Ok(empty) when wiki_dir is missing, so
+        // we propagate every Storage error here unmodified — those represent
+        // genuine I/O failures (permissions, races, corruption) that callers
+        // need to see, not silence.
+        let pages = self.list_pages()?;
+        let index = WikiIndex::new();
+        let findings = WikiLinter::lint(&pages, &index);
+        let pages_examined = pages.len();
+        Ok(LintReport {
+            pages_examined,
+            findings,
+            schema_version: WIKI_SCHEMA_VERSION,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+/// Structured maintenance report returned by [`WikiEngine::maintain`].
+///
+/// **Stability contract (v1, wiki-D2c):** new fields are appended with
+/// `#[serde(default)]` and never reordered/removed. Field semantics:
+/// - `pages_examined`: count of `WikiPage`s read from disk for this run
+/// - `findings`: every [`LintFinding`] produced by [`WikiLinter::lint`]
+/// - `schema_version`: matches `WIKI_SCHEMA_VERSION` at the time of run
+/// - `elapsed_ms`: wall-clock duration of the maintenance scan
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LintReport {
+    pub pages_examined: usize,
+    pub findings: Vec<LintFinding>,
+    pub schema_version: u32,
+    pub elapsed_ms: u64,
 }
 
 /// Atomically write `content` to `path` by writing into a sibling temp file
@@ -3265,7 +3315,7 @@ fn parse_index_counts(s: &str) -> Option<(usize, usize)> {
 
 // ── #254: WikiLinter ──────────────────────────────────────────────────────────
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LintCategory {
     OrphanPage,
     MissingPage,
@@ -3275,6 +3325,7 @@ pub enum LintCategory {
     EmptyPage,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LintFinding {
     pub category: LintCategory,
     pub page: String,
@@ -3947,5 +3998,90 @@ mod feature_tests_256_258 {
                 .any(|e| e.slug == "page-a"),
             "versioned index round-trip lost entry"
         );
+    }
+
+    // ─── wiki-D2c: WikiEngine::maintain + LintReport ──────────────────────
+
+    #[test]
+    fn maintain_returns_empty_report_when_wiki_dir_missing() {
+        // Fresh tempdir with no .caduceus/wiki created. `maintain` must NOT
+        // panic and must NOT propagate an error — the contract is that it's
+        // safe to call from a fire-and-forget post-turn task even on a
+        // wiki-less repo.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        let report = engine
+            .maintain()
+            .expect("maintain must not error on missing wiki");
+        assert_eq!(report.pages_examined, 0);
+        assert!(report.findings.is_empty());
+        assert_eq!(report.schema_version, WIKI_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn maintain_reports_pages_examined_and_runs_linter() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        engine.write_page("alpha", "# Alpha\n\n[[beta]]\n").unwrap();
+        engine.write_page("beta", "# Beta\n\n[[alpha]]\n").unwrap();
+        engine
+            .write_page("orphan", "# Orphan\n\nstandalone\n")
+            .unwrap();
+
+        let report = engine.maintain().unwrap();
+
+        assert_eq!(report.pages_examined, 3);
+        // Linter should flag at least one orphan finding.
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.category == LintCategory::OrphanPage),
+            "expected at least one OrphanPage finding, got {:?}",
+            report.findings
+        );
+        assert_eq!(report.schema_version, WIKI_SCHEMA_VERSION);
+        // elapsed_ms is u64 — only assert it's plausible (under 10s).
+        assert!(report.elapsed_ms < 10_000);
+    }
+
+    #[test]
+    fn maintain_idempotent_back_to_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WikiEngine::new(dir.path());
+        engine.init().unwrap();
+        engine.write_page("solo", "# Solo\n").unwrap();
+
+        let r1 = engine.maintain().unwrap();
+        let r2 = engine.maintain().unwrap();
+        assert_eq!(r1.pages_examined, r2.pages_examined);
+        assert_eq!(r1.findings.len(), r2.findings.len());
+        assert_eq!(r1.schema_version, r2.schema_version);
+    }
+
+    #[test]
+    fn lint_report_serializes_with_serde_json() {
+        // C-maint v1 contract: LintReport must be (de)serializable so the
+        // bridge layer (D2-z) and orchestrator slash command (D3) can shuttle
+        // it across boundaries without bespoke conversion logic.
+        let report = LintReport {
+            pages_examined: 2,
+            findings: vec![LintFinding {
+                category: LintCategory::OrphanPage,
+                page: "alpha".into(),
+                description: "no inbound links".into(),
+                suggestion: "add a [[link]] from another page".into(),
+            }],
+            schema_version: WIKI_SCHEMA_VERSION,
+            elapsed_ms: 7,
+        };
+        let json = serde_json::to_string(&report).expect("LintReport serializes");
+        let parsed: LintReport =
+            serde_json::from_str(&json).expect("LintReport round-trips through JSON");
+        assert_eq!(parsed.pages_examined, 2);
+        assert_eq!(parsed.findings.len(), 1);
+        assert_eq!(parsed.findings[0].category, LintCategory::OrphanPage);
+        assert_eq!(parsed.schema_version, WIKI_SCHEMA_VERSION);
     }
 }
