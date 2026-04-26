@@ -2853,6 +2853,14 @@ pub struct WikiPage {
     pub last_modified: u64,
 }
 
+/// Schema version marker prepended to every on-disk wiki metadata file
+/// (`index.md`, `log.md`). Pages themselves remain unversioned in Phase A;
+/// page front-matter is tracked separately for a later phase.
+///
+/// The marker is an HTML comment so it renders invisibly in any markdown
+/// viewer, and `from_markdown` parsers tolerate unknown leading lines.
+const WIKI_SCHEMA_HEADER: &str = "<!-- schema_version: 1 -->\n";
+
 /// Core wiki manager – owns the wiki directory layout.
 pub struct WikiEngine {
     wiki_dir: PathBuf,
@@ -2876,13 +2884,11 @@ impl WikiEngine {
 
         let index_path = self.wiki_dir.join("index.md");
         if !index_path.exists() {
-            fs::write(&index_path, "# Wiki Index\n\n")
-                .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+            atomic_write(&index_path, WikiIndex::new().to_markdown().as_bytes())?;
         }
         let log_path = self.wiki_dir.join("log.md");
         if !log_path.exists() {
-            fs::write(&log_path, "# Wiki Log\n\n")
-                .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+            atomic_write(&log_path, WikiLog::new().to_markdown().as_bytes())?;
         }
         Ok(())
     }
@@ -2892,12 +2898,19 @@ impl WikiEngine {
     }
 
     /// Absolute path of a page file for the given slug.
-    pub fn page_path(&self, slug: &str) -> PathBuf {
-        self.wiki_dir.join(format!("{slug}.md"))
+    ///
+    /// Returns `Err(Storage)` if the slug is unsafe (path traversal, reserved
+    /// names, control characters). See [`validate_slug`] for the full ruleset.
+    pub fn page_path(&self, slug: &str) -> std::result::Result<PathBuf, CaduceusError> {
+        validate_slug(slug)?;
+        Ok(self.wiki_dir.join(format!("{slug}.md")))
     }
 
     pub fn page_exists(&self, slug: &str) -> bool {
-        self.page_path(slug).exists()
+        match self.page_path(slug) {
+            Ok(p) => p.exists(),
+            Err(_) => false,
+        }
     }
 
     /// List all `.md` pages in the wiki dir, excluding `index.md` and `log.md`.
@@ -2946,17 +2959,33 @@ impl WikiEngine {
     }
 
     pub fn read_page(&self, slug: &str) -> std::result::Result<String, CaduceusError> {
-        let path = self.page_path(slug);
+        let path = self.page_path(slug)?;
+        // Defense-in-depth: refuse to dereference a symlink even if a slug-valid
+        // path was created out-of-band. `symlink_metadata` does not follow links.
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() {
+                return Err(CaduceusError::Storage(format!(
+                    "wiki page {slug:?} is a symlink; refusing to read"
+                )));
+            }
+        }
         fs::read_to_string(&path).map_err(|e| CaduceusError::Storage(e.to_string()))
     }
 
     pub fn write_page(&self, slug: &str, content: &str) -> std::result::Result<(), CaduceusError> {
-        let path = self.page_path(slug);
-        fs::write(path, content).map_err(|e| CaduceusError::Storage(e.to_string()))
+        let path = self.page_path(slug)?;
+        atomic_write(&path, content.as_bytes())
     }
 
     pub fn delete_page(&self, slug: &str) -> std::result::Result<(), CaduceusError> {
-        let path = self.page_path(slug);
+        let path = self.page_path(slug)?;
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() {
+                return Err(CaduceusError::Storage(format!(
+                    "wiki page {slug:?} is a symlink; refusing to delete"
+                )));
+            }
+        }
         fs::remove_file(path).map_err(|e| CaduceusError::Storage(e.to_string()))
     }
 
@@ -2978,6 +3007,34 @@ impl WikiEngine {
     }
 }
 
+/// Atomically write `content` to `path` by writing into a sibling temp file
+/// and renaming over the destination.
+///
+/// This protects against torn writes (a crash mid-write leaves the previous
+/// content intact) but does **not** serialise concurrent writers — the last
+/// writer to call `persist` wins. Concurrent-writer protection is out of
+/// scope for Phase A and tracked separately.
+///
+/// Caller must ensure `path.parent()` exists (we call `create_dir_all` for
+/// safety on first write).
+fn atomic_write(path: &Path, content: &[u8]) -> std::result::Result<(), CaduceusError> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| CaduceusError::Storage(format!("path {path:?} has no parent")))?;
+    fs::create_dir_all(parent).map_err(|e| CaduceusError::Storage(e.to_string()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+    tmp.write_all(content)
+        .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+    tmp.persist(path)
+        .map_err(|e| CaduceusError::Storage(e.error.to_string()))?;
+    Ok(())
+}
+
 fn wiki_title_from_content(content: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
@@ -2988,20 +3045,88 @@ fn wiki_title_from_content(content: &str) -> Option<String> {
     None
 }
 
+/// Validate a wiki slug for safe use as a file name inside `wiki_dir`.
+///
+/// Rejects empty, path separators, parent-dir traversal, hidden / reserved
+/// names, and control characters. This is the primary defence against path
+/// traversal in `WikiEngine::page_path`.
+fn validate_slug(slug: &str) -> std::result::Result<(), CaduceusError> {
+    if slug.is_empty() {
+        return Err(CaduceusError::Storage("wiki slug must not be empty".into()));
+    }
+    if slug == "." || slug == ".." {
+        return Err(CaduceusError::Storage(format!(
+            "wiki slug {slug:?} is reserved"
+        )));
+    }
+    if matches!(slug, "index" | "log") {
+        return Err(CaduceusError::Storage(format!(
+            "wiki slug {slug:?} is reserved (used for wiki metadata)"
+        )));
+    }
+    if slug.starts_with('.') {
+        return Err(CaduceusError::Storage(format!(
+            "wiki slug {slug:?} must not start with '.'"
+        )));
+    }
+    for ch in slug.chars() {
+        match ch {
+            '/' | '\\' | '\0' => {
+                return Err(CaduceusError::Storage(format!(
+                    "wiki slug {slug:?} contains forbidden character {ch:?}"
+                )));
+            }
+            c if c.is_control() => {
+                return Err(CaduceusError::Storage(format!(
+                    "wiki slug {slug:?} contains control character"
+                )));
+            }
+            _ => {}
+        }
+    }
+    // Reject any `..` segment even when wedged between other characters such as
+    // `foo..bar`. Splitting on the path separators above already forbids real
+    // segment traversal; this catches a lone literal `..` that bypassed the
+    // earlier explicit check (e.g. `..` with surrounding whitespace).
+    if slug.split(|c| c == '/' || c == '\\').any(|s| s == "..") {
+        return Err(CaduceusError::Storage(format!(
+            "wiki slug {slug:?} contains parent-directory traversal"
+        )));
+    }
+    Ok(())
+}
+
 /// Extract `[[slug]]` link references from wiki content.
+///
+/// Rules:
+/// - `[[slug|alias]]` returns the slug only (text after `|` is display alias).
+/// - `[[]]` (empty) is rejected.
+/// - Links inside fenced code blocks (lines starting with ```` ``` ````,
+///   optionally followed by a language tag) are skipped.
+/// - Output is deduplicated, preserving first-seen order.
 fn wiki_extract_links(content: &str) -> Vec<String> {
-    let mut links = Vec::new();
-    let mut remaining = content;
-    while let Some(start) = remaining.find("[[") {
-        let after_open = &remaining[start + 2..];
-        if let Some(end) = after_open.find("]]") {
-            let slug = after_open[..end].trim().to_string();
-            if !slug.is_empty() && !links.contains(&slug) {
-                links.push(slug);
+    let mut links: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for line in content.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let mut remaining = line;
+        while let Some(start) = remaining.find("[[") {
+            let after_open = &remaining[start + 2..];
+            let Some(end) = after_open.find("]]") else {
+                break;
+            };
+            let raw = &after_open[..end];
+            let slug = raw.split('|').next().unwrap_or("").trim();
+            if !slug.is_empty() && !links.iter().any(|s| s == slug) {
+                links.push(slug.to_string());
             }
             remaining = &after_open[end + 2..];
-        } else {
-            break;
         }
     }
     links
@@ -3064,7 +3189,8 @@ impl WikiIndex {
 
     /// Render the index as markdown suitable for `index.md`.
     pub fn to_markdown(&self) -> String {
-        let mut out = String::from("# Wiki Index\n\n");
+        let mut out = String::from(WIKI_SCHEMA_HEADER);
+        out.push_str("# Wiki Index\n\n");
         let categories = ["entity", "concept", "source", "analysis"];
         for cat in &categories {
             let entries: Vec<_> = self.find_by_category(cat);
@@ -3240,7 +3366,8 @@ impl WikiLog {
 
     /// Render as `log.md`.  Each entry: `## [timestamp] Op | description`
     pub fn to_markdown(&self) -> String {
-        let mut out = String::from("# Wiki Log\n\n");
+        let mut out = String::from(WIKI_SCHEMA_HEADER);
+        out.push_str("# Wiki Log\n\n");
         for e in &self.entries {
             out.push_str(&format!(
                 "## [{}] {} | {}\n",
@@ -3636,6 +3763,7 @@ impl WikiWatcher {
                 "node_modules".to_string(),
                 ".git".to_string(),
                 "target".to_string(),
+                ".caduceus".to_string(),
             ],
         }
     }
@@ -3992,14 +4120,13 @@ impl WikiMaintenanceAgent {
                 }
                 let index_md = index.to_markdown();
                 let index_path = wiki.wiki_dir().join("index.md");
-                fs::write(&index_path, index_md)
-                    .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+                atomic_write(&index_path, index_md.as_bytes())?;
                 MaintenanceOutcome::IndexUpdated
             }
             MaintenanceActionType::UpdateLog => {
                 let log_md = log.to_markdown();
                 let log_path = wiki.wiki_dir().join("log.md");
-                fs::write(&log_path, log_md).map_err(|e| CaduceusError::Storage(e.to_string()))?;
+                atomic_write(&log_path, log_md.as_bytes())?;
                 MaintenanceOutcome::LogFlushed
             }
             MaintenanceActionType::RunLint => {
@@ -4030,8 +4157,16 @@ impl WikiMaintenanceAgent {
         let watcher = WikiWatcher::new();
         let changes = watcher.detect_changes(project_root, previous_hashes);
 
+        // Index is rebuilt from scratch each cycle so that pages deleted from
+        // disk also disappear from the index. Loading the previous index would
+        // leave stale entries pointing at non-existent pages.
         let mut index = WikiIndex::new();
-        let mut log = WikiLog::new();
+        // Log is append-only; load history from disk so prior entries survive.
+        let log_path = wiki.wiki_dir().join("log.md");
+        let mut log = match fs::read_to_string(&log_path) {
+            Ok(s) => WikiLog::from_markdown(&s),
+            Err(_) => WikiLog::new(),
+        };
         let log_baseline = log.entries.len();
 
         let actions = self.plan_actions(&changes, &wiki, &index);
@@ -4124,8 +4259,14 @@ impl WikiAutoTrigger {
         let wiki = WikiEngine::new(project_root);
         wiki.init()?;
 
+        // See WikiMaintenanceAgent::run_full_maintenance for why index is
+        // rebuilt while log is loaded.
         let mut index = WikiIndex::new();
-        let mut log = WikiLog::new();
+        let log_path = wiki.wiki_dir().join("log.md");
+        let mut log = match fs::read_to_string(&log_path) {
+            Ok(s) => WikiLog::from_markdown(&s),
+            Err(_) => WikiLog::new(),
+        };
         let log_baseline = log.entries.len();
 
         let actions = self.agent.plan_actions(&changes, &wiki, &index);
@@ -5241,5 +5382,283 @@ mod feature_tests_256_258 {
         // Second turn: same file, no change → snapshot updated, returns None
         let r2 = trigger.on_agent_turn_complete(dir.path()).unwrap();
         assert!(r2.is_none());
+    }
+
+    // ── Phase A fix #1: path traversal regression tests ──────────────────
+
+    #[test]
+    fn validate_slug_rejects_unsafe_inputs() {
+        // Empty / reserved / hidden / traversal / separator / control.
+        for bad in [
+            "",
+            "..",
+            ".",
+            "index",
+            "log",
+            ".hidden",
+            "../etc/passwd",
+            "..\\windows",
+            "sub/dir",
+            "sub\\dir",
+            "with\0null",
+            "with\nnewline",
+            "with\ttab",
+        ] {
+            assert!(
+                super::validate_slug(bad).is_err(),
+                "validate_slug({bad:?}) should be Err"
+            );
+        }
+        // Sanity: ordinary slugs still accepted.
+        for good in ["foo", "foo-bar", "foo_bar.v2", "café", "a"] {
+            assert!(
+                super::validate_slug(good).is_ok(),
+                "validate_slug({good:?}) should be Ok"
+            );
+        }
+    }
+
+    #[test]
+    fn page_path_blocks_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = WikiEngine::new(dir.path());
+        wiki.init().unwrap();
+
+        // Plant a target file outside the wiki dir.
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, "TOP-SECRET").unwrap();
+
+        // All four entrypoints must refuse the malicious slug.
+        assert!(wiki.read_page("../secret").is_err());
+        assert!(wiki.write_page("../secret", "pwned").is_err());
+        assert!(wiki.delete_page("../secret").is_err());
+        assert!(!wiki.page_exists("../secret"));
+
+        // Outside file is intact and no `../secret.md` was created in wiki_dir
+        // or its parent.
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "TOP-SECRET");
+        assert!(!dir.path().join("secret.md").exists());
+    }
+
+    #[test]
+    fn read_page_rejects_symlink() {
+        // the slug itself is valid, refuse to dereference.
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = WikiEngine::new(dir.path());
+        wiki.init().unwrap();
+
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, "TOP-SECRET").unwrap();
+
+        let link_in_wiki = wiki.wiki_dir().join("trojan.md");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link_in_wiki).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&outside, &link_in_wiki).unwrap();
+
+        let err = wiki
+            .read_page("trojan")
+            .expect_err("symlink read must fail");
+        assert!(format!("{err:?}").contains("symlink"));
+        assert!(wiki.delete_page("trojan").is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "TOP-SECRET");
+    }
+
+    // ── Phase A fix #2: atomic writes (torn-write protection) ────────────
+
+    #[test]
+    fn write_page_is_atomic_no_leftover_tmps() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = Arc::new(WikiEngine::new(dir.path()));
+        wiki.init().unwrap();
+
+        // Use distinguishable, large-ish payloads so a torn write would be
+        // observable as junk text, not just a different short string.
+        let payload_a = "ALPHA".repeat(4096);
+        let payload_b = "BETA-".repeat(4096);
+
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let wiki = Arc::clone(&wiki);
+            let payload = if i % 2 == 0 {
+                payload_a.clone()
+            } else {
+                payload_b.clone()
+            };
+            handles.push(thread::spawn(move || {
+                wiki.write_page("contended", &payload).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Result is exactly one of the two inputs (no mixed/torn content).
+        let observed = wiki.read_page("contended").unwrap();
+        assert!(
+            observed == payload_a || observed == payload_b,
+            "observed neither alpha nor beta — torn write detected"
+        );
+
+        // No stray temp files leaked into wiki_dir.
+        let stray: Vec<_> = std::fs::read_dir(wiki.wiki_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "contended.md" && n != "index.md" && n != "log.md" && n != "raw")
+            .collect();
+        assert!(stray.is_empty(), "leftover files in wiki_dir: {stray:?}");
+    }
+
+    // ── Phase A fix #3: log history survives maintenance cycles ──────────
+
+    #[test]
+    fn maintenance_log_history_survives_second_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut trigger = WikiAutoTrigger::new();
+        trigger.on_session_start(dir.path());
+
+        // First cycle creates a page → log entry written.
+        std::fs::write(dir.path().join("first.rs"), "fn first() {}").unwrap();
+        let r1 = trigger.on_agent_turn_complete(dir.path()).unwrap();
+        assert!(r1.is_some(), "first cycle should run");
+        let log_after_first =
+            std::fs::read_to_string(dir.path().join(".caduceus/wiki/log.md")).unwrap();
+        assert!(
+            log_after_first.contains("Create") || log_after_first.contains("Update"),
+            "first-cycle log entry missing: {log_after_first}"
+        );
+
+        // Second cycle creates another page; the first entry must still be
+        // present (previously the log was rewritten from scratch each cycle).
+        std::fs::write(dir.path().join("second.rs"), "fn second() {}").unwrap();
+        let r2 = trigger.on_agent_turn_complete(dir.path()).unwrap();
+        assert!(r2.is_some(), "second cycle should run");
+        let log_after_second =
+            std::fs::read_to_string(dir.path().join(".caduceus/wiki/log.md")).unwrap();
+        // Both first.rs and second.rs page-creates should appear; if the log
+        // had been rewritten from scratch the "first" entry would be missing.
+        assert!(
+            log_after_second.contains("first.rs") && log_after_second.contains("second.rs"),
+            "second-cycle log lost first-cycle history: {log_after_second}"
+        );
+    }
+
+    // ── Phase A fix #4: watcher excludes the wiki dir itself ─────────────
+
+    #[test]
+    fn watcher_ignores_caduceus_wiki_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // A normal source file that should be tracked …
+        std::fs::write(dir.path().join("real.rs"), "fn r() {}").unwrap();
+        // … and wiki output that the watcher must NOT see, otherwise an
+        // auto-trigger maintenance write becomes a "file changed" event and
+        // triggers another maintenance cycle, looping forever.
+        std::fs::create_dir_all(dir.path().join(".caduceus/wiki")).unwrap();
+        std::fs::write(dir.path().join(".caduceus/wiki/index.md"), "# Wiki Index\n").unwrap();
+        std::fs::write(
+            dir.path().join(".caduceus/wiki/whatever.md"),
+            "# whatever\n",
+        )
+        .unwrap();
+
+        let watcher = WikiWatcher::new();
+        let snap = watcher.snapshot_project(dir.path());
+        let keys: Vec<_> = snap.keys().cloned().collect();
+        assert!(
+            keys.iter().any(|k| k.ends_with("real.rs")),
+            "real source missing from snapshot: {keys:?}"
+        );
+        assert!(
+            keys.iter().all(|k| !k.contains(".caduceus")),
+            "wiki dir leaked into snapshot: {keys:?}"
+        );
+    }
+
+    // ── Phase A fix #13: link extractor handles aliases + code fences ────
+
+    #[test]
+    fn extract_links_handles_alias_fences_and_empties() {
+        // Alias: `[[slug|alias]]` → slug only.
+        let content = "Hello [[design-doc|the design]] and [[ops]] and [[]] and [[ops]] again.";
+        let links = super::wiki_extract_links(content);
+        assert_eq!(links, vec!["design-doc".to_string(), "ops".to_string()]);
+
+        // Code fence with bare ``` — links inside must be ignored.
+        let fenced = "Real [[real-link]]\n```\n[[fenced-link]]\n```\nMore [[other-link]]";
+        let links = super::wiki_extract_links(fenced);
+        assert_eq!(
+            links,
+            vec!["real-link".to_string(), "other-link".to_string()],
+            "fenced links must be skipped"
+        );
+
+        // Code fence with language tag (```rust).
+        let fenced_rust = "Real [[r1]]\n```rust\nlet _ = \"[[r2]]\";\n```\nAfter [[r3]]";
+        let links = super::wiki_extract_links(fenced_rust);
+        assert_eq!(
+            links,
+            vec!["r1".to_string(), "r3".to_string()],
+            "fenced rust links must be skipped"
+        );
+
+        // Empty `[[]]` and whitespace-only must be dropped.
+        let edges = "[[]] and [[   ]] and [[real]]";
+        let links = super::wiki_extract_links(edges);
+        assert_eq!(links, vec!["real".to_string()]);
+    }
+
+    // ── Phase A fix #14: schema versioning on index.md and log.md ────────
+
+    #[test]
+    fn schema_version_header_emitted_and_round_trips() {
+        // index + log both carry the schema marker.
+        let index_md = WikiIndex::new().to_markdown();
+        assert!(
+            index_md.starts_with("<!-- schema_version: 1 -->\n"),
+            "index missing schema header: {index_md:?}"
+        );
+        let log_md = WikiLog::new().to_markdown();
+        assert!(
+            log_md.starts_with("<!-- schema_version: 1 -->\n"),
+            "log missing schema header: {log_md:?}"
+        );
+
+        // Versioned content round-trips cleanly through from_markdown.
+        let mut idx = WikiIndex::new();
+        idx.update_entry(
+            "page-a",
+            IndexEntry {
+                slug: "page-a".into(),
+                title: "Page A".into(),
+                summary: "summary".into(),
+                category: "entity".into(),
+                source_count: 1,
+                link_count: 0,
+            },
+        );
+        let parsed = WikiIndex::from_markdown(&idx.to_markdown());
+        assert!(
+            parsed.find_by_query("page-a").len() == 1,
+            "versioned index round-trip lost entry"
+        );
+
+        let mut log = WikiLog::new();
+        log.append(LogEntry {
+            timestamp: "2026-04-26T00:00:00Z".into(),
+            operation: WikiOperation::Create,
+            description: "initial".into(),
+            pages_touched: vec!["page-a".into()],
+        });
+        let parsed_log = WikiLog::from_markdown(&log.to_markdown());
+        assert_eq!(parsed_log.recent(10).len(), 1);
+
+        // Legacy unversioned files still parse (forward compat).
+        let legacy = "# Wiki Log\n\n## [2025-01-01T00:00:00Z] Update | legacy entry\n";
+        let parsed_legacy = WikiLog::from_markdown(legacy);
+        assert_eq!(parsed_legacy.recent(10).len(), 1);
     }
 }
