@@ -3089,19 +3089,36 @@ fn validate_slug(slug: &str) -> std::result::Result<(), CaduceusError> {
 }
 
 /// Extract `[[slug]]` link references from wiki content.
+///
+/// Rules:
+/// - `[[slug|alias]]` returns the slug only (text after `|` is display alias).
+/// - `[[]]` (empty) is rejected.
+/// - Links inside fenced code blocks (lines starting with ```` ``` ````,
+///   optionally followed by a language tag) are skipped.
+/// - Output is deduplicated, preserving first-seen order.
 fn wiki_extract_links(content: &str) -> Vec<String> {
-    let mut links = Vec::new();
-    let mut remaining = content;
-    while let Some(start) = remaining.find("[[") {
-        let after_open = &remaining[start + 2..];
-        if let Some(end) = after_open.find("]]") {
-            let slug = after_open[..end].trim().to_string();
-            if !slug.is_empty() && !links.contains(&slug) {
-                links.push(slug);
+    let mut links: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for line in content.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let mut remaining = line;
+        while let Some(start) = remaining.find("[[") {
+            let after_open = &remaining[start + 2..];
+            let Some(end) = after_open.find("]]") else {
+                break;
+            };
+            let raw = &after_open[..end];
+            let slug = raw.split('|').next().unwrap_or("").trim();
+            if !slug.is_empty() && !links.iter().any(|s| s == slug) {
+                links.push(slug.to_string());
             }
             remaining = &after_open[end + 2..];
-        } else {
-            break;
         }
     }
     links
@@ -5551,5 +5568,39 @@ mod feature_tests_256_258 {
             keys.iter().all(|k| !k.contains(".caduceus")),
             "wiki dir leaked into snapshot: {keys:?}"
         );
+    }
+
+    // ── Phase A fix #13: link extractor handles aliases + code fences ────
+
+    #[test]
+    fn extract_links_handles_alias_fences_and_empties() {
+        // Alias: `[[slug|alias]]` → slug only.
+        let content = "Hello [[design-doc|the design]] and [[ops]] and [[]] and [[ops]] again.";
+        let links = super::wiki_extract_links(content);
+        assert_eq!(links, vec!["design-doc".to_string(), "ops".to_string()]);
+
+        // Code fence with bare ``` — links inside must be ignored.
+        let fenced = "Real [[real-link]]\n```\n[[fenced-link]]\n```\nMore [[other-link]]";
+        let links = super::wiki_extract_links(fenced);
+        assert_eq!(
+            links,
+            vec!["real-link".to_string(), "other-link".to_string()],
+            "fenced links must be skipped"
+        );
+
+        // Code fence with language tag (```rust).
+        let fenced_rust =
+            "Real [[r1]]\n```rust\nlet _ = \"[[r2]]\";\n```\nAfter [[r3]]";
+        let links = super::wiki_extract_links(fenced_rust);
+        assert_eq!(
+            links,
+            vec!["r1".to_string(), "r3".to_string()],
+            "fenced rust links must be skipped"
+        );
+
+        // Empty `[[]]` and whitespace-only must be dropped.
+        let edges = "[[]] and [[   ]] and [[real]]";
+        let links = super::wiki_extract_links(edges);
+        assert_eq!(links, vec!["real".to_string()]);
     }
 }
