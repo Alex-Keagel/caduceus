@@ -491,6 +491,9 @@ impl WorktreeManager {
             .arg(worktree_path)
             .arg("HEAD")
             .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .map_err(CaduceusError::Io)?;
 
@@ -508,6 +511,9 @@ impl WorktreeManager {
             .args(["worktree", "remove", "--force"])
             .arg(worktree_path)
             .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .map_err(CaduceusError::Io)?;
 
@@ -524,6 +530,14 @@ impl WorktreeManager {
         let output = std::process::Command::new("git")
             .args(["worktree", "list", "--porcelain"])
             .current_dir(repo_path)
+            // When invoked from a git hook (pre-push, etc.) GIT_DIR is set
+            // by the parent git process and would override `current_dir`,
+            // making this report the OUTER repo's worktrees instead of the
+            // one at `repo_path`. Strip those env vars so we always honor
+            // the explicit path.
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .map_err(CaduceusError::Io)?;
 

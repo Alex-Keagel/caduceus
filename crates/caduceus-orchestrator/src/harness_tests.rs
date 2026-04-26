@@ -3701,3 +3701,20 @@ async fn audit_c2_unique_prompt_id_per_request() {
         Some("thread-xyz")
     );
 }
+
+// ── ST7: T1 — default spawn_agent timeout is 900s ────────────────────────────
+#[tokio::test]
+async fn default_spawn_agent_timeout_is_900s() {
+    let adapter = Arc::new(MockLlmAdapter::new(vec![]));
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+    // Constructor seeds an override for "spawn_agent" → 900s by default
+    // (plan v3.1 §9). Asserted via the same private field the runtime
+    // tool-loop reads at agent_harness.rs:2603.
+    assert_eq!(
+        harness.tool_timeout_overrides.get("spawn_agent").copied(),
+        Some(std::time::Duration::from_secs(900)),
+        "spawn_agent must default to 900s wall-clock"
+    );
+    // Sanity: generic tool_timeout untouched (still 120s default).
+    assert_eq!(harness.tool_timeout, std::time::Duration::from_secs(120));
+}

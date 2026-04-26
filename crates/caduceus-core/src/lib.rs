@@ -1946,6 +1946,418 @@ pub enum CaduceusError {
 
 pub type Result<T> = std::result::Result<T, CaduceusError>;
 
+// ── ST7: SubAgent failure taxonomy ────────────────────────────────────────────
+
+/// Coarse phase a sub-agent task is in when an error / timeout fires.
+/// Computed locally from observed [`AgentEvent`] traffic on the sub-agent's
+/// emitter; see plan v3.1 Fix 2 for the transition table. Stable wire-shape
+/// (`#[serde(tag="phase")]`) so downstream consumers can match on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SubAgentPhase {
+    /// Default at spawn entry, before any provider/tool/context event.
+    ModelSelection,
+    /// Provider call active: at least one of `ThinkingStarted`,
+    /// `ReasoningDelta`, `TextDelta` has been observed since the last
+    /// `ToolCallStart`.
+    ProviderCall,
+    /// A tool is executing. Set on `ToolCallStart`. Per v3.1 Fix 2,
+    /// `ToolResultEnd` does NOT transition out of this phase — only the
+    /// next provider-side event does.
+    ToolExecution,
+    /// `ContextWarning` / `ContextCompacted` / `ContextGroupsEvicted`
+    /// observed.
+    ContextManagement,
+    /// No phase signal observed yet (or signal not classifiable).
+    Unknown,
+}
+
+/// Retry hint emitted alongside `SubAgentFailure::ProviderError`. Master
+/// orchestrator uses this to decide reroute / immediate retry / surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum RetryClass {
+    /// Transient transport blip — retry immediately, same provider.
+    Immediate,
+    /// Rate-limit / overload — wait `retry_after_secs` then retry.
+    Backoff,
+    /// Auth / malformed / policy — do not retry.
+    NonRetriable,
+}
+
+/// Detail payload for [`SubAgentFailure::Timeout`]. Newtype-wrapped
+/// (`#[non_exhaustive]`) so adding fields is non-breaking. See plan v2 B7.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct TimeoutFailure {
+    pub elapsed_secs: u64,
+    pub timeout_secs: u64,
+    pub last_phase: SubAgentPhase,
+    pub tools_started: bool,
+}
+
+impl TimeoutFailure {
+    pub fn new(
+        elapsed_secs: u64,
+        timeout_secs: u64,
+        last_phase: SubAgentPhase,
+        tools_started: bool,
+    ) -> Self {
+        Self {
+            elapsed_secs,
+            timeout_secs,
+            last_phase,
+            tools_started,
+        }
+    }
+}
+
+/// Detail payload for [`SubAgentFailure::ProviderError`]. Provider/model
+/// are `Option` because at the zed-tool boundary the typed `CaduceusError`
+/// is already collapsed to an `anyhow::Error`; classification done in
+/// caduceus-orchestrator preserves the typed values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ProviderErrorFailure {
+    pub provider: Option<ProviderId>,
+    pub model: Option<ModelId>,
+    pub message: String,
+    pub retry_class: RetryClass,
+    pub retry_after_secs: Option<u64>,
+    pub http_status: Option<u16>,
+}
+
+impl ProviderErrorFailure {
+    pub fn new(message: impl Into<String>, retry_class: RetryClass) -> Self {
+        Self {
+            provider: None,
+            model: None,
+            message: message.into(),
+            retry_class,
+            retry_after_secs: None,
+            http_status: None,
+        }
+    }
+}
+
+/// Structured outcome of a failed sub-agent spawn. Tagged on the wire
+/// (`#[serde(tag="failure_type")]`) so the LLM-visible JSON in
+/// `SpawnAgentToolOutput::Error` carries an explicit discriminant.
+///
+/// Per plan v3.1: `ContextExhausted` is intentionally absent — folded into
+/// ST7-followup-A (StopReason discriminant lift).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "failure_type", content = "details")]
+#[non_exhaustive]
+pub enum SubAgentFailure {
+    Timeout(TimeoutFailure),
+    ProviderError(ProviderErrorFailure),
+    ToolError {
+        tool_name: String,
+        message: String,
+    },
+    UserCancel,
+    PolicyDenied {
+        capability: String,
+        tool: String,
+        reason: String,
+    },
+    RecursionLimitExceeded {
+        current_depth: u8,
+        max_depth: u8,
+    },
+    ModelRefusal {
+        refusal_text: String,
+    },
+    /// Catch-all for shapes we cannot classify (e.g. `anyhow::Other`,
+    /// channel-closed pre-ST7-prereq). `kind` is a stable string so the
+    /// LLM can branch without reading `message`.
+    InternalError {
+        kind: String,
+        message: String,
+    },
+}
+
+impl SubAgentFailure {
+    /// Stable string discriminant matching the `failure_type` serde tag.
+    /// Useful for telemetry / classification without serde round-trip.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Timeout(_) => "Timeout",
+            Self::ProviderError(_) => "ProviderError",
+            Self::ToolError { .. } => "ToolError",
+            Self::UserCancel => "UserCancel",
+            Self::PolicyDenied { .. } => "PolicyDenied",
+            Self::RecursionLimitExceeded { .. } => "RecursionLimitExceeded",
+            Self::ModelRefusal { .. } => "ModelRefusal",
+            Self::InternalError { .. } => "InternalError",
+        }
+    }
+}
+
+impl fmt::Display for SubAgentFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout(t) => write!(
+                f,
+                "sub-agent timeout: {}s elapsed, limit {}s, last_phase={:?}",
+                t.elapsed_secs, t.timeout_secs, t.last_phase
+            ),
+            Self::ProviderError(p) => write!(f, "provider error: {}", p.message),
+            Self::ToolError { tool_name, message } => {
+                write!(f, "tool error in {tool_name}: {message}")
+            }
+            Self::UserCancel => write!(f, "cancelled by user"),
+            Self::PolicyDenied {
+                capability,
+                tool,
+                reason,
+            } => write!(f, "policy denied: {capability} for {tool}: {reason}"),
+            Self::RecursionLimitExceeded {
+                current_depth,
+                max_depth,
+            } => write!(
+                f,
+                "Maximum subagent depth ({max_depth}) reached (current depth {current_depth})"
+            ),
+            Self::ModelRefusal { refusal_text } => write!(f, "model refusal: {refusal_text}"),
+            Self::InternalError { kind, message } => {
+                write!(f, "internal error [{kind}]: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SubAgentFailure {}
+
+/// Caller-supplied context for [`classify_caduceus_error`]. Carries the
+/// `(provider, model)` pair that the typed `CaduceusError` itself does not
+/// preserve (because variants like `Provider(String)` / `RateLimited` /
+/// `ProviderTimeout` are intentionally provider-agnostic).
+///
+/// Per ST7 must-fix #2 / plan v3 §A: `ProviderErrorFailure` MUST surface
+/// `provider`/`model` whenever the call-site has them, so ST8's
+/// vendor-rerouting decision can branch correctly. Adding fields to every
+/// `CaduceusError::Provider*` variant would touch dozens of construction
+/// sites across the workspace; threading a context struct from the
+/// classifier call site (which always has the in-flight model and provider
+/// in scope — `Dispatcher`, `Harness`, etc.) is the surgical alternative.
+#[derive(Debug, Clone, Default)]
+pub struct ClassifyContext {
+    pub provider: Option<ProviderId>,
+    pub model: Option<ModelId>,
+}
+
+impl ClassifyContext {
+    pub fn new(provider: Option<ProviderId>, model: Option<ModelId>) -> Self {
+        Self { provider, model }
+    }
+
+    /// Empty context — use only at boundaries where provider/model are not
+    /// in scope (e.g. zed `spawn_agent_tool` after the `anyhow::Error`
+    /// collapse). Prefer threading a populated context whenever possible.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
+/// Classify a typed [`CaduceusError`] into a [`SubAgentFailure`]. The
+/// `ctx` argument supplies `(provider, model)` for `ProviderError`
+/// variants (ST7 must-fix #2 — populated for ST8's vendor-rerouting
+/// decision).
+///
+/// `elapsed_secs`/`timeout_secs` are `Option<u64>` (ST7 r3 #5):
+/// callers that don't have real timing data (e.g. zed's
+/// `spawn_agent_tool` non-timeout error path, or the agent.rs
+/// task-result error arm) MUST pass `None, None` rather than
+/// fabricated zeros. Pre-fix, zero sentinels were latent traps:
+/// no current arm reads them, but a future Timeout-classification
+/// path could silently misreport `0s elapsed` as a real value.
+pub fn classify_caduceus_error(
+    err: &CaduceusError,
+    ctx: &ClassifyContext,
+    last_phase: SubAgentPhase,
+    tools_started: bool,
+    elapsed_secs: Option<u64>,
+    timeout_secs: Option<u64>,
+) -> SubAgentFailure {
+    match err {
+        CaduceusError::Cancelled => SubAgentFailure::UserCancel,
+        CaduceusError::PermissionDenied { capability, tool } => SubAgentFailure::PolicyDenied {
+            capability: capability.clone(),
+            tool: tool.clone(),
+            reason: "permission denied".into(),
+        },
+        CaduceusError::Tool { tool, message } => SubAgentFailure::ToolError {
+            tool_name: tool.clone(),
+            message: message.clone(),
+        },
+        CaduceusError::RateLimited { retry_after_secs } => {
+            SubAgentFailure::ProviderError(ProviderErrorFailure {
+                provider: ctx.provider.clone(),
+                model: ctx.model.clone(),
+                message: format!("rate limited: retry after {retry_after_secs}s"),
+                retry_class: RetryClass::Backoff,
+                retry_after_secs: Some(*retry_after_secs),
+                http_status: Some(429),
+            })
+        }
+        CaduceusError::ProviderTimeout {
+            elapsed_ms,
+            limit_ms,
+            context,
+        } => SubAgentFailure::ProviderError(ProviderErrorFailure {
+            provider: ctx.provider.clone(),
+            model: ctx.model.clone(),
+            message: format!(
+                "provider timeout after {elapsed_ms}ms (limit {limit_ms}ms): {context}"
+            ),
+            retry_class: RetryClass::Backoff,
+            retry_after_secs: None,
+            http_status: None,
+        }),
+        CaduceusError::Provider(msg) => {
+            // ST7 r3 fix #3: triage Provider(String) into transient vs
+            // permanent vs unknown. Pre-fix, every Provider(String) was
+            // routed to RetryClass::Immediate, which retries forever
+            // for permanent errors that should fail fast (400
+            // BadRequest, 401 auth, 404 model not found). Patterns
+            // mirror caduceus-providers/retry_adapter::is_transient_error
+            // but extended to recognise auth / not-found 4xx as
+            // permanent (NonRetriable).
+            let lower = msg.to_lowercase();
+            let has_status = |code: &str| -> bool {
+                // Match the 3-digit code as its own token: surrounded
+                // by non-alphanumeric chars (or string boundary) so
+                // "400" doesn't match inside "1400tokens".
+                let bytes = lower.as_bytes();
+                let target = code.as_bytes();
+                let n = target.len();
+                let mut i = 0;
+                while i + n <= bytes.len() {
+                    if &bytes[i..i + n] == target {
+                        let prev_ok = i == 0 || !(bytes[i - 1] as char).is_ascii_alphanumeric();
+                        let next_ok =
+                            i + n == bytes.len() || !(bytes[i + n] as char).is_ascii_alphanumeric();
+                        if prev_ok && next_ok {
+                            return true;
+                        }
+                    }
+                    i += 1;
+                }
+                false
+            };
+            // Permanent: surface immediately, no retry. Auth & client
+            // errors (4xx that are not rate-limit) belong here.
+            let is_permanent = lower.contains("badrequest")
+                || lower.contains("bad request")
+                || has_status("400")
+                || lower.contains("unauthorized")
+                || has_status("401")
+                || lower.contains("forbidden")
+                || has_status("403")
+                || lower.contains("not found")
+                || has_status("404")
+                || lower.contains("auth failed")
+                || lower.contains("invalid api key")
+                || lower.contains("model not found");
+            // Transient: short network/server blips. Retry quickly.
+            let is_transient = lower.contains("timeout")
+                || lower.contains("timed out")
+                || lower.contains("connection reset")
+                || lower.contains("connection refused")
+                || lower.contains("network error")
+                || has_status("502")
+                || has_status("503")
+                || has_status("504")
+                || lower.contains("service unavailable")
+                || lower.contains("internal server error")
+                || lower.contains("overloaded");
+            // Rate-limit phrasings that arrived as Provider(String)
+            // rather than CaduceusError::RateLimited.
+            let is_rate_limited =
+                lower.contains("rate limit") || lower.contains("rate-limit") || has_status("429");
+            let retry_class = if is_permanent {
+                RetryClass::NonRetriable
+            } else if is_rate_limited {
+                RetryClass::Backoff
+            } else if is_transient {
+                RetryClass::Immediate
+            } else {
+                // Unknown phrasing — keep prior default. Caller is
+                // expected to log the surrounding context for triage.
+                RetryClass::Immediate
+            };
+            let http_status = if has_status("400") {
+                Some(400)
+            } else if has_status("401") || lower.contains("unauthorized") {
+                Some(401)
+            } else if has_status("403") || lower.contains("forbidden") {
+                Some(403)
+            } else if has_status("404") {
+                Some(404)
+            } else if has_status("429") {
+                Some(429)
+            } else if has_status("502") {
+                Some(502)
+            } else if has_status("503") {
+                Some(503)
+            } else if has_status("504") {
+                Some(504)
+            } else {
+                None
+            };
+            SubAgentFailure::ProviderError(ProviderErrorFailure {
+                provider: ctx.provider.clone(),
+                model: ctx.model.clone(),
+                message: msg.clone(),
+                retry_class,
+                retry_after_secs: None,
+                http_status,
+            })
+        }
+        CaduceusError::ContextOverflow { used, limit } => {
+            // Pre-ST7-followup-A: surfaced as InternalError so callers
+            // can branch without prematurely committing to a public
+            // ContextExhausted shape we can't reliably populate yet.
+            let _ = (last_phase, tools_started, elapsed_secs, timeout_secs);
+            SubAgentFailure::InternalError {
+                kind: "context_overflow".into(),
+                message: format!("{used} tokens used, limit {limit}"),
+            }
+        }
+        other => SubAgentFailure::InternalError {
+            kind: "caduceus_error".into(),
+            message: other.to_string(),
+        },
+    }
+}
+
+impl SubAgentPhase {
+    /// Apply v3.1 Fix 2 transition table. Returns the new phase given the
+    /// observed [`AgentEvent`]. Unhandled variants leave the phase
+    /// unchanged.
+    ///
+    /// Critical invariant: `ToolResultEnd` does NOT exit `ToolExecution`.
+    /// Only the next provider-side event (`ThinkingStarted` /
+    /// `ReasoningDelta` / `TextDelta`) does.
+    pub fn next_phase(self, event: &AgentEvent) -> Self {
+        match event {
+            AgentEvent::ContextWarning { .. }
+            | AgentEvent::ContextCompacted { .. }
+            | AgentEvent::ContextGroupsEvicted { .. } => Self::ContextManagement,
+            AgentEvent::ToolCallStart { .. } => Self::ToolExecution,
+            AgentEvent::ThinkingStarted { .. }
+            | AgentEvent::ReasoningDelta { .. }
+            | AgentEvent::TextDelta { .. } => Self::ProviderCall,
+            // ToolResultStart / ToolResultEnd: stay in ToolExecution.
+            // RoutingDecision: emitted while in ModelSelection, no transition.
+            // SessionPhaseChanged / others: leave phase untouched.
+            _ => self,
+        }
+    }
+}
+
 // ── Traits ─────────────────────────────────────────────────────────────────────
 
 #[async_trait::async_trait]
@@ -2871,6 +3283,510 @@ impl Default for ConfigMigrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ST7: SubAgentFailure / SubAgentPhase / classifier ─────────────────────
+
+    #[test]
+    fn sub_agent_failure_kind_str_stable() {
+        assert_eq!(
+            SubAgentFailure::Timeout(TimeoutFailure::new(1, 900, SubAgentPhase::Unknown, false))
+                .kind_str(),
+            "Timeout"
+        );
+        assert_eq!(SubAgentFailure::UserCancel.kind_str(), "UserCancel");
+        assert_eq!(
+            SubAgentFailure::ModelRefusal {
+                refusal_text: "x".into()
+            }
+            .kind_str(),
+            "ModelRefusal"
+        );
+    }
+
+    #[test]
+    fn sub_agent_failure_serde_tag_shape() {
+        let f = SubAgentFailure::Timeout(TimeoutFailure::new(
+            901,
+            900,
+            SubAgentPhase::ToolExecution,
+            true,
+        ));
+        let v = serde_json::to_value(&f).expect("serialize");
+        assert_eq!(v["failure_type"], "Timeout");
+        assert_eq!(v["details"]["elapsed_secs"], 901);
+        assert_eq!(v["details"]["last_phase"], "ToolExecution");
+
+        // Round-trip via tagged shape.
+        let back: SubAgentFailure = serde_json::from_value(v).unwrap();
+        assert_eq!(back.kind_str(), "Timeout");
+    }
+
+    #[test]
+    fn classify_caduceus_error_ratelimit_to_backoff() {
+        let err = CaduceusError::RateLimited {
+            retry_after_secs: 30,
+        };
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        ) {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(p.retry_class, RetryClass::Backoff);
+                assert_eq!(p.retry_after_secs, Some(30));
+                assert_eq!(p.http_status, Some(429));
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_provider_timeout_to_backoff() {
+        let err = CaduceusError::ProviderTimeout {
+            elapsed_ms: 6000,
+            limit_ms: 5000,
+            context: "chat".into(),
+        };
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(6),
+            Some(900),
+        ) {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(p.retry_class, RetryClass::Backoff);
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_tool_to_tool_error() {
+        let err = CaduceusError::Tool {
+            tool: "read_file".into(),
+            message: "boom".into(),
+        };
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::ToolExecution,
+            true,
+            Some(1),
+            Some(900),
+        ) {
+            SubAgentFailure::ToolError { tool_name, message } => {
+                assert_eq!(tool_name, "read_file");
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected ToolError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_permission_to_policy_denied() {
+        let err = CaduceusError::PermissionDenied {
+            capability: "fs.write".into(),
+            tool: "write_file".into(),
+        };
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::ToolExecution,
+            true,
+            Some(1),
+            Some(900),
+        ) {
+            SubAgentFailure::PolicyDenied {
+                capability, tool, ..
+            } => {
+                assert_eq!(capability, "fs.write");
+                assert_eq!(tool, "write_file");
+            }
+            other => panic!("expected PolicyDenied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_cancelled_to_user_cancel() {
+        let err = CaduceusError::Cancelled;
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        ) {
+            SubAgentFailure::UserCancel => {}
+            other => panic!("expected UserCancel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_provider_string_to_immediate() {
+        let err = CaduceusError::Provider("transient blip".into());
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        ) {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(p.retry_class, RetryClass::Immediate);
+                assert!(p.retry_after_secs.is_none());
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    // ST7 r3 #3: Provider(String) triage — permanent vs transient vs unknown.
+
+    #[test]
+    fn classify_caduceus_error_provider_string_400_bad_request_is_non_retriable() {
+        for (msg, expected_status) in [
+            ("BadRequest: invalid request payload", None),
+            ("HTTP 400 Bad Request", Some(400)),
+            ("400 invalid model parameter", Some(400)),
+        ] {
+            let err = CaduceusError::Provider(msg.into());
+            match classify_caduceus_error(
+                &err,
+                &ClassifyContext::empty(),
+                SubAgentPhase::ProviderCall,
+                false,
+                Some(0),
+                Some(900),
+            ) {
+                SubAgentFailure::ProviderError(p) => {
+                    assert_eq!(
+                        p.retry_class,
+                        RetryClass::NonRetriable,
+                        "{msg} should be NonRetriable"
+                    );
+                    assert_eq!(p.http_status, expected_status, "status for {msg}");
+                }
+                other => panic!("expected ProviderError, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_provider_string_auth_errors_are_non_retriable() {
+        for (msg, expected_status) in [
+            ("Unauthorized: invalid token", Some(401)),
+            ("HTTP 401 access denied", Some(401)),
+            ("Forbidden", Some(403)),
+            ("HTTP 403 region restricted", Some(403)),
+            ("auth failed", None),
+            ("invalid api key supplied", None),
+        ] {
+            let err = CaduceusError::Provider(msg.into());
+            match classify_caduceus_error(
+                &err,
+                &ClassifyContext::empty(),
+                SubAgentPhase::ProviderCall,
+                false,
+                Some(0),
+                Some(900),
+            ) {
+                SubAgentFailure::ProviderError(p) => {
+                    assert_eq!(
+                        p.retry_class,
+                        RetryClass::NonRetriable,
+                        "{msg} should be NonRetriable"
+                    );
+                    assert_eq!(p.http_status, expected_status, "status for {msg}");
+                }
+                other => panic!("expected ProviderError, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_provider_string_404_model_not_found_is_non_retriable() {
+        for msg in [
+            "model not found",
+            "HTTP 404 model not found",
+            "404: unknown model id",
+        ] {
+            let err = CaduceusError::Provider(msg.into());
+            match classify_caduceus_error(
+                &err,
+                &ClassifyContext::empty(),
+                SubAgentPhase::ProviderCall,
+                false,
+                Some(0),
+                Some(900),
+            ) {
+                SubAgentFailure::ProviderError(p) => {
+                    assert_eq!(
+                        p.retry_class,
+                        RetryClass::NonRetriable,
+                        "{msg} should be NonRetriable"
+                    );
+                }
+                other => panic!("expected ProviderError, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_provider_string_5xx_and_network_are_immediate() {
+        for msg in [
+            "HTTP 502 bad gateway",
+            "HTTP 503 service unavailable",
+            "HTTP 504 gateway timeout",
+            "connection reset by peer",
+            "connection refused",
+            "request timeout",
+            "network error: dns resolution",
+            "internal server error",
+            "service unavailable",
+            "overloaded",
+        ] {
+            let err = CaduceusError::Provider(msg.into());
+            match classify_caduceus_error(
+                &err,
+                &ClassifyContext::empty(),
+                SubAgentPhase::ProviderCall,
+                false,
+                Some(0),
+                Some(900),
+            ) {
+                SubAgentFailure::ProviderError(p) => {
+                    assert_eq!(
+                        p.retry_class,
+                        RetryClass::Immediate,
+                        "{msg} should be Immediate"
+                    );
+                }
+                other => panic!("expected ProviderError, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_provider_string_rate_limit_is_backoff() {
+        for msg in [
+            "HTTP 429 rate limit exceeded",
+            "rate limit hit, please retry",
+            "rate-limit applies",
+        ] {
+            let err = CaduceusError::Provider(msg.into());
+            match classify_caduceus_error(
+                &err,
+                &ClassifyContext::empty(),
+                SubAgentPhase::ProviderCall,
+                false,
+                Some(0),
+                Some(900),
+            ) {
+                SubAgentFailure::ProviderError(p) => {
+                    assert_eq!(
+                        p.retry_class,
+                        RetryClass::Backoff,
+                        "{msg} should be Backoff"
+                    );
+                }
+                other => panic!("expected ProviderError, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_provider_string_unknown_falls_back_to_immediate() {
+        let err = CaduceusError::Provider("something weird happened".into());
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        ) {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(p.retry_class, RetryClass::Immediate);
+                assert!(p.http_status.is_none());
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_populates_provider_and_model_for_429() {
+        // ST7 must-fix #2: ProviderErrorFailure MUST carry provider/model
+        // when the call-site supplies them (ST8 vendor-rerouting input).
+        let err = CaduceusError::RateLimited {
+            retry_after_secs: 30,
+        };
+        let ctx = ClassifyContext::new(
+            Some(ProviderId::new("anthropic")),
+            Some(ModelId::new("claude-opus-4.7")),
+        );
+        match classify_caduceus_error(
+            &err,
+            &ctx,
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        ) {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(p.provider, Some(ProviderId::new("anthropic")));
+                assert_eq!(p.model, Some(ModelId::new("claude-opus-4.7")));
+                assert_eq!(p.http_status, Some(429));
+                assert_eq!(p.retry_class, RetryClass::Backoff);
+                assert_eq!(p.retry_after_secs, Some(30));
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+
+        // Also exercise the ProviderTimeout + Provider(String) arms.
+        let err = CaduceusError::ProviderTimeout {
+            elapsed_ms: 6000,
+            limit_ms: 5000,
+            context: "chat".into(),
+        };
+        match classify_caduceus_error(
+            &err,
+            &ctx,
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(6),
+            Some(900),
+        ) {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(p.provider, Some(ProviderId::new("anthropic")));
+                assert_eq!(p.model, Some(ModelId::new("claude-opus-4.7")));
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+
+        let err = CaduceusError::Provider("503 service unavailable".into());
+        match classify_caduceus_error(
+            &err,
+            &ctx,
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        ) {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(p.provider, Some(ProviderId::new("anthropic")));
+                assert_eq!(p.model, Some(ModelId::new("claude-opus-4.7")));
+                assert_eq!(p.retry_class, RetryClass::Immediate);
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_empty_context_yields_none_provider_model() {
+        // Backward-compat: empty context (zed-tool boundary) leaves
+        // provider/model None so consumers can branch on Option.
+        let err = CaduceusError::RateLimited {
+            retry_after_secs: 30,
+        };
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        ) {
+            SubAgentFailure::ProviderError(p) => {
+                assert!(p.provider.is_none());
+                assert!(p.model.is_none());
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_other_falls_back_to_internal() {
+        let err = CaduceusError::Other(anyhow::anyhow!("synthetic"));
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::Unknown,
+            false,
+            Some(0),
+            Some(900),
+        ) {
+            SubAgentFailure::InternalError { kind, .. } => {
+                assert_eq!(kind, "caduceus_error");
+            }
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+    }
+
+    // ── Phase transition table (v3.1 Fix 2) ──────────────────────────────────
+
+    #[test]
+    fn phase_initial_is_model_selection() {
+        // ModelSelection is the spawn-entry default. RoutingDecision does
+        // not transition.
+        let p = SubAgentPhase::ModelSelection.next_phase(&AgentEvent::RoutingDecision {
+            candidates: vec![],
+            activated: vec![],
+            threshold: 0.5,
+        });
+        assert_eq!(p, SubAgentPhase::ModelSelection);
+    }
+
+    #[test]
+    fn phase_provider_call_then_tool_execution_then_back() {
+        let p =
+            SubAgentPhase::ModelSelection.next_phase(&AgentEvent::TextDelta { text: "hi".into() });
+        assert_eq!(p, SubAgentPhase::ProviderCall);
+
+        let p = p.next_phase(&AgentEvent::ToolCallStart {
+            id: ToolCallId::new("1"),
+            name: "read_file".into(),
+        });
+        assert_eq!(p, SubAgentPhase::ToolExecution);
+
+        // ToolResultEnd MUST NOT exit ToolExecution (v3.1 Fix 2).
+        let p = p.next_phase(&AgentEvent::ToolResultEnd {
+            id: ToolCallId::new("1"),
+            content: String::new(),
+            is_error: false,
+        });
+        assert_eq!(p, SubAgentPhase::ToolExecution);
+
+        // The next provider-side event finally transitions back.
+        let p = p.next_phase(&AgentEvent::ReasoningDelta {
+            content: "think".into(),
+        });
+        assert_eq!(p, SubAgentPhase::ProviderCall);
+    }
+
+    #[test]
+    fn phase_context_management_on_context_events() {
+        for ev in [
+            AgentEvent::ContextWarning {
+                level: "warning_85".into(),
+                used_tokens: 85,
+                max_tokens: 100,
+            },
+            AgentEvent::ContextCompacted {
+                freed_tokens: 10,
+                before: 100,
+                after: 90,
+            },
+        ] {
+            let p = SubAgentPhase::ProviderCall.next_phase(&ev);
+            assert_eq!(p, SubAgentPhase::ContextManagement);
+        }
+    }
 
     #[test]
     fn session_id_unique() {
