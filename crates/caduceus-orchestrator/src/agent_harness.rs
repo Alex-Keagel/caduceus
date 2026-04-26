@@ -1964,7 +1964,14 @@ impl AgentHarness {
                     em.emit_error(&msg).await;
                     em.emit(AgentEvent::TurnComplete {
                         stop_reason: StopReason::BudgetExceeded,
-                        usage: caduceus_core::TokenUsage::default(),
+                        usage: caduceus_core::TokenUsage {
+                            // ST7-followup-A: even on BudgetExceeded with no
+                            // provider-side usage, surface context_limit so
+                            // the bridge can distinguish prompt-side
+                            // exhaustion from output-cap MaxTokens.
+                            context_limit: Some(state.token_budget.context_limit),
+                            ..Default::default()
+                        },
                     })
                     .await;
                 }
@@ -2114,6 +2121,11 @@ impl AgentHarness {
                                 output_tokens: 0,
                                 cache_read_tokens: 0,
                                 cache_write_tokens: 0,
+                                // ST7-followup-A: even on provider error,
+                                // surface context_limit so consumers know
+                                // which budget the failed turn was running
+                                // against.
+                                context_limit: Some(state.token_budget.context_limit),
                             },
                         )
                         .await;
@@ -2257,6 +2269,10 @@ impl AgentHarness {
                                 output_tokens: response.output_tokens,
                                 cache_read_tokens: response.cache_read_tokens,
                                 cache_write_tokens: response.cache_creation_tokens,
+                                // ST7-followup-A: surface model context_limit
+                                // so bridges can distinguish prompt-side
+                                // exhaustion from output-cap MaxTokens.
+                                context_limit: Some(state.token_budget.context_limit),
                             },
                         )
                         .await;
