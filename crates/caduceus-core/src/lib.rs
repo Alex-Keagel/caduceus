@@ -2206,14 +2206,108 @@ pub fn classify_caduceus_error(
             retry_after_secs: None,
             http_status: None,
         }),
-        CaduceusError::Provider(msg) => SubAgentFailure::ProviderError(ProviderErrorFailure {
-            provider: ctx.provider.clone(),
-            model: ctx.model.clone(),
-            message: msg.clone(),
-            retry_class: RetryClass::Immediate,
-            retry_after_secs: None,
-            http_status: None,
-        }),
+        CaduceusError::Provider(msg) => {
+            // ST7 r3 fix #3: triage Provider(String) into transient vs
+            // permanent vs unknown. Pre-fix, every Provider(String) was
+            // routed to RetryClass::Immediate, which retries forever
+            // for permanent errors that should fail fast (400
+            // BadRequest, 401 auth, 404 model not found). Patterns
+            // mirror caduceus-providers/retry_adapter::is_transient_error
+            // but extended to recognise auth / not-found 4xx as
+            // permanent (NonRetriable).
+            let lower = msg.to_lowercase();
+            let has_status = |code: &str| -> bool {
+                // Match the 3-digit code as its own token: surrounded
+                // by non-alphanumeric chars (or string boundary) so
+                // "400" doesn't match inside "1400tokens".
+                let bytes = lower.as_bytes();
+                let target = code.as_bytes();
+                let n = target.len();
+                let mut i = 0;
+                while i + n <= bytes.len() {
+                    if &bytes[i..i + n] == target {
+                        let prev_ok = i == 0
+                            || !(bytes[i - 1] as char).is_ascii_alphanumeric();
+                        let next_ok = i + n == bytes.len()
+                            || !(bytes[i + n] as char).is_ascii_alphanumeric();
+                        if prev_ok && next_ok {
+                            return true;
+                        }
+                    }
+                    i += 1;
+                }
+                false
+            };
+            // Permanent: surface immediately, no retry. Auth & client
+            // errors (4xx that are not rate-limit) belong here.
+            let is_permanent = lower.contains("badrequest")
+                || lower.contains("bad request")
+                || has_status("400")
+                || lower.contains("unauthorized")
+                || has_status("401")
+                || lower.contains("forbidden")
+                || has_status("403")
+                || lower.contains("not found")
+                || has_status("404")
+                || lower.contains("auth failed")
+                || lower.contains("invalid api key")
+                || lower.contains("model not found");
+            // Transient: short network/server blips. Retry quickly.
+            let is_transient = lower.contains("timeout")
+                || lower.contains("timed out")
+                || lower.contains("connection reset")
+                || lower.contains("connection refused")
+                || lower.contains("network error")
+                || has_status("502")
+                || has_status("503")
+                || has_status("504")
+                || lower.contains("service unavailable")
+                || lower.contains("internal server error")
+                || lower.contains("overloaded");
+            // Rate-limit phrasings that arrived as Provider(String)
+            // rather than CaduceusError::RateLimited.
+            let is_rate_limited = lower.contains("rate limit")
+                || lower.contains("rate-limit")
+                || has_status("429");
+            let retry_class = if is_permanent {
+                RetryClass::NonRetriable
+            } else if is_rate_limited {
+                RetryClass::Backoff
+            } else if is_transient {
+                RetryClass::Immediate
+            } else {
+                // Unknown phrasing — keep prior default. Caller is
+                // expected to log the surrounding context for triage.
+                RetryClass::Immediate
+            };
+            let http_status = if has_status("400") {
+                Some(400)
+            } else if has_status("401") || lower.contains("unauthorized") {
+                Some(401)
+            } else if has_status("403") || lower.contains("forbidden") {
+                Some(403)
+            } else if has_status("404") {
+                Some(404)
+            } else if has_status("429") {
+                Some(429)
+            } else if has_status("502") {
+                Some(502)
+            } else if has_status("503") {
+                Some(503)
+            } else if has_status("504") {
+                Some(504)
+            } else {
+                None
+            };
+            SubAgentFailure::ProviderError(ProviderErrorFailure {
+                provider: ctx.provider.clone(),
+                model: ctx.model.clone(),
+                message: msg.clone(),
+                retry_class,
+                retry_after_secs: None,
+                http_status,
+            })
+        }
         CaduceusError::ContextOverflow { used, limit } => {
             // Pre-ST7-followup-A: surfaced as InternalError so callers
             // can branch without prematurely committing to a public
@@ -3297,6 +3391,179 @@ mod tests {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Immediate);
                 assert!(p.retry_after_secs.is_none());
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    // ST7 r3 #3: Provider(String) triage — permanent vs transient vs unknown.
+
+    #[test]
+    fn classify_caduceus_error_provider_string_400_bad_request_is_non_retriable() {
+        for (msg, expected_status) in [
+            ("BadRequest: invalid request payload", None),
+            ("HTTP 400 Bad Request", Some(400)),
+            ("400 invalid model parameter", Some(400)),
+        ] {
+            let err = CaduceusError::Provider(msg.into());
+            match classify_caduceus_error(
+                &err,
+                &ClassifyContext::empty(),
+                SubAgentPhase::ProviderCall,
+                false,
+                0,
+                900,
+            ) {
+                SubAgentFailure::ProviderError(p) => {
+                    assert_eq!(
+                        p.retry_class,
+                        RetryClass::NonRetriable,
+                        "{msg} should be NonRetriable"
+                    );
+                    assert_eq!(p.http_status, expected_status, "status for {msg}");
+                }
+                other => panic!("expected ProviderError, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_provider_string_auth_errors_are_non_retriable() {
+        for (msg, expected_status) in [
+            ("Unauthorized: invalid token", Some(401)),
+            ("HTTP 401 access denied", Some(401)),
+            ("Forbidden", Some(403)),
+            ("HTTP 403 region restricted", Some(403)),
+            ("auth failed", None),
+            ("invalid api key supplied", None),
+        ] {
+            let err = CaduceusError::Provider(msg.into());
+            match classify_caduceus_error(
+                &err,
+                &ClassifyContext::empty(),
+                SubAgentPhase::ProviderCall,
+                false,
+                0,
+                900,
+            ) {
+                SubAgentFailure::ProviderError(p) => {
+                    assert_eq!(
+                        p.retry_class,
+                        RetryClass::NonRetriable,
+                        "{msg} should be NonRetriable"
+                    );
+                    assert_eq!(p.http_status, expected_status, "status for {msg}");
+                }
+                other => panic!("expected ProviderError, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_provider_string_404_model_not_found_is_non_retriable() {
+        for msg in [
+            "model not found",
+            "HTTP 404 model not found",
+            "404: unknown model id",
+        ] {
+            let err = CaduceusError::Provider(msg.into());
+            match classify_caduceus_error(
+                &err,
+                &ClassifyContext::empty(),
+                SubAgentPhase::ProviderCall,
+                false,
+                0,
+                900,
+            ) {
+                SubAgentFailure::ProviderError(p) => {
+                    assert_eq!(
+                        p.retry_class,
+                        RetryClass::NonRetriable,
+                        "{msg} should be NonRetriable"
+                    );
+                }
+                other => panic!("expected ProviderError, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_provider_string_5xx_and_network_are_immediate() {
+        for msg in [
+            "HTTP 502 bad gateway",
+            "HTTP 503 service unavailable",
+            "HTTP 504 gateway timeout",
+            "connection reset by peer",
+            "connection refused",
+            "request timeout",
+            "network error: dns resolution",
+            "internal server error",
+            "service unavailable",
+            "overloaded",
+        ] {
+            let err = CaduceusError::Provider(msg.into());
+            match classify_caduceus_error(
+                &err,
+                &ClassifyContext::empty(),
+                SubAgentPhase::ProviderCall,
+                false,
+                0,
+                900,
+            ) {
+                SubAgentFailure::ProviderError(p) => {
+                    assert_eq!(
+                        p.retry_class,
+                        RetryClass::Immediate,
+                        "{msg} should be Immediate"
+                    );
+                }
+                other => panic!("expected ProviderError, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_provider_string_rate_limit_is_backoff() {
+        for msg in [
+            "HTTP 429 rate limit exceeded",
+            "rate limit hit, please retry",
+            "rate-limit applies",
+        ] {
+            let err = CaduceusError::Provider(msg.into());
+            match classify_caduceus_error(
+                &err,
+                &ClassifyContext::empty(),
+                SubAgentPhase::ProviderCall,
+                false,
+                0,
+                900,
+            ) {
+                SubAgentFailure::ProviderError(p) => {
+                    assert_eq!(
+                        p.retry_class,
+                        RetryClass::Backoff,
+                        "{msg} should be Backoff"
+                    );
+                }
+                other => panic!("expected ProviderError, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_provider_string_unknown_falls_back_to_immediate() {
+        let err = CaduceusError::Provider("something weird happened".into());
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            0,
+            900,
+        ) {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(p.retry_class, RetryClass::Immediate);
+                assert!(p.http_status.is_none());
             }
             other => panic!("expected ProviderError, got {other:?}"),
         }
