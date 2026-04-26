@@ -2128,11 +2128,44 @@ impl fmt::Display for SubAgentFailure {
 
 impl std::error::Error for SubAgentFailure {}
 
-/// Classify a typed [`CaduceusError`] into a [`SubAgentFailure`]. Provider /
-/// model fields stay `None` — callers with that context (e.g.
-/// caduceus-orchestrator) should fill them in after.
+/// Caller-supplied context for [`classify_caduceus_error`]. Carries the
+/// `(provider, model)` pair that the typed `CaduceusError` itself does not
+/// preserve (because variants like `Provider(String)` / `RateLimited` /
+/// `ProviderTimeout` are intentionally provider-agnostic).
+///
+/// Per ST7 must-fix #2 / plan v3 §A: `ProviderErrorFailure` MUST surface
+/// `provider`/`model` whenever the call-site has them, so ST8's
+/// vendor-rerouting decision can branch correctly. Adding fields to every
+/// `CaduceusError::Provider*` variant would touch dozens of construction
+/// sites across the workspace; threading a context struct from the
+/// classifier call site (which always has the in-flight model and provider
+/// in scope — `Dispatcher`, `Harness`, etc.) is the surgical alternative.
+#[derive(Debug, Clone, Default)]
+pub struct ClassifyContext {
+    pub provider: Option<ProviderId>,
+    pub model: Option<ModelId>,
+}
+
+impl ClassifyContext {
+    pub fn new(provider: Option<ProviderId>, model: Option<ModelId>) -> Self {
+        Self { provider, model }
+    }
+
+    /// Empty context — use only at boundaries where provider/model are not
+    /// in scope (e.g. zed `spawn_agent_tool` after the `anyhow::Error`
+    /// collapse). Prefer threading a populated context whenever possible.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
+/// Classify a typed [`CaduceusError`] into a [`SubAgentFailure`]. The
+/// `ctx` argument supplies `(provider, model)` for `ProviderError`
+/// variants (ST7 must-fix #2 — populated for ST8's vendor-rerouting
+/// decision).
 pub fn classify_caduceus_error(
     err: &CaduceusError,
+    ctx: &ClassifyContext,
     last_phase: SubAgentPhase,
     tools_started: bool,
     elapsed_secs: u64,
@@ -2151,8 +2184,8 @@ pub fn classify_caduceus_error(
         },
         CaduceusError::RateLimited { retry_after_secs } => {
             SubAgentFailure::ProviderError(ProviderErrorFailure {
-                provider: None,
-                model: None,
+                provider: ctx.provider.clone(),
+                model: ctx.model.clone(),
                 message: format!("rate limited: retry after {retry_after_secs}s"),
                 retry_class: RetryClass::Backoff,
                 retry_after_secs: Some(*retry_after_secs),
@@ -2164,8 +2197,8 @@ pub fn classify_caduceus_error(
             limit_ms,
             context,
         } => SubAgentFailure::ProviderError(ProviderErrorFailure {
-            provider: None,
-            model: None,
+            provider: ctx.provider.clone(),
+            model: ctx.model.clone(),
             message: format!(
                 "provider timeout after {elapsed_ms}ms (limit {limit_ms}ms): {context}"
             ),
@@ -2174,8 +2207,8 @@ pub fn classify_caduceus_error(
             http_status: None,
         }),
         CaduceusError::Provider(msg) => SubAgentFailure::ProviderError(ProviderErrorFailure {
-            provider: None,
-            model: None,
+            provider: ctx.provider.clone(),
+            model: ctx.model.clone(),
             message: msg.clone(),
             retry_class: RetryClass::Immediate,
             retry_after_secs: None,
@@ -3191,7 +3224,7 @@ mod tests {
         let err = CaduceusError::RateLimited {
             retry_after_secs: 30,
         };
-        match classify_caduceus_error(&err, SubAgentPhase::ProviderCall, false, 0, 900) {
+        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, 0, 900) {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Backoff);
                 assert_eq!(p.retry_after_secs, Some(30));
@@ -3208,7 +3241,7 @@ mod tests {
             limit_ms: 5000,
             context: "chat".into(),
         };
-        match classify_caduceus_error(&err, SubAgentPhase::ProviderCall, false, 6, 900) {
+        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, 6, 900) {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Backoff);
             }
@@ -3222,7 +3255,7 @@ mod tests {
             tool: "read_file".into(),
             message: "boom".into(),
         };
-        match classify_caduceus_error(&err, SubAgentPhase::ToolExecution, true, 1, 900) {
+        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ToolExecution, true, 1, 900) {
             SubAgentFailure::ToolError { tool_name, message } => {
                 assert_eq!(tool_name, "read_file");
                 assert_eq!(message, "boom");
@@ -3237,7 +3270,7 @@ mod tests {
             capability: "fs.write".into(),
             tool: "write_file".into(),
         };
-        match classify_caduceus_error(&err, SubAgentPhase::ToolExecution, true, 1, 900) {
+        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ToolExecution, true, 1, 900) {
             SubAgentFailure::PolicyDenied {
                 capability, tool, ..
             } => {
@@ -3251,7 +3284,7 @@ mod tests {
     #[test]
     fn classify_caduceus_error_cancelled_to_user_cancel() {
         let err = CaduceusError::Cancelled;
-        match classify_caduceus_error(&err, SubAgentPhase::ProviderCall, false, 0, 900) {
+        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, 0, 900) {
             SubAgentFailure::UserCancel => {}
             other => panic!("expected UserCancel, got {other:?}"),
         }
@@ -3260,7 +3293,7 @@ mod tests {
     #[test]
     fn classify_caduceus_error_provider_string_to_immediate() {
         let err = CaduceusError::Provider("transient blip".into());
-        match classify_caduceus_error(&err, SubAgentPhase::ProviderCall, false, 0, 900) {
+        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, 0, 900) {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Immediate);
                 assert!(p.retry_after_secs.is_none());
@@ -3270,9 +3303,96 @@ mod tests {
     }
 
     #[test]
+    fn classify_caduceus_error_populates_provider_and_model_for_429() {
+        // ST7 must-fix #2: ProviderErrorFailure MUST carry provider/model
+        // when the call-site supplies them (ST8 vendor-rerouting input).
+        let err = CaduceusError::RateLimited { retry_after_secs: 30 };
+        let ctx = ClassifyContext::new(
+            Some(ProviderId::new("anthropic")),
+            Some(ModelId::new("claude-opus-4.7")),
+        );
+        match classify_caduceus_error(
+            &err,
+            &ctx,
+            SubAgentPhase::ProviderCall,
+            false,
+            0,
+            900,
+        ) {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(p.provider, Some(ProviderId::new("anthropic")));
+                assert_eq!(p.model, Some(ModelId::new("claude-opus-4.7")));
+                assert_eq!(p.http_status, Some(429));
+                assert_eq!(p.retry_class, RetryClass::Backoff);
+                assert_eq!(p.retry_after_secs, Some(30));
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+
+        // Also exercise the ProviderTimeout + Provider(String) arms.
+        let err = CaduceusError::ProviderTimeout {
+            elapsed_ms: 6000,
+            limit_ms: 5000,
+            context: "chat".into(),
+        };
+        match classify_caduceus_error(
+            &err,
+            &ctx,
+            SubAgentPhase::ProviderCall,
+            false,
+            6,
+            900,
+        ) {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(p.provider, Some(ProviderId::new("anthropic")));
+                assert_eq!(p.model, Some(ModelId::new("claude-opus-4.7")));
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+
+        let err = CaduceusError::Provider("503 service unavailable".into());
+        match classify_caduceus_error(
+            &err,
+            &ctx,
+            SubAgentPhase::ProviderCall,
+            false,
+            0,
+            900,
+        ) {
+            SubAgentFailure::ProviderError(p) => {
+                assert_eq!(p.provider, Some(ProviderId::new("anthropic")));
+                assert_eq!(p.model, Some(ModelId::new("claude-opus-4.7")));
+                assert_eq!(p.retry_class, RetryClass::Immediate);
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_caduceus_error_empty_context_yields_none_provider_model() {
+        // Backward-compat: empty context (zed-tool boundary) leaves
+        // provider/model None so consumers can branch on Option.
+        let err = CaduceusError::RateLimited { retry_after_secs: 30 };
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            0,
+            900,
+        ) {
+            SubAgentFailure::ProviderError(p) => {
+                assert!(p.provider.is_none());
+                assert!(p.model.is_none());
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn classify_caduceus_error_other_falls_back_to_internal() {
         let err = CaduceusError::Other(anyhow::anyhow!("synthetic"));
-        match classify_caduceus_error(&err, SubAgentPhase::Unknown, false, 0, 900) {
+        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::Unknown, false, 0, 900) {
             SubAgentFailure::InternalError { kind, .. } => {
                 assert_eq!(kind, "caduceus_error");
             }
