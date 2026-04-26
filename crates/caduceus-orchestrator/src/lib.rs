@@ -28,6 +28,7 @@ pub mod rollout_prm;
 pub mod scoped_context;
 pub mod self_consistency;
 pub mod snapshot;
+pub mod wiki_slash;
 pub mod worker_pool;
 pub mod workers;
 

@@ -312,9 +312,10 @@ impl Default for ReplMode {
     }
 }
 
-fn slash_commands() -> [&'static str; 8] {
+fn slash_commands() -> [&'static str; 10] {
     [
-        "/approve", "/clear", "/compact", "/context", "/deny", "/exit", "/help", "/quit",
+        "/approve", "/clear", "/compact", "/context", "/deny", "/exit", "/help", "/init", "/quit",
+        "/wiki",
     ]
 }
 
@@ -766,6 +767,37 @@ mod tests {
             completions,
             vec!["/compact".to_string(), "/context".to_string()]
         );
+    }
+
+    #[test]
+    fn repl_slash_completion_includes_wiki_and_init() {
+        // wiki-D3: /wiki and /init must appear in tab-completion so users
+        // discover them without reading docs.
+        let repl = ReplMode::new();
+        assert_eq!(repl.complete_slash_command("/w"), vec!["/wiki".to_string()]);
+        assert_eq!(repl.complete_slash_command("/i"), vec!["/init".to_string()]);
+    }
+
+    #[test]
+    fn repl_dispatches_wiki_and_init_as_slash_commands() {
+        // wiki-D3: ReplAction must surface /wiki and /init as
+        // SlashCommand variants so callers can dispatch them via
+        // wiki_slash::handle_wiki / handle_init.
+        let mut repl = ReplMode::new();
+        match repl.add_input("/wiki") {
+            ReplAction::SlashCommand(name, args) => {
+                assert_eq!(name, "wiki");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected SlashCommand for /wiki, got {other:?}"),
+        }
+        match repl.add_input("/init") {
+            ReplAction::SlashCommand(name, args) => {
+                assert_eq!(name, "init");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected SlashCommand for /init, got {other:?}"),
+        }
     }
 
     #[test]
