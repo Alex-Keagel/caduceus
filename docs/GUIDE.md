@@ -123,36 +123,31 @@ Caduceus's **Omniscience layer** (crate: `caduceus-omniscience`) continuously bu
 
 ### WikiEngine
 
-**What it does:** Auto-maintains a living knowledge wiki in `.caduceus/wiki/` that documents your project's architecture, key APIs, and patterns in plain Markdown.
+**What it does:** Provides a persistent project wiki on disk at `.caduceus/wiki/` — plain Markdown pages that the agent can read, write, search, and link with `[[wiki-link]]` syntax. The wiki is **agent-driven**, not auto-maintained: pages exist when the LLM (or you) writes them.
 
 **Structure:**
 
 ```
 .caduceus/
 └── wiki/
-    ├── index.md          # Master index with links to all pages
-    ├── architecture.md   # Auto-generated architecture overview
-    ├── api/              # One page per public API surface
-    │   ├── config.md
-    │   └── providers.md
-    ├── patterns.md       # Detected design patterns
-    └── glossary.md       # Project-specific terminology
+    ├── index.md          # Auto-managed catalog (rebuilt when the agent runs maintenance)
+    ├── log.md            # Append-only history of wiki operations
+    └── <slug>.md         # One file per page; flat namespace, slug-validated
 ```
 
-**WikiWatcher — what triggers updates:**
+**How pages get created and updated:**
 
-- **File save:** Any change to a source file triggers re-analysis of that file's public API surface and updates the relevant wiki page
-- **Agent turn:** At the end of every agent turn, the WikiEngine checks for staleness and regenerates any pages whose source files have changed since last write
-- **Manual trigger:** Run `/wiki refresh` to force a full rebuild
-- **`/init`:** Generates the initial wiki from scratch using a deep scan pass
+- **LLM tool (Zed runtime):** The agent calls the `caduceus_project_wiki` tool to read, write, search, list, or delete pages. This is the only path that writes to the wiki today.
+- **Manual editing:** You can edit pages directly in your editor. The on-disk format is plain Markdown — no special escaping required.
+- **Automatic maintenance:** Not wired up in the shipped runtime. The library types exist (`WikiWatcher`, `WikiAutoTrigger`, `WikiMaintenanceAgent`) but nothing instantiates them on agent-turn or session lifecycle today. See `ROADMAP.md` for the planned auto-maintenance work.
 
-**Reading the wiki:** The agent automatically injects relevant wiki pages into its context when answering questions. You can also read them directly:
+**Reading the wiki:** The agent reads wiki pages on demand via the `caduceus_project_wiki` tool when its prompt asks it to. There is **no automatic injection** of wiki pages into the agent context today. You can also read pages directly:
 
 ```bash
-cat .caduceus/wiki/architecture.md
+cat .caduceus/wiki/<slug>.md
 ```
 
-**Committing the wiki:** The `.caduceus/wiki/` directory is worth committing — it gives future sessions instant architectural context and saves the scanning overhead on first open.
+**Committing the wiki:** The `.caduceus/wiki/` directory is worth committing — it preserves project knowledge across sessions and machines.
 
 ---
 
@@ -197,10 +192,9 @@ Type `/` in the input to open the command palette with fuzzy autocomplete.
 
 | Command | Description |
 |---------|-------------|
-| `/init` | Initialize `.caduceus/` in the current project (scaffolds `CADUCEUS.md`, config, wiki) |
+| `/init` | Initialize `.caduceus/` in the current project (scaffolds `CADUCEUS.md` and starter config) |
 | `/config [key] [value]` | Get or set a config value. Browse sections interactively without arguments. |
 | `/connect [provider]` | Add API credentials for a new LLM provider |
-| `/wiki [refresh\|show]` | Manage the auto-generated project wiki |
 | `/scan` | Re-run ProjectScanner on the current directory |
 
 ### Context Commands
