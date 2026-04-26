@@ -16,7 +16,7 @@
 | Cline Kanban (Research) | Kanban |
 | MS Agent Governance Toolkit | MS Governance |
 
-**Status Legend:** ✅ Implemented · 🔧 Stubbed · ✅ Planned · ✅ Future  
+**Status Legend:** ✅ Implemented · 🟡 Library / Partial (code exists but not wired into runtime) · 🔧 Stubbed · 💡 Planned / Future  
 **Priority:** P0 (Critical) · P1 (High) · P2 (Medium) · P3 (Nice-to-have)
 
 ---
@@ -91,7 +91,7 @@
 | 54 | Plugin capability grants | Fine-grained permission grants scoped to each plugin | Claurst | ✅ | P2 | `caduceus-plugin` |
 | 136 | Stale-base preflight / git freshness | Detect stale base-commit or diverged branches before tool execution; block workspace-wide commands on stale state | Claw | ✅ | P1 | `caduceus-git` |
 | 137 | `/config` slash command | Get or set config keys interactively; supports section browsing | Claw | ✅ | P1 | `caduceus-orchestrator` |
-| 138 | `/init` slash command | Project initialization — scaffold CADUCEUS.md, .caduceus/ directory, and starter config | Claw | ✅ | P1 | `caduceus-orchestrator` |
+| 138 | `/init` slash command | Project initialization — scaffold CADUCEUS.md, .caduceus/ directory, and starter config | Claw | 🟡 | P1 | `caduceus-orchestrator` |
 | 139 | `/model` slash command | Switch active model at runtime without restarting the session | Claw | ✅ | P1 | `caduceus-orchestrator` |
 | 140 | `/export` slash command | Export conversation to Markdown file with title/header and full content | Claw | ✅ | P1 | `caduceus-orchestrator` |
 | 141 | Summary compression (line/char budgets) | Second-pass compression of compaction summaries to configurable line/character budgets | Claw | ✅ | P1 | `caduceus-orchestrator` |
@@ -703,15 +703,15 @@ Session forking is the first concrete multiplayer feature (P2). Multi-agent capa
 | 247 | Git-trackable task data | Task/project data stored as JSON files alongside code for version control | Agentic-Tools | ✅ | P2 | `caduceus-storage` |
 | 248 | WebAuthn/FIDO2 passkey authentication | Passwordless authentication for cloud deployment using hardware security keys | OpenCode-Cloud | 💡 | P3 | `caduceus-permissions` |
 | 249 | Two-factor authentication (2FA) | TOTP/SMS second factor for enterprise deployments | OpenCode-Cloud | 💡 | P3 | `caduceus-permissions` |
-| 250 | Wiki engine | Persistent project wiki in .caduceus/wiki/ — CRUD, search, [[links]], git-tracked markdown | Karpathy | ✅ | P1 | `caduceus-storage` |
-| 251 | Wiki index | Auto-maintained index.md — catalog of all pages with categories, summaries, orphan detection | Karpathy | ✅ | P1 | `caduceus-storage` |
-| 252 | Wiki log | Append-only log.md — chronological record of ingests, queries, lints with parseable format | Karpathy | ✅ | P1 | `caduceus-storage` |
-| 253 | Wiki ingestor | Extract entities/claims from sources → generate summary + entity pages + cross-references | Karpathy | ✅ | P1 | `caduceus-storage` |
-| 254 | Wiki linter | Health check — orphan pages, broken links, empty pages, stale content detection | Karpathy | ✅ | P1 | `caduceus-storage` |
-| 255 | Wiki query engine | Search pages by TF-relevance, gather context, extract [[citations]] | Karpathy | ✅ | P1 | `caduceus-storage` |
-| 256 | Wiki watcher | File change detection with FNV-1a hashing, extension filtering, ignore patterns | Karpathy | ✅ | P1 | `caduceus-storage` |
-| 257 | Wiki maintenance agent | Auto-plans and executes wiki updates: create/update/delete pages, rebuild index, lint | Karpathy | ✅ | P1 | `caduceus-storage` |
-| 258 | Wiki auto-trigger | Hooks into agent lifecycle — auto-maintenance on every turn, session start/end | Karpathy | ✅ | P1 | `caduceus-storage` |
+| 250 | Wiki engine | Persistent project wiki in .caduceus/wiki/ — CRUD, search, [[links]], git-tracked markdown (exposed via zed `caduceus_project_wiki` LLM tool) | Karpathy | ✅ | P1 | `caduceus-storage` |
+| 251 | Wiki index | Auto-maintained index.md — catalog of all pages with categories, summaries, orphan detection | Karpathy | 🟡 | P1 | `caduceus-storage` |
+| 252 | Wiki log | Append-only log.md — chronological record of ingests, queries, lints with parseable format | Karpathy | 🟡 | P1 | `caduceus-storage` |
+| 253 | Wiki ingestor | Extract entities/claims from sources → generate summary + entity pages + cross-references | Karpathy | 🟡 | P1 | `caduceus-storage` |
+| 254 | Wiki linter | Health check — orphan pages, broken links, empty pages, stale content detection | Karpathy | 🟡 | P1 | `caduceus-storage` |
+| 255 | Wiki query engine | Search pages by TF-relevance, gather context, extract [[citations]] | Karpathy | 🟡 | P1 | `caduceus-storage` |
+| 256 | Wiki watcher | File change detection with FNV-1a hashing, extension filtering, ignore patterns | Karpathy | 🟡 | P1 | `caduceus-storage` |
+| 257 | Wiki maintenance agent | Auto-plans and executes wiki updates: create/update/delete pages, rebuild index, lint | Karpathy | 🟡 | P1 | `caduceus-storage` |
+| 258 | Wiki auto-trigger | Hooks into agent lifecycle — auto-maintenance on every turn, session start/end | Karpathy | 🟡 | P1 | `caduceus-storage` |
 | 259 | Agent scaffolder | Generate .agent.md with persona, triggers, tools, checklist via /create agent | New | ✅ | P1 | `caduceus-orchestrator` |
 | 260 | Skill scaffolder | Generate SKILL.md with steps, triggers, examples via /create skill | New | ✅ | P1 | `caduceus-orchestrator` |
 | 261 | Instructions scaffolder | Generate CADUCEUS.md with auto-detect (language, framework) via /create instructions | New | ✅ | P1 | `caduceus-orchestrator` |
