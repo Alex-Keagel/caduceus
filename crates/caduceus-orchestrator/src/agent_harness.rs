@@ -32,7 +32,6 @@ use caduceus_tools::ToolRegistry;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-
 /// P11.5 — outcome of a single tool spawn inside the parallel batch.
 /// Distinguishes timeouts from cancellations from completion so the
 /// collector can emit the right telemetry event without parsing
@@ -42,7 +41,6 @@ enum ToolSpawnOutcome {
     TimedOut,
     Cancelled,
 }
-
 
 // ── Agent harness ──────────────────────────────────────────────────────────────
 // The core conversation loop: send -> extract tool calls -> execute -> append -> repeat
@@ -1333,7 +1331,11 @@ impl AgentHarness {
     /// We only update `context_limit` and `reserved_output`. The
     /// `used_input` / `used_output` counters are preserved so a
     /// mid-session switch doesn't reset spending.
-    pub(crate) async fn apply_model_budget_for_turn(&self, state: &mut SessionState, model_id: &str) -> bool {
+    pub(crate) async fn apply_model_budget_for_turn(
+        &self,
+        state: &mut SessionState,
+        model_id: &str,
+    ) -> bool {
         let (ctx, reserved) = caduceus_core::TokenBudget::model_spec(model_id);
         if state.token_budget.context_limit == ctx && state.token_budget.reserved_output == reserved
         {
@@ -1498,7 +1500,10 @@ impl AgentHarness {
                 thinking_effort: None,
                 speed: None,
             };
-            match self.provider_chat_bounded(req, "verification-rollout").await {
+            match self
+                .provider_chat_bounded(req, "verification-rollout")
+                .await
+            {
                 Ok(resp) if !resp.content.trim().is_empty() => {
                     ballot_logprobs.push(resp.logprobs.as_ref().map(|s| s.mean_token_p));
                     ballots.push(resp.content);
@@ -1870,8 +1875,7 @@ impl AgentHarness {
         // Build tool specs once — reused across iterations (only messages change).
         // Converts `Vec<ToolSpec>` from the registry to `Arc<[ToolSpec]>` here so
         // that each ChatRequest built below only bumps a refcount (ST-C2 Phase 4).
-        let tool_specs: Arc<[caduceus_core::ToolSpec]> =
-            Arc::from(self.tools.specs());
+        let tool_specs: Arc<[caduceus_core::ToolSpec]> = Arc::from(self.tools.specs());
 
         // Token budget warning
         let warning = state.token_budget.warning_level();
@@ -2057,8 +2061,8 @@ impl AgentHarness {
                 prompt_id: Some(uuid::Uuid::new_v4().to_string()),
                 intent: Some(CompletionIntent::UserPrompt),
                 stop: vec![],
-            thinking_effort: None,
-            speed: None,
+                thinking_effort: None,
+                speed: None,
             };
 
             // Call LLM — always use chat() for tool loops. Streaming happens
@@ -2367,11 +2371,9 @@ impl AgentHarness {
                                     // headers, env, ...) are redacted before
                                     // the value fans out over the broadcast
                                     // channel + retention ring.
-                                    raw_input: Some(
-                                        caduceus_core::redact_secrets_for_event(
-                                            tool_use.input.clone(),
-                                        ),
-                                    ),
+                                    raw_input: Some(caduceus_core::redact_secrets_for_event(
+                                        tool_use.input.clone(),
+                                    )),
                                 })
                                 .await;
                             }
@@ -3198,18 +3200,17 @@ impl AgentHarness {
                     // stops sending data mid-stream (half-open TCP, model stall)
                     // we must give up rather than block forever.
                     let idle_start = std::time::Instant::now();
-                    let next_opt =
-                        match tokio::time::timeout(idle_limit, stream.next()).await {
-                            Ok(opt) => opt,
-                            Err(_elapsed) => {
-                                stream_error = Some(format!(
-                                    "stream idle timeout after {}ms (limit {}ms)",
-                                    idle_start.elapsed().as_millis(),
-                                    idle_limit_ms
-                                ));
-                                break;
-                            }
-                        };
+                    let next_opt = match tokio::time::timeout(idle_limit, stream.next()).await {
+                        Ok(opt) => opt,
+                        Err(_elapsed) => {
+                            stream_error = Some(format!(
+                                "stream idle timeout after {}ms (limit {}ms)",
+                                idle_start.elapsed().as_millis(),
+                                idle_limit_ms
+                            ));
+                            break;
+                        }
+                    };
                     let chunk_result = match next_opt {
                         Some(c) => c,
                         None => break,
@@ -3636,4 +3637,3 @@ pub(crate) fn extract_host(url: &str) -> Option<String> {
         Some(host.to_string())
     }
 }
-

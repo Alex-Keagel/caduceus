@@ -514,7 +514,10 @@ mod tests {
             ]),
         );
         let retry = RetryAdapter::new(primary.clone()).with_policy(fast_policy());
-        let _stream = retry.stream(req()).await.expect("should succeed after retries");
+        let _stream = retry
+            .stream(req())
+            .await
+            .expect("should succeed after retries");
         assert_eq!(
             primary.stream_calls(),
             3,
@@ -539,8 +542,7 @@ mod tests {
             ]),
         );
         let backup = Arc::new(
-            ScriptedAdapter::new("backup", vec![])
-                .with_stream_results(vec![Ok(empty_stream)]),
+            ScriptedAdapter::new("backup", vec![]).with_stream_results(vec![Ok(empty_stream)]),
         );
         let retry = RetryAdapter::new(primary.clone())
             .with_policy(fast_policy())
@@ -554,13 +556,11 @@ mod tests {
     async fn audit_c4_stream_non_transient_short_circuits() {
         let empty_stream: StreamResult = Box::pin(futures::stream::empty());
         let primary = Arc::new(
-            ScriptedAdapter::new("primary", vec![]).with_stream_results(vec![Err(
-                CaduceusError::Provider("400 bad request".into()),
-            )]),
+            ScriptedAdapter::new("primary", vec![])
+                .with_stream_results(vec![Err(CaduceusError::Provider("400 bad request".into()))]),
         );
         let backup = Arc::new(
-            ScriptedAdapter::new("backup", vec![])
-                .with_stream_results(vec![Ok(empty_stream)]),
+            ScriptedAdapter::new("backup", vec![]).with_stream_results(vec![Ok(empty_stream)]),
         );
         let retry = RetryAdapter::new(primary.clone())
             .with_policy(fast_policy())

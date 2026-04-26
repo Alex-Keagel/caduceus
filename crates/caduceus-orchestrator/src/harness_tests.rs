@@ -239,9 +239,7 @@ fn tool_result_message(tool_id: &str, content: &str) -> caduceus_providers::Mess
         content: content.into(),
         content_blocks: None,
         tool_calls: Vec::new(),
-        tool_result: Some(
-            caduceus_core::ToolResult::success(content).with_tool_use_id(tool_id),
-        ),
+        tool_result: Some(caduceus_core::ToolResult::success(content).with_tool_use_id(tool_id)),
         cache_breakpoint: false,
     }
 }
@@ -622,8 +620,7 @@ async fn bash_with_timeout() {
 async fn cancellation_propagation() {
     // MockLlmAdapter with no scripted streams simulates an abort mid-session
     let adapter = Arc::new(MockLlmAdapter::new(vec![]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness.run(&mut state, &mut history, "do something").await;
@@ -636,8 +633,7 @@ async fn empty_input_noop() {
     let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response(
         "Please provide a message.",
     )]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness.run(&mut state, &mut history, "").await.unwrap();
@@ -651,8 +647,7 @@ async fn rate_limit_recovery() {
         make_chat_response("first response"),
         make_chat_response("second response after recovery"),
     ]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let r1 = harness.run(&mut state, &mut history, "ping").await.unwrap();
@@ -691,8 +686,7 @@ fn context_overflow_truncation() {
 async fn malformed_response_handling() {
     // No scripted streams → stream() returns Err (simulates unparseable response)
     let adapter = Arc::new(MockLlmAdapter::new(vec![]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness.run(&mut state, &mut history, "give me data").await;
@@ -739,8 +733,7 @@ async fn multi_tool_turn() {
 #[tokio::test]
 async fn session_state_persistence() {
     let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("remembered")]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     harness
@@ -887,9 +880,8 @@ async fn harness_cancellation_before_start() {
     token.cancel();
 
     let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("response")]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_cancellation_token(token);
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_cancellation_token(token);
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness.run(&mut state, &mut history, "hello").await;
@@ -909,9 +901,8 @@ async fn harness_reset_cancellation_unblocks_subsequent_runs() {
         make_chat_response("first response"),
         make_chat_response("second response"),
     ]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_cancellation_token(token.clone());
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_cancellation_token(token.clone());
 
     // First run cancels mid-flight (simulate by cancelling before start).
     token.cancel();
@@ -995,17 +986,15 @@ async fn harness_with_query_config() {
 #[test]
 fn harness_default_max_tool_rounds() {
     let adapter: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
     assert_eq!(harness.max_tool_rounds, 50);
 }
 
 #[test]
 fn harness_custom_max_tool_rounds() {
     let adapter: Arc<dyn LlmAdapter> = Arc::new(MockLlmAdapter::new(vec![]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_max_tool_rounds(10);
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_max_tool_rounds(10);
     assert_eq!(harness.max_tool_rounds, 10);
 }
 
@@ -1504,8 +1493,7 @@ async fn circuit_breaker_stops_after_consecutive_failures() {
         .collect();
 
     let adapter = Arc::new(MockLlmAdapter::new(bad_responses));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness
@@ -2687,9 +2675,8 @@ async fn harness_emitter_accessor_returns_clone_with_replay_access() {
     // contain the same TurnComplete the live channel saw.
     let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("done")]));
     let (em, mut rx) = AgentEventEmitter::channel(16);
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_emitter(em);
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_emitter(em);
     let handle = harness
         .emitter()
         .expect("emitter must be exposed via accessor");
@@ -2714,8 +2701,7 @@ async fn harness_emitter_accessor_returns_clone_with_replay_access() {
 #[tokio::test]
 async fn harness_emitter_accessor_returns_none_when_unset() {
     let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("x")]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
     assert!(harness.emitter().is_none());
 }
 
@@ -2837,9 +2823,8 @@ async fn emitter_no_overflow_means_no_synthetic_event() {
 #[tokio::test]
 async fn verification_off_returns_loop_answer_unchanged() {
     let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("loop answer")]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_verification_strategy(caduceus_core::VerificationStrategy::Off);
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_verification_strategy(caduceus_core::VerificationStrategy::Off);
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness.run(&mut state, &mut history, "hi").await.unwrap();
@@ -2857,11 +2842,10 @@ async fn verification_rollout_vote_tie_keeps_original() {
         make_chat_response("right"),
         make_chat_response("wrong"),
     ]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_verification_strategy(caduceus_core::VerificationStrategy::RolloutVote {
-                samples: 3,
-            });
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_verification_strategy(caduceus_core::VerificationStrategy::RolloutVote {
+            samples: 3,
+        });
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness
@@ -2880,11 +2864,10 @@ async fn verification_rollout_vote_replaces_when_consensus_disagrees() {
         make_chat_response("right"),
         make_chat_response("right"),
     ]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_verification_strategy(caduceus_core::VerificationStrategy::RolloutVote {
-                samples: 3,
-            });
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_verification_strategy(caduceus_core::VerificationStrategy::RolloutVote {
+            samples: 3,
+        });
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness
@@ -2930,12 +2913,11 @@ async fn prm_weighted_vote_overrides_plurality_when_verifier_pins_minority() {
     let verifier: Arc<dyn caduceus_core::StepVerifier> = Arc::new(PinVerifier {
         prefer: "good".into(),
     });
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_verification_strategy(caduceus_core::VerificationStrategy::PrmWeightedVote {
-                samples: 3,
-            })
-            .with_step_verifier(verifier);
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_verification_strategy(caduceus_core::VerificationStrategy::PrmWeightedVote {
+            samples: 3,
+        })
+        .with_step_verifier(verifier);
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness.run(&mut state, &mut history, "x").await.unwrap();
@@ -2955,11 +2937,10 @@ async fn prm_weighted_vote_falls_back_to_plurality_without_verifier() {
         make_chat_response("good"),
         make_chat_response("good"),
     ]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_verification_strategy(caduceus_core::VerificationStrategy::PrmWeightedVote {
-                samples: 2,
-            });
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_verification_strategy(caduceus_core::VerificationStrategy::PrmWeightedVote {
+            samples: 2,
+        });
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness.run(&mut state, &mut history, "x").await.unwrap();
@@ -2972,11 +2953,8 @@ async fn verification_test_gated_is_inert_for_now() {
     // engage extra rollouts (only RolloutVote does). Adapter has 1
     // response; if TestGated tried to sample more it would error.
     let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("only")]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated {
-                samples: 3,
-            });
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated { samples: 3 });
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness.run(&mut state, &mut history, "hi").await.unwrap();
@@ -3015,11 +2993,10 @@ async fn cisc_weighted_vote_overrides_plurality_when_minority_more_confident() {
         make_chat_response_with_confidence("bad", 0.2),
         make_chat_response_with_confidence("good", 0.95),
     ]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_verification_strategy(
-                caduceus_core::VerificationStrategy::CiscWeightedVote { samples: 3 },
-            );
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_verification_strategy(caduceus_core::VerificationStrategy::CiscWeightedVote {
+            samples: 3,
+        });
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness.run(&mut state, &mut history, "x").await.unwrap();
@@ -3038,11 +3015,10 @@ async fn cisc_weighted_vote_keeps_majority_when_confidence_uniform() {
         make_chat_response_with_confidence("a", 0.7),
         make_chat_response_with_confidence("b", 0.7),
     ]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_verification_strategy(
-                caduceus_core::VerificationStrategy::CiscWeightedVote { samples: 3 },
-            );
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_verification_strategy(caduceus_core::VerificationStrategy::CiscWeightedVote {
+            samples: 3,
+        });
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness.run(&mut state, &mut history, "x").await.unwrap();
@@ -3058,11 +3034,10 @@ async fn cisc_weighted_vote_falls_back_to_plurality_without_logprobs() {
         make_chat_response("good"),
         make_chat_response("good"),
     ]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_verification_strategy(
-                caduceus_core::VerificationStrategy::CiscWeightedVote { samples: 2 },
-            );
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_verification_strategy(caduceus_core::VerificationStrategy::CiscWeightedVote {
+            samples: 2,
+        });
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness.run(&mut state, &mut history, "x").await.unwrap();
@@ -3078,12 +3053,11 @@ async fn cisc_weighted_vote_emits_started_with_strategy_label() {
         make_chat_response_with_confidence("loop", 0.9),
         make_chat_response_with_confidence("loop", 0.9),
     ]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_emitter(emitter)
-            .with_verification_strategy(
-                caduceus_core::VerificationStrategy::CiscWeightedVote { samples: 2 },
-            );
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_emitter(emitter)
+        .with_verification_strategy(caduceus_core::VerificationStrategy::CiscWeightedVote {
+            samples: 2,
+        });
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let _ = harness.run(&mut state, &mut history, "x").await.unwrap();
@@ -3121,12 +3095,9 @@ async fn test_gate_pass_appends_passing_annotation() {
     // `true` exits 0 — should annotate "✓ project tests passed".
     let dir = tempfile::tempdir().unwrap();
     let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("done")]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated {
-                samples: 1,
-            })
-            .with_test_gate_config(TestGateConfig::new(vec!["true".to_string()], dir.path()));
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated { samples: 1 })
+        .with_test_gate_config(TestGateConfig::new(vec!["true".to_string()], dir.path()));
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness.run(&mut state, &mut history, "hi").await.unwrap();
@@ -3139,12 +3110,9 @@ async fn test_gate_fail_appends_failing_annotation_with_tail() {
     // `false` exits 1.
     let dir = tempfile::tempdir().unwrap();
     let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("done")]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated {
-                samples: 1,
-            })
-            .with_test_gate_config(TestGateConfig::new(vec!["false".to_string()], dir.path()));
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated { samples: 1 })
+        .with_test_gate_config(TestGateConfig::new(vec!["false".to_string()], dir.path()));
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness.run(&mut state, &mut history, "hi").await.unwrap();
@@ -3156,15 +3124,12 @@ async fn test_gate_fail_appends_failing_annotation_with_tail() {
 async fn test_gate_spawn_error_for_missing_binary() {
     let dir = tempfile::tempdir().unwrap();
     let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("done")]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated {
-                samples: 1,
-            })
-            .with_test_gate_config(TestGateConfig::new(
-                vec!["caduceus-no-such-binary-xyz123".to_string()],
-                dir.path(),
-            ));
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated { samples: 1 })
+        .with_test_gate_config(TestGateConfig::new(
+            vec!["caduceus-no-such-binary-xyz123".to_string()],
+            dir.path(),
+        ));
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness.run(&mut state, &mut history, "hi").await.unwrap();
@@ -3177,15 +3142,12 @@ async fn test_gate_timeout_kills_long_running_command() {
     // a Timeout annotation (not a Fail).
     let dir = tempfile::tempdir().unwrap();
     let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("done")]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated {
-                samples: 1,
-            })
-            .with_test_gate_config(
-                TestGateConfig::new(vec!["sleep".to_string(), "60".to_string()], dir.path())
-                    .with_timeout(std::time::Duration::from_millis(200)),
-            );
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated { samples: 1 })
+        .with_test_gate_config(
+            TestGateConfig::new(vec!["sleep".to_string(), "60".to_string()], dir.path())
+                .with_timeout(std::time::Duration::from_millis(200)),
+        );
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness.run(&mut state, &mut history, "hi").await.unwrap();
@@ -3197,11 +3159,8 @@ async fn test_gate_no_config_is_noop() {
     // TestGated configured but no TestGateConfig provided → final
     // text untouched (logged via emitter).
     let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("plain")]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated {
-                samples: 1,
-            });
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated { samples: 1 });
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let result = harness.run(&mut state, &mut history, "hi").await.unwrap();
@@ -3266,13 +3225,10 @@ async fn test_gate_emits_started_and_completed_events_on_pass() {
     let adapter = Arc::new(MockLlmAdapter::new(vec![make_chat_response("done")]));
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
     let emitter = AgentEventEmitter::without_retention(tx);
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_emitter(emitter)
-            .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated {
-                samples: 1,
-            })
-            .with_test_gate_config(TestGateConfig::new(vec!["true".to_string()], dir.path()));
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_emitter(emitter)
+        .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated { samples: 1 })
+        .with_test_gate_config(TestGateConfig::new(vec!["true".to_string()], dir.path()));
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     let _ = harness.run(&mut state, &mut history, "hi").await.unwrap();
@@ -3328,17 +3284,14 @@ async fn test_gate_cancellation_short_circuits_before_spawn() {
     // Cancelled BEFORE spawning anything (we'd notice if it tried
     // to spawn `sleep 60` because the test would take a minute).
     token.cancel();
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_emitter(emitter)
-            .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated {
-                samples: 1,
-            })
-            .with_test_gate_config(
-                TestGateConfig::new(vec!["sleep".to_string(), "60".to_string()], dir.path())
-                    .with_timeout(Duration::from_secs(120)),
-            )
-            .with_cancellation_token(token);
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_emitter(emitter)
+        .with_verification_strategy(caduceus_core::VerificationStrategy::TestGated { samples: 1 })
+        .with_test_gate_config(
+            TestGateConfig::new(vec!["sleep".to_string(), "60".to_string()], dir.path())
+                .with_timeout(Duration::from_secs(120)),
+        )
+        .with_cancellation_token(token);
     let mut state = make_session();
     let mut history = ConversationHistory::new();
     // run() will hit cancellation early — but we don't care about
@@ -3446,9 +3399,8 @@ async fn agent_loop_emits_balanced_step_bracket() {
     )]));
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);
     let emitter = AgentEventEmitter::without_retention(tx);
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
-            .with_emitter(emitter);
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_emitter(emitter);
     let mut state = make_session();
     let mut history = ConversationHistory::new();
 
@@ -3503,11 +3455,9 @@ async fn audit_c5_mid_stream_error_surfaces_as_err() {
         )),
     ];
 
-    let adapter = Arc::new(
-        MockLlmAdapter::new(vec![]).with_fallible_stream_chunks(vec![fallible_stream]),
-    );
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+    let adapter =
+        Arc::new(MockLlmAdapter::new(vec![]).with_fallible_stream_chunks(vec![fallible_stream]));
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
     let mut state = make_session();
 
     let result = harness.stream_turn(&mut state, "hello").await;
@@ -3557,13 +3507,16 @@ async fn audit_c5_clean_stream_still_succeeds() {
     ];
 
     let adapter = Arc::new(MockLlmAdapter::new(vec![]).with_stream_chunks(vec![chunks]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
     let mut state = make_session();
 
     let result = harness.stream_turn(&mut state, "hello").await;
 
-    assert!(result.is_ok(), "clean stream must succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "clean stream must succeed: {:?}",
+        result.err()
+    );
     assert_eq!(result.unwrap(), "Hello world");
 }
 
@@ -3598,8 +3551,7 @@ async fn audit_c3_chat_timeout_surfaces_as_provider_timeout() {
         }])
         .with_chat_delay(std::time::Duration::from_millis(500)),
     );
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
     let mut state = make_session();
 
     let t0 = std::time::Instant::now();
@@ -3645,26 +3597,23 @@ fn audit_c3_provider_timeout_is_transient_for_retry_adapter() {
 async fn audit_c2_harness_forwards_thread_id_and_mints_prompt_id() {
     use caduceus_providers::mock::MockLlmAdapter;
 
-    let adapter = Arc::new(MockLlmAdapter::new(vec![caduceus_providers::ChatResponse {
-        content: "done".into(),
-        tool_calls: vec![],
-        stop_reason: caduceus_core::StopReason::EndTurn,
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_creation_tokens: 0,
-        logprobs: None,
-        thinking: String::new(),
-    }]));
+    let adapter = Arc::new(MockLlmAdapter::new(vec![
+        caduceus_providers::ChatResponse {
+            content: "done".into(),
+            tool_calls: vec![],
+            stop_reason: caduceus_core::StopReason::EndTurn,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            logprobs: None,
+            thinking: String::new(),
+        },
+    ]));
     let adapter_clone = adapter.clone();
 
-    let harness = AgentHarness::new(
-        adapter,
-        caduceus_tools::ToolRegistry::new(),
-        4096,
-        "system",
-    )
-    .with_thread_id("thread-abc-123");
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_thread_id("thread-abc-123");
     let mut state = make_session();
     let mut history = crate::ConversationHistory::new();
     let _ = harness.run(&mut state, &mut history, "hi").await;
@@ -3726,13 +3675,8 @@ async fn audit_c2_unique_prompt_id_per_request() {
         },
     ]));
     let adapter_clone = adapter.clone();
-    let harness = AgentHarness::new(
-        adapter,
-        caduceus_tools::ToolRegistry::new(),
-        4096,
-        "system",
-    )
-    .with_thread_id("thread-xyz");
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system")
+        .with_thread_id("thread-xyz");
     let mut state = make_session();
     let mut history = crate::ConversationHistory::new();
     let _ = harness.run(&mut state, &mut history, "a").await;
@@ -3745,7 +3689,10 @@ async fn audit_c2_unique_prompt_id_per_request() {
         recorded.len()
     );
     let pid1 = recorded[0].prompt_id.as_deref().expect("pid1");
-    let pid2 = recorded[recorded.len() - 1].prompt_id.as_deref().expect("pid2");
+    let pid2 = recorded[recorded.len() - 1]
+        .prompt_id
+        .as_deref()
+        .expect("pid2");
     assert_ne!(pid1, pid2, "prompt_id must differ across turns");
     // Both turns use the same thread_id.
     assert_eq!(recorded[0].thread_id.as_deref(), Some("thread-xyz"));

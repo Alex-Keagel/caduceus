@@ -209,7 +209,9 @@ impl AgentMode {
 
     pub fn description(&self) -> &'static str {
         match self {
-            Self::Plan => "Read codebase + web. Markdown writes only. Combined planning and research.",
+            Self::Plan => {
+                "Read codebase + web. Markdown writes only. Combined planning and research."
+            }
             Self::Act => "Execute code changes within granted write envelope (with approval).",
             Self::Autopilot => {
                 "Autonomous execution — no per-step approval, scope-expansion still asks."
@@ -853,10 +855,7 @@ mod tests {
     fn mode_from_str_all_variants() {
         assert_eq!(AgentMode::from_str_loose("plan"), Some(AgentMode::Plan));
         assert_eq!(AgentMode::from_str_loose("act"), Some(AgentMode::Act));
-        assert_eq!(
-            AgentMode::from_str_loose("research"),
-            Some(AgentMode::Plan)
-        );
+        assert_eq!(AgentMode::from_str_loose("research"), Some(AgentMode::Plan));
         assert_eq!(
             AgentMode::from_str_loose("autopilot"),
             Some(AgentMode::Autopilot)
@@ -1099,10 +1098,7 @@ mod tests {
             );
             // default_mode must be one of the 3 canonical modes.
             assert!(
-                matches!(
-                    persona.default_mode.as_str(),
-                    "plan" | "act" | "autopilot"
-                ),
+                matches!(persona.default_mode.as_str(), "plan" | "act" | "autopilot"),
                 "persona '{name}' has non-canonical default_mode: {}",
                 persona.default_mode
             );

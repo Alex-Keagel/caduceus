@@ -20,8 +20,8 @@ fn p3_2_request_logprobs_default_off() {
 fn p3_2_request_logprobs_builder_toggles() {
     use caduceus_providers::mock::MockLlmAdapter;
     let provider = std::sync::Arc::new(MockLlmAdapter::new(vec![]));
-    let h = AgentHarness::new(provider, ToolRegistry::new(), 4096, "sys")
-        .with_request_logprobs(true);
+    let h =
+        AgentHarness::new(provider, ToolRegistry::new(), 4096, "sys").with_request_logprobs(true);
     assert!(h.request_logprobs());
     let h = h.with_request_logprobs(false);
     assert!(!h.request_logprobs());
@@ -275,8 +275,7 @@ fn instructions_generate_defaults_when_empty() {
 
 #[test]
 fn instructions_auto_detect_rust() {
-    let cfg =
-        InstructionsScaffolder::auto_detect("/home/user/myapp", &["Rust".to_string()], 42);
+    let cfg = InstructionsScaffolder::auto_detect("/home/user/myapp", &["Rust".to_string()], 42);
     assert_eq!(cfg.project_name, "myapp");
     assert_eq!(cfg.project_type, "Rust");
     assert!(cfg.build_command.contains("cargo"));
@@ -705,9 +704,7 @@ fn p9_5_sync_memory_blocks_assigns_pair_id_for_tool_calls_and_results() {
         content: "OK".into(),
         content_blocks: None,
         tool_calls: vec![],
-        tool_result: Some(
-            caduceus_core::ToolResult::success("OK").with_tool_use_id("call_abc"),
-        ),
+        tool_result: Some(caduceus_core::ToolResult::success("OK").with_tool_use_id("call_abc")),
         cache_breakpoint: false,
     };
 
@@ -1109,8 +1106,8 @@ async fn p11_5_cancellation_after_tool_starts_aborts_it() {
         delay: std::time::Duration::from_secs(5),
     }));
     let token = caduceus_core::CancellationToken::new();
-    let harness = AgentHarness::new(adapter, registry, 4096, "system")
-        .with_cancellation_token(token.clone());
+    let harness =
+        AgentHarness::new(adapter, registry, 4096, "system").with_cancellation_token(token.clone());
 
     // Cancel shortly after the run starts.
     let token_to_fire = token.clone();
@@ -1175,8 +1172,8 @@ async fn p11_5_tool_result_marked_error_on_cancel() {
         delay: std::time::Duration::from_secs(5),
     }));
     let token = caduceus_core::CancellationToken::new();
-    let harness = AgentHarness::new(adapter, registry, 4096, "system")
-        .with_cancellation_token(token.clone());
+    let harness =
+        AgentHarness::new(adapter, registry, 4096, "system").with_cancellation_token(token.clone());
 
     let token_to_fire = token.clone();
     tokio::spawn(async move {
@@ -1282,8 +1279,8 @@ async fn p12_2_cache_hit_short_circuits_tool_execution() {
     let key = caduceus_tools::SpecKey::new("slow_cache", &serde_json::json!({}));
     cache.reserve(&key);
     cache.complete(&key, Ok(caduceus_core::ToolResult::success("from-cache")));
-    let harness = AgentHarness::new(adapter, registry, 4096, "system")
-        .with_speculative_cache(cache.clone());
+    let harness =
+        AgentHarness::new(adapter, registry, 4096, "system").with_speculative_cache(cache.clone());
 
     let mut state = p11_2_session();
     let mut history = ConversationHistory::new();
@@ -1456,8 +1453,7 @@ async fn p13_2_failed_tool_inlines_reflexion_lesson() {
     let mem = Arc::new(std::sync::Mutex::new(
         crate::reflexion::ReflexionMemory::new(8),
     ));
-    let harness =
-        AgentHarness::new(adapter, registry, 200_000, "test").with_reflexion(mem.clone());
+    let harness = AgentHarness::new(adapter, registry, 200_000, "test").with_reflexion(mem.clone());
 
     let mut state = session();
     let mut history = ConversationHistory::new();

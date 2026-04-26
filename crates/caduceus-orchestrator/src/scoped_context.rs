@@ -250,7 +250,7 @@ impl BuiltinScopedContextInjector {
         let trimmed = prefix.trim();
         // First sentence or first char-budget, whichever comes first.
         let end_of_sentence = trimmed
-            .find(|c| matches!(c, '.' | '!' | '?' | '\n'))
+            .find(['.', '!', '?', '\n'])
             .map(|i| i + 1)
             .unwrap_or(trimmed.len());
         let cap = end_of_sentence.min(self.max_role_chars).min(trimmed.len());

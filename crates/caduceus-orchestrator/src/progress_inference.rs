@@ -90,4 +90,3 @@ impl ProgressInferrer {
         (0.4 * commits + 0.4 * tests + 0.2 * files).min(100.0)
     }
 }
-

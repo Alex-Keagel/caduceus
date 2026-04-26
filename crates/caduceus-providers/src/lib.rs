@@ -255,7 +255,11 @@ impl From<&LlmMessage> for Message {
         Message {
             role: role_to_str(m.role).into(),
             content: content_text,
-            content_blocks: if blocks.is_empty() { None } else { Some(blocks) },
+            content_blocks: if blocks.is_empty() {
+                None
+            } else {
+                Some(blocks)
+            },
             tool_calls,
             tool_result,
             cache_breakpoint: false,
@@ -2629,9 +2633,18 @@ mod tests {
         // LanguageModelRequest.intent encoding verbatim.
         let cases = [
             (CompletionIntent::UserPrompt, "\"user_prompt\""),
-            (CompletionIntent::ThreadSummarization, "\"thread_summarization\""),
-            (CompletionIntent::VerificationRollout, "\"verification_rollout\""),
-            (CompletionIntent::GenerateGitCommitMessage, "\"generate_git_commit_message\""),
+            (
+                CompletionIntent::ThreadSummarization,
+                "\"thread_summarization\"",
+            ),
+            (
+                CompletionIntent::VerificationRollout,
+                "\"verification_rollout\"",
+            ),
+            (
+                CompletionIntent::GenerateGitCommitMessage,
+                "\"generate_git_commit_message\"",
+            ),
             (CompletionIntent::OneShot, "\"one_shot\""),
         ];
         for (variant, expected) in cases {
@@ -3158,7 +3171,8 @@ mod tests {
             messages: vec![
                 Message::user("first turn — long stable prefix").with_cache_breakpoint(),
                 Message::user("second turn — fresh"),
-            ].into(),
+            ]
+            .into(),
             system: None,
             max_tokens: 1024,
             temperature: None,
@@ -3267,7 +3281,8 @@ mod tests {
                 assistant_msg,
                 tool_msg,
                 Message::user("What did the file say?"),
-            ].into(),
+            ]
+            .into(),
             system: Some("You are helpful.".into()),
             max_tokens: 1024,
             temperature: None,

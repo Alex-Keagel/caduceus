@@ -33,12 +33,12 @@ pub mod workers;
 
 // ST-B1 Wave 0a — extracted modules.
 mod scaffolders;
+#[cfg(test)]
+pub(crate) use scaffolders::to_title_case;
 pub use scaffolders::{
     AgentScaffoldConfig, AgentScaffolder, InstructionsConfig, InstructionsScaffolder,
     SkillScaffoldConfig, SkillScaffolder,
 };
-#[cfg(test)]
-pub(crate) use scaffolders::to_title_case;
 
 // ST-B1 Wave 0b — extracted modules.
 mod prd_parser;
@@ -70,7 +70,9 @@ pub use session_manager::SessionManager;
 
 // ST-B1 Wave 2 — extracted modules.
 mod agent_event_emitter;
-pub use agent_event_emitter::{AgentEventEmitter, DEFAULT_BROADCAST_CAP, DEFAULT_EMITTER_RETENTION};
+pub use agent_event_emitter::{
+    AgentEventEmitter, DEFAULT_BROADCAST_CAP, DEFAULT_EMITTER_RETENTION,
+};
 
 // ST-B1 finalization: AgentHarness + associated types
 mod agent_harness;
@@ -78,6 +80,7 @@ pub use agent_harness::{
     execute_tool_calls, extract_memories, preflight_envelope_of, AgentHarness, PreflightOutcome,
     TestGateConfig, TestGateOutcome,
 };
+#[cfg(test)]
 pub(crate) use agent_harness::{extract_host, tail_chars};
 
 pub use branching_planner::PlannerConfig;
@@ -92,20 +95,25 @@ pub use scoped_context::{
     ScopedContext,
 };
 
+#[cfg(test)]
 use caduceus_core::{
-    AgentEvent, CaduceusError, CancellationToken, ModelId, PermissionOutcome, Result,
-    SessionPhase, SessionState, StopReason, TokenUsage, WarningLevel,
+    AgentEvent, CancellationToken, ModelId, PermissionOutcome, SessionPhase, SessionState,
+    StopReason, TokenUsage, WarningLevel,
 };
+use caduceus_core::{CaduceusError, Result};
+#[cfg(test)]
 use caduceus_permissions::envelope::{
     Decision, DenyReason, ExpansionCapability, PermissionEnvelope,
 };
+#[cfg(test)]
 use caduceus_providers::{ChatRequest, LlmAdapter};
+#[cfg(test)]
 use caduceus_tools::ToolRegistry;
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::{Duration, Instant};
 #[cfg(test)]
 use tokio::sync::mpsc;
-
 
 // ── P1: Loop Detection ─────────────────────────────────────────────────────────
 // F2: unified implementation lives in caduceus-core. The engine re-exports
@@ -273,7 +281,12 @@ mod phase3_bench {
         // 2 KB-ish body per message — realistic assistant turn size.
         let body = "lorem ipsum ".repeat(170);
         Message {
-            role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+            role: if i.is_multiple_of(2) {
+                "user"
+            } else {
+                "assistant"
+            }
+            .into(),
             content: format!("[turn {i}] {body}"),
             content_blocks: None,
             tool_calls: vec![],
@@ -355,8 +368,6 @@ mod harness_tests;
 
 #[cfg(test)]
 mod feature_tests_236_246;
-
-
 
 // ── Tests for #259–#261 ───────────────────────────────────────────────────────
 

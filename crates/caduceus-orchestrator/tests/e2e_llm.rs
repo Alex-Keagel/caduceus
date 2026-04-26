@@ -83,7 +83,8 @@ async fn e2e_anthropic_simple_chat() {
         model: ModelId::new("claude-sonnet-4-20250514"),
         messages: vec![caduceus_providers::Message::user(
             "What is 2+2? Answer with just the number.",
-        )].into(),
+        )]
+        .into(),
         system: None,
         max_tokens: 32,
         temperature: Some(0.0),
@@ -96,8 +97,8 @@ async fn e2e_anthropic_simple_chat() {
         prompt_id: None,
         intent: None,
         stop: vec![],
-            thinking_effort: None,
-            speed: None,
+        thinking_effort: None,
+        speed: None,
     };
 
     let response = provider.chat(request).await.expect("Anthropic chat failed");
@@ -133,7 +134,8 @@ async fn e2e_anthropic_tool_call() {
         model: ModelId::new("claude-sonnet-4-20250514"),
         messages: vec![caduceus_providers::Message::user(
             "What's the weather in Tokyo?",
-        )].into(),
+        )]
+        .into(),
         system: None,
         max_tokens: 256,
         temperature: Some(0.0),
@@ -146,8 +148,8 @@ async fn e2e_anthropic_tool_call() {
         prompt_id: None,
         intent: None,
         stop: vec![],
-            thinking_effort: None,
-            speed: None,
+        thinking_effort: None,
+        speed: None,
     };
 
     let response = provider
@@ -218,7 +220,8 @@ async fn e2e_openai_simple_chat() {
         model: ModelId::new("gpt-4o-mini"),
         messages: vec![caduceus_providers::Message::user(
             "What is 3+3? Answer with just the number.",
-        )].into(),
+        )]
+        .into(),
         system: None,
         max_tokens: 32,
         temperature: Some(0.0),
@@ -231,8 +234,8 @@ async fn e2e_openai_simple_chat() {
         prompt_id: None,
         intent: None,
         stop: vec![],
-            thinking_effort: None,
-            speed: None,
+        thinking_effort: None,
+        speed: None,
     };
 
     let response = provider.chat(request).await.expect("OpenAI chat failed");
@@ -277,8 +280,8 @@ async fn e2e_openai_tool_call() {
         prompt_id: None,
         intent: None,
         stop: vec![],
-            thinking_effort: None,
-            speed: None,
+        thinking_effort: None,
+        speed: None,
     };
 
     let response = provider
@@ -303,7 +306,8 @@ async fn e2e_copilot_simple_chat() {
         model: ModelId::new("gpt-4o"),
         messages: vec![caduceus_providers::Message::user(
             "What is 5+5? Answer with just the number.",
-        )].into(),
+        )]
+        .into(),
         system: None,
         max_tokens: 32,
         temperature: Some(0.0),
@@ -316,8 +320,8 @@ async fn e2e_copilot_simple_chat() {
         prompt_id: None,
         intent: None,
         stop: vec![],
-            thinking_effort: None,
-            speed: None,
+        thinking_effort: None,
+        speed: None,
     };
 
     let response = provider.chat(request).await.expect("Copilot chat failed");

@@ -113,10 +113,7 @@ fn is_secret_key(key: &str) -> bool {
         })
         .collect();
     SECRET_KEY_STEMS.iter().any(|stem| {
-        let stem_norm: String = stem
-            .chars()
-            .filter(|c| *c != '-' && *c != '_')
-            .collect();
+        let stem_norm: String = stem.chars().filter(|c| *c != '-' && *c != '_').collect();
         normalized.contains(&stem_norm)
     })
 }
@@ -232,14 +229,8 @@ mod tests {
             ]
         }));
         assert_eq!(out["items"][0]["name"].as_str(), Some("a"));
-        assert_eq!(
-            out["items"][0]["token"].as_str(),
-            Some(REDACTED_SENTINEL),
-        );
-        assert_eq!(
-            out["items"][1]["token"].as_str(),
-            Some(REDACTED_SENTINEL),
-        );
+        assert_eq!(out["items"][0]["token"].as_str(), Some(REDACTED_SENTINEL),);
+        assert_eq!(out["items"][1]["token"].as_str(), Some(REDACTED_SENTINEL),);
     }
 
     #[test]

@@ -117,9 +117,9 @@ fn p10_03_behavior_rules_preamble_present() {
     // Phase 3 (DAG orchestration) — PB6 self-pause + diversity-by-default
     // + plan-first-for-non-trivial. Three anchors must be present.
     for anchor in [
-        "Self-pause check",       // PB6a self-pause
-        "Diversity by default",   // PB6b diversity-by-default
-        "Plan-first",             // PB6c plan-first for non-trivial
+        "Self-pause check",     // PB6a self-pause
+        "Diversity by default", // PB6b diversity-by-default
+        "Plan-first",           // PB6c plan-first for non-trivial
     ] {
         assert!(
             prompt.contains(anchor),
@@ -129,10 +129,7 @@ fn p10_03_behavior_rules_preamble_present() {
     // Sweep #3 (post nanoTeacher-thread dead-end) — PB7 forbids treating an
     // empty target directory as a blocker when the user asked to create
     // files there. Two anchors guarantee the wording survives edits.
-    for anchor in [
-        "Empty target is a green light",
-        "is empty\" and stop",
-    ] {
+    for anchor in ["Empty target is a green light", "is empty\" and stop"] {
         assert!(
             prompt.contains(anchor),
             "PB7 empty-target rule missing: '{anchor}':\n{prompt}"

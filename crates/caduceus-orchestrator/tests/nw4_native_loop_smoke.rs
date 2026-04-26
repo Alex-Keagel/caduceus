@@ -25,11 +25,7 @@ use std::sync::Arc;
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 fn session() -> SessionState {
-    SessionState::new(
-        ".",
-        ProviderId::new("mock"),
-        ModelId::new("mock-model"),
-    )
+    SessionState::new(".", ProviderId::new("mock"), ModelId::new("mock-model"))
 }
 
 fn text_response(text: &str) -> ChatResponse {
@@ -115,7 +111,9 @@ impl Tool for EchoTool {
 
 #[tokio::test]
 async fn nw4_s1_plain_prompt_completes_single_turn() {
-    let provider = Arc::new(MockLlmAdapter::new(vec![text_response("README summary here.")]));
+    let provider = Arc::new(MockLlmAdapter::new(vec![text_response(
+        "README summary here.",
+    )]));
     let harness = AgentHarness::new(provider, ToolRegistry::new(), 8192, "system");
     let mut state = session();
     let mut history = ConversationHistory::new();
@@ -151,8 +149,15 @@ async fn nw4_s2_read_only_tool_round_trip() {
         .await
         .expect("tool round-trip should succeed");
 
-    assert_eq!(counter.load(Ordering::SeqCst), 1, "tool should fire exactly once");
-    assert!(out.contains("echo: crate root"), "final text should include tool output: {out}");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "tool should fire exactly once"
+    );
+    assert!(
+        out.contains("echo: crate root"),
+        "final text should include tool output: {out}"
+    );
 }
 
 // ── S4 — "web fetch" shape: same single-tool path, no mode-switch loop ──────
@@ -160,7 +165,11 @@ async fn nw4_s2_read_only_tool_round_trip() {
 #[tokio::test]
 async fn nw4_s4_fetch_shaped_tool_no_mode_switch() {
     let provider = Arc::new(MockLlmAdapter::new(vec![
-        tool_call_response("call_1", "web_fetch", json!({ "text": "https://example.com" })),
+        tool_call_response(
+            "call_1",
+            "web_fetch",
+            json!({ "text": "https://example.com" }),
+        ),
         text_response("Fetched: echo: https://example.com"),
     ]));
     let (tool, counter) = EchoTool::new("web_fetch");
@@ -208,7 +217,10 @@ async fn nw4_s5_multi_round_tool_chain() {
         3,
         "tool must fire exactly 3 times across the chain"
     );
-    assert!(out.contains("done"), "final text should be the post-chain summary: {out}");
+    assert!(
+        out.contains("done"),
+        "final text should be the post-chain summary: {out}"
+    );
 
     // History must contain exactly one user turn — no duplicated system
     // preamble as we round-tripped through the tool loop.

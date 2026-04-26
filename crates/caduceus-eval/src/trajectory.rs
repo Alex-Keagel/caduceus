@@ -63,6 +63,7 @@ pub const TRAJECTORY_SCHEMA_VERSION: u16 = 1;
 /// schema can add entries without breaking older readers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // Llm variant is intrinsically large; boxing would change construction API of a public serde type.
 pub enum TrajectoryEntry {
     /// First line of every file. Carries metadata that survives the
     /// individual entries (session id, schema version, recorder
