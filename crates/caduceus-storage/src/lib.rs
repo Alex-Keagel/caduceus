@@ -2876,13 +2876,11 @@ impl WikiEngine {
 
         let index_path = self.wiki_dir.join("index.md");
         if !index_path.exists() {
-            fs::write(&index_path, "# Wiki Index\n\n")
-                .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+            atomic_write(&index_path, b"# Wiki Index\n\n")?;
         }
         let log_path = self.wiki_dir.join("log.md");
         if !log_path.exists() {
-            fs::write(&log_path, "# Wiki Log\n\n")
-                .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+            atomic_write(&log_path, b"# Wiki Log\n\n")?;
         }
         Ok(())
     }
@@ -2968,7 +2966,7 @@ impl WikiEngine {
 
     pub fn write_page(&self, slug: &str, content: &str) -> std::result::Result<(), CaduceusError> {
         let path = self.page_path(slug)?;
-        fs::write(path, content).map_err(|e| CaduceusError::Storage(e.to_string()))
+        atomic_write(&path, content.as_bytes())
     }
 
     pub fn delete_page(&self, slug: &str) -> std::result::Result<(), CaduceusError> {
@@ -2999,6 +2997,34 @@ impl WikiEngine {
         }
         Ok(matches)
     }
+}
+
+/// Atomically write `content` to `path` by writing into a sibling temp file
+/// and renaming over the destination.
+///
+/// This protects against torn writes (a crash mid-write leaves the previous
+/// content intact) but does **not** serialise concurrent writers — the last
+/// writer to call `persist` wins. Concurrent-writer protection is out of
+/// scope for Phase A and tracked separately.
+///
+/// Caller must ensure `path.parent()` exists (we call `create_dir_all` for
+/// safety on first write).
+fn atomic_write(path: &Path, content: &[u8]) -> std::result::Result<(), CaduceusError> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| CaduceusError::Storage(format!("path {path:?} has no parent")))?;
+    fs::create_dir_all(parent).map_err(|e| CaduceusError::Storage(e.to_string()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+    tmp.write_all(content)
+        .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+    tmp.persist(path)
+        .map_err(|e| CaduceusError::Storage(e.error.to_string()))?;
+    Ok(())
 }
 
 fn wiki_title_from_content(content: &str) -> Option<String> {
@@ -4066,14 +4092,13 @@ impl WikiMaintenanceAgent {
                 }
                 let index_md = index.to_markdown();
                 let index_path = wiki.wiki_dir().join("index.md");
-                fs::write(&index_path, index_md)
-                    .map_err(|e| CaduceusError::Storage(e.to_string()))?;
+                atomic_write(&index_path, index_md.as_bytes())?;
                 MaintenanceOutcome::IndexUpdated
             }
             MaintenanceActionType::UpdateLog => {
                 let log_md = log.to_markdown();
                 let log_path = wiki.wiki_dir().join("log.md");
-                fs::write(&log_path, log_md).map_err(|e| CaduceusError::Storage(e.to_string()))?;
+                atomic_write(&log_path, log_md.as_bytes())?;
                 MaintenanceOutcome::LogFlushed
             }
             MaintenanceActionType::RunLint => {
@@ -5375,7 +5400,6 @@ mod feature_tests_256_258 {
 
     #[test]
     fn read_page_rejects_symlink() {
-        // Symlinks may be planted out-of-band (e.g. checked-out repo). Even when
         // the slug itself is valid, refuse to dereference.
         let dir = tempfile::tempdir().unwrap();
         let wiki = WikiEngine::new(dir.path());
@@ -5394,5 +5418,54 @@ mod feature_tests_256_258 {
         assert!(format!("{err:?}").contains("symlink"));
         assert!(wiki.delete_page("trojan").is_err());
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "TOP-SECRET");
+    }
+
+    // ── Phase A fix #2: atomic writes (torn-write protection) ────────────
+
+    #[test]
+    fn write_page_is_atomic_no_leftover_tmps() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = Arc::new(WikiEngine::new(dir.path()));
+        wiki.init().unwrap();
+
+        // Use distinguishable, large-ish payloads so a torn write would be
+        // observable as junk text, not just a different short string.
+        let payload_a = "ALPHA".repeat(4096);
+        let payload_b = "BETA-".repeat(4096);
+
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let wiki = Arc::clone(&wiki);
+            let payload = if i % 2 == 0 {
+                payload_a.clone()
+            } else {
+                payload_b.clone()
+            };
+            handles.push(thread::spawn(move || {
+                wiki.write_page("contended", &payload).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Result is exactly one of the two inputs (no mixed/torn content).
+        let observed = wiki.read_page("contended").unwrap();
+        assert!(
+            observed == payload_a || observed == payload_b,
+            "observed neither alpha nor beta — torn write detected"
+        );
+
+        // No stray temp files leaked into wiki_dir.
+        let stray: Vec<_> = std::fs::read_dir(wiki.wiki_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "contended.md" && n != "index.md" && n != "log.md" && n != "raw")
+            .collect();
+        assert!(stray.is_empty(), "leftover files in wiki_dir: {stray:?}");
     }
 }
