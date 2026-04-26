@@ -4129,8 +4129,16 @@ impl WikiMaintenanceAgent {
         let watcher = WikiWatcher::new();
         let changes = watcher.detect_changes(project_root, previous_hashes);
 
+        // Index is rebuilt from scratch each cycle so that pages deleted from
+        // disk also disappear from the index. Loading the previous index would
+        // leave stale entries pointing at non-existent pages.
         let mut index = WikiIndex::new();
-        let mut log = WikiLog::new();
+        // Log is append-only; load history from disk so prior entries survive.
+        let log_path = wiki.wiki_dir().join("log.md");
+        let mut log = match fs::read_to_string(&log_path) {
+            Ok(s) => WikiLog::from_markdown(&s),
+            Err(_) => WikiLog::new(),
+        };
         let log_baseline = log.entries.len();
 
         let actions = self.plan_actions(&changes, &wiki, &index);
@@ -4223,8 +4231,14 @@ impl WikiAutoTrigger {
         let wiki = WikiEngine::new(project_root);
         wiki.init()?;
 
+        // See WikiMaintenanceAgent::run_full_maintenance for why index is
+        // rebuilt while log is loaded.
         let mut index = WikiIndex::new();
-        let mut log = WikiLog::new();
+        let log_path = wiki.wiki_dir().join("log.md");
+        let mut log = match fs::read_to_string(&log_path) {
+            Ok(s) => WikiLog::from_markdown(&s),
+            Err(_) => WikiLog::new(),
+        };
         let log_baseline = log.entries.len();
 
         let actions = self.agent.plan_actions(&changes, &wiki, &index);
@@ -5467,5 +5481,39 @@ mod feature_tests_256_258 {
             .filter(|n| n != "contended.md" && n != "index.md" && n != "log.md" && n != "raw")
             .collect();
         assert!(stray.is_empty(), "leftover files in wiki_dir: {stray:?}");
+    }
+
+    // ── Phase A fix #3: log history survives maintenance cycles ──────────
+
+    #[test]
+    fn maintenance_log_history_survives_second_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut trigger = WikiAutoTrigger::new();
+        trigger.on_session_start(dir.path());
+
+        // First cycle creates a page → log entry written.
+        std::fs::write(dir.path().join("first.rs"), "fn first() {}").unwrap();
+        let r1 = trigger.on_agent_turn_complete(dir.path()).unwrap();
+        assert!(r1.is_some(), "first cycle should run");
+        let log_after_first =
+            std::fs::read_to_string(dir.path().join(".caduceus/wiki/log.md")).unwrap();
+        assert!(
+            log_after_first.contains("Create") || log_after_first.contains("Update"),
+            "first-cycle log entry missing: {log_after_first}"
+        );
+
+        // Second cycle creates another page; the first entry must still be
+        // present (previously the log was rewritten from scratch each cycle).
+        std::fs::write(dir.path().join("second.rs"), "fn second() {}").unwrap();
+        let r2 = trigger.on_agent_turn_complete(dir.path()).unwrap();
+        assert!(r2.is_some(), "second cycle should run");
+        let log_after_second =
+            std::fs::read_to_string(dir.path().join(".caduceus/wiki/log.md")).unwrap();
+        // Both first.rs and second.rs page-creates should appear; if the log
+        // had been rewritten from scratch the "first" entry would be missing.
+        assert!(
+            log_after_second.contains("first.rs") && log_after_second.contains("second.rs"),
+            "second-cycle log lost first-cycle history: {log_after_second}"
+        );
     }
 }
