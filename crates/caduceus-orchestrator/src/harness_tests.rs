@@ -3706,8 +3706,7 @@ async fn audit_c2_unique_prompt_id_per_request() {
 #[tokio::test]
 async fn default_spawn_agent_timeout_is_900s() {
     let adapter = Arc::new(MockLlmAdapter::new(vec![]));
-    let harness =
-        AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
+    let harness = AgentHarness::new(adapter, caduceus_tools::ToolRegistry::new(), 4096, "system");
     // Constructor seeds an override for "spawn_agent" → 900s by default
     // (plan v3.1 §9). Asserted via the same private field the runtime
     // tool-loop reads at agent_harness.rs:2603.

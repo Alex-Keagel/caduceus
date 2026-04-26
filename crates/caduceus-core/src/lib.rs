@@ -2121,7 +2121,9 @@ impl fmt::Display for SubAgentFailure {
                 "Maximum subagent depth ({max_depth}) reached (current depth {current_depth})"
             ),
             Self::ModelRefusal { refusal_text } => write!(f, "model refusal: {refusal_text}"),
-            Self::InternalError { kind, message } => write!(f, "internal error [{kind}]: {message}"),
+            Self::InternalError { kind, message } => {
+                write!(f, "internal error [{kind}]: {message}")
+            }
         }
     }
 }
@@ -2234,10 +2236,9 @@ pub fn classify_caduceus_error(
                 let mut i = 0;
                 while i + n <= bytes.len() {
                     if &bytes[i..i + n] == target {
-                        let prev_ok = i == 0
-                            || !(bytes[i - 1] as char).is_ascii_alphanumeric();
-                        let next_ok = i + n == bytes.len()
-                            || !(bytes[i + n] as char).is_ascii_alphanumeric();
+                        let prev_ok = i == 0 || !(bytes[i - 1] as char).is_ascii_alphanumeric();
+                        let next_ok =
+                            i + n == bytes.len() || !(bytes[i + n] as char).is_ascii_alphanumeric();
                         if prev_ok && next_ok {
                             return true;
                         }
@@ -2274,9 +2275,8 @@ pub fn classify_caduceus_error(
                 || lower.contains("overloaded");
             // Rate-limit phrasings that arrived as Provider(String)
             // rather than CaduceusError::RateLimited.
-            let is_rate_limited = lower.contains("rate limit")
-                || lower.contains("rate-limit")
-                || has_status("429");
+            let is_rate_limited =
+                lower.contains("rate limit") || lower.contains("rate-limit") || has_status("429");
             let retry_class = if is_permanent {
                 RetryClass::NonRetriable
             } else if is_rate_limited {
@@ -3326,7 +3326,14 @@ mod tests {
         let err = CaduceusError::RateLimited {
             retry_after_secs: 30,
         };
-        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(0), Some(900)) {
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        ) {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Backoff);
                 assert_eq!(p.retry_after_secs, Some(30));
@@ -3343,7 +3350,14 @@ mod tests {
             limit_ms: 5000,
             context: "chat".into(),
         };
-        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(6), Some(900)) {
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(6),
+            Some(900),
+        ) {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Backoff);
             }
@@ -3357,7 +3371,14 @@ mod tests {
             tool: "read_file".into(),
             message: "boom".into(),
         };
-        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ToolExecution, true, Some(1), Some(900)) {
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::ToolExecution,
+            true,
+            Some(1),
+            Some(900),
+        ) {
             SubAgentFailure::ToolError { tool_name, message } => {
                 assert_eq!(tool_name, "read_file");
                 assert_eq!(message, "boom");
@@ -3372,7 +3393,14 @@ mod tests {
             capability: "fs.write".into(),
             tool: "write_file".into(),
         };
-        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ToolExecution, true, Some(1), Some(900)) {
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::ToolExecution,
+            true,
+            Some(1),
+            Some(900),
+        ) {
             SubAgentFailure::PolicyDenied {
                 capability, tool, ..
             } => {
@@ -3386,7 +3414,14 @@ mod tests {
     #[test]
     fn classify_caduceus_error_cancelled_to_user_cancel() {
         let err = CaduceusError::Cancelled;
-        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(0), Some(900)) {
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        ) {
             SubAgentFailure::UserCancel => {}
             other => panic!("expected UserCancel, got {other:?}"),
         }
@@ -3395,7 +3430,14 @@ mod tests {
     #[test]
     fn classify_caduceus_error_provider_string_to_immediate() {
         let err = CaduceusError::Provider("transient blip".into());
-        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::ProviderCall, false, Some(0), Some(900)) {
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::ProviderCall,
+            false,
+            Some(0),
+            Some(900),
+        ) {
             SubAgentFailure::ProviderError(p) => {
                 assert_eq!(p.retry_class, RetryClass::Immediate);
                 assert!(p.retry_after_secs.is_none());
@@ -3581,7 +3623,9 @@ mod tests {
     fn classify_caduceus_error_populates_provider_and_model_for_429() {
         // ST7 must-fix #2: ProviderErrorFailure MUST carry provider/model
         // when the call-site supplies them (ST8 vendor-rerouting input).
-        let err = CaduceusError::RateLimited { retry_after_secs: 30 };
+        let err = CaduceusError::RateLimited {
+            retry_after_secs: 30,
+        };
         let ctx = ClassifyContext::new(
             Some(ProviderId::new("anthropic")),
             Some(ModelId::new("claude-opus-4.7")),
@@ -3647,7 +3691,9 @@ mod tests {
     fn classify_caduceus_error_empty_context_yields_none_provider_model() {
         // Backward-compat: empty context (zed-tool boundary) leaves
         // provider/model None so consumers can branch on Option.
-        let err = CaduceusError::RateLimited { retry_after_secs: 30 };
+        let err = CaduceusError::RateLimited {
+            retry_after_secs: 30,
+        };
         match classify_caduceus_error(
             &err,
             &ClassifyContext::empty(),
@@ -3667,7 +3713,14 @@ mod tests {
     #[test]
     fn classify_caduceus_error_other_falls_back_to_internal() {
         let err = CaduceusError::Other(anyhow::anyhow!("synthetic"));
-        match classify_caduceus_error(&err, &ClassifyContext::empty(), SubAgentPhase::Unknown, false, Some(0), Some(900)) {
+        match classify_caduceus_error(
+            &err,
+            &ClassifyContext::empty(),
+            SubAgentPhase::Unknown,
+            false,
+            Some(0),
+            Some(900),
+        ) {
             SubAgentFailure::InternalError { kind, .. } => {
                 assert_eq!(kind, "caduceus_error");
             }
@@ -3691,9 +3744,8 @@ mod tests {
 
     #[test]
     fn phase_provider_call_then_tool_execution_then_back() {
-        let p = SubAgentPhase::ModelSelection.next_phase(&AgentEvent::TextDelta {
-            text: "hi".into(),
-        });
+        let p =
+            SubAgentPhase::ModelSelection.next_phase(&AgentEvent::TextDelta { text: "hi".into() });
         assert_eq!(p, SubAgentPhase::ProviderCall);
 
         let p = p.next_phase(&AgentEvent::ToolCallStart {
