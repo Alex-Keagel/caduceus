@@ -4,13 +4,13 @@ This file captures aspirational behavior that is **not yet wired into the shippe
 
 ## Wiki — Auto-maintenance and lifecycle integration
 
-The wiki is currently agent-driven via the `caduceus_project_wiki` LLM tool (see `docs/GUIDE.md`). The library exposes additional types — `WikiWatcher`, `WikiAutoTrigger`, `WikiMaintenanceAgent` — that are designed to keep the wiki current without explicit prompts, but nothing instantiates them in the shipped runtime.
+The wiki is currently agent-driven via the `caduceus_project_wiki` LLM tool (see `docs/GUIDE.md`). Earlier sketches of an auto-maintenance pipeline (`WikiWatcher`, `WikiAutoTrigger`, `WikiMaintenanceAgent`, `WikiQueryEngine`, `WikiIngestor`, `WikiLog`) were deleted in Phase C — they had zero callers and would have been speculative scaffolding for behavior that was never wired up. When auto-maintenance is wired, it should be rebuilt at the **orchestrator layer** rather than re-introduced into `caduceus-storage`.
 
 Planned work to make the wiki truly self-maintaining:
 
-- **Agent-turn hook.** Instantiate `WikiAutoTrigger` per-thread in zed's `Thread` and call `on_agent_turn_complete` at turn end so the maintenance agent can rebuild the index and refresh stale pages without explicit prompts.
-- **Session lifecycle hooks.** Wire `on_session_start` / `on_session_end` to the host runtime so initial scans and end-of-session summaries run automatically.
-- **File-system watcher.** Start `WikiWatcher` on session open so file saves trigger incremental re-analysis. Watcher must ignore `.caduceus/` itself to avoid self-trigger loops (this guard ships in Phase A; the start-up wiring does not).
+- **Agent-turn hook.** Add an orchestrator-layer hook in zed's `Thread` that, after each turn, calls `WikiEngine` to refresh the index/lint stale pages. (Replaces the deleted `WikiAutoTrigger.on_agent_turn_complete`.)
+- **Session lifecycle hooks.** Wire `on_session_start` / `on_session_end` in the orchestrator so initial scans and end-of-session summaries run automatically.
+- **File-system watcher.** Build a thin watcher at the orchestrator layer (or reuse zed's existing fs-watcher infrastructure) so file saves trigger incremental re-analysis. The watcher MUST ignore `.caduceus/` itself to avoid self-trigger loops — the Phase A regression test was deleted alongside `WikiWatcher` but the requirement still stands for any rebuild.
 - **`/wiki refresh` slash command.** Register a `/wiki` command in the orchestrator that forces a full maintenance pass on demand.
 - **`/init`-driven first scan.** Extend `/init` so it runs an initial deep scan that seeds the wiki with architecture, API, and pattern pages.
 - **Automatic context injection.** Replace the current memory-bank "project overview" injection in zed's thread context (`thread.rs:5158`) with a `WikiEngine::search()`-driven pass that surfaces relevant wiki pages as context for each turn.
@@ -18,7 +18,7 @@ Planned work to make the wiki truly self-maintaining:
 Prerequisites:
 
 - Wiki Phase A correctness fixes must be in place (path traversal, atomic writes, log history preservation, watcher self-trigger guard, link extractor, schema versioning) — without them, auto-maintenance corrupts the wiki or infinite-loops. ✅ shipped.
-- Wiki Phase C cleanup (delete unused speculative architecture) should land first to avoid wiring up code paths that will be deleted.
+- Wiki Phase C cleanup (delete unused speculative architecture). ✅ shipped.
 
 ## `/init` slash command
 
