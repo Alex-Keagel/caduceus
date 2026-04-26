@@ -1408,6 +1408,16 @@ pub struct TokenUsage {
     pub output_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_write_tokens: u32,
+    /// ST7-followup-A: model's max context window. Populated by the
+    /// orchestrator at TurnComplete from `TokenBudget::context_limit` so
+    /// downstream consumers (zed bridge, UI) can distinguish
+    /// `StopReason::MaxTokens` driven by *output cap* exhaustion from
+    /// *prompt-side context exhaustion* (where `input_tokens` is at/near
+    /// `context_limit`). Optional + `#[serde(default)]` so older
+    /// persisted snapshots and older providers that don't surface this
+    /// keep deserializing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<u32>,
 }
 
 impl TokenUsage {
@@ -1424,6 +1434,13 @@ impl TokenUsage {
         self.cache_write_tokens = self
             .cache_write_tokens
             .saturating_add(other.cache_write_tokens);
+        // ST7-followup-A: preserve the most recently observed context_limit
+        // (Some wins over None; later Some replaces earlier Some). The
+        // budget is per-model, so rolling forward the most-recent reading
+        // matches the model the next turn will run on.
+        if other.context_limit.is_some() {
+            self.context_limit = other.context_limit;
+        }
     }
 }
 
@@ -3285,6 +3302,59 @@ mod tests {
     use super::*;
 
     // ── ST7: SubAgentFailure / SubAgentPhase / classifier ─────────────────────
+
+    #[test]
+    fn token_usage_accumulate_preserves_most_recent_context_limit() {
+        // ST7-followup-A: context_limit is per-model; when accumulating
+        // usage across turns the most-recent reading (Some) replaces an
+        // earlier reading. None values are ignored so a partial Error
+        // turn doesn't clobber a known limit from a prior good turn.
+        let mut acc = TokenUsage::default();
+        assert_eq!(acc.context_limit, None);
+
+        acc.accumulate(&TokenUsage {
+            input_tokens: 100,
+            context_limit: Some(200_000),
+            ..Default::default()
+        });
+        assert_eq!(acc.context_limit, Some(200_000));
+        assert_eq!(acc.input_tokens, 100);
+
+        // None reading does NOT clobber the previous Some.
+        acc.accumulate(&TokenUsage {
+            output_tokens: 50,
+            context_limit: None,
+            ..Default::default()
+        });
+        assert_eq!(
+            acc.context_limit,
+            Some(200_000),
+            "None must not clobber a previously known context_limit"
+        );
+
+        // Newer Some replaces older Some (model swap mid-session).
+        acc.accumulate(&TokenUsage {
+            input_tokens: 10,
+            context_limit: Some(128_000),
+            ..Default::default()
+        });
+        assert_eq!(
+            acc.context_limit,
+            Some(128_000),
+            "newer Some must replace older Some (per-turn model swap case)"
+        );
+    }
+
+    #[test]
+    fn token_usage_serde_back_compat_without_context_limit() {
+        // ST7-followup-A: persisted snapshots from before the field was
+        // added must continue to deserialize. `#[serde(default)]` on the
+        // new field is the wire contract.
+        let json = r#"{"input_tokens":10,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0}"#;
+        let u: TokenUsage = serde_json::from_str(json).expect("legacy JSON must parse");
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.context_limit, None);
+    }
 
     #[test]
     fn sub_agent_failure_kind_str_stable() {

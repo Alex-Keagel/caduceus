@@ -176,6 +176,7 @@ impl HeadlessRunner {
             output_tokens: state.token_budget.used_output,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            context_limit: Some(state.token_budget.context_limit),
         };
         HeadlessResult::success(output, &usage)
     }
@@ -641,6 +642,7 @@ mod tests {
             output_tokens: 567,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            context_limit: None,
         };
         let result = HeadlessResult::success("Fixed 3 tests", &usage);
         let json = result.format(OutputFormat::Json).unwrap();
@@ -667,6 +669,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            context_limit: None,
         };
         let result = HeadlessResult::success("All tests pass", &usage);
         let text = result.format(OutputFormat::Text).unwrap();
@@ -680,6 +683,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            context_limit: None,
         };
         let result = HeadlessResult::success("Done", &usage);
         let compact = result.format(OutputFormat::Compact).unwrap();
