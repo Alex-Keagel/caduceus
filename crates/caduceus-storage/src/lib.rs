@@ -3175,19 +3175,6 @@ impl WikiIndex {
             .collect()
     }
 
-    pub fn find_by_query(&self, query: &str) -> Vec<&IndexEntry> {
-        let lower = query.to_lowercase();
-        self.entries
-            .iter()
-            .filter(|e| {
-                e.slug.to_lowercase().contains(&lower)
-                    || e.title.to_lowercase().contains(&lower)
-                    || e.summary.to_lowercase().contains(&lower)
-                    || e.category.to_lowercase().contains(&lower)
-            })
-            .collect()
-    }
-
     /// Render the index as markdown suitable for `index.md`.
     pub fn to_markdown(&self) -> String {
         let mut out = String::from(WIKI_SCHEMA_HEADER);
@@ -3252,24 +3239,10 @@ impl WikiIndex {
         index
     }
 
-    /// Return slugs of pages that have no inbound `[[links]]` in `all_slugs`.
-    pub fn orphan_pages(&self, all_slugs: &[String]) -> Vec<String> {
-        let linked: std::collections::HashSet<String> = self
-            .entries
-            .iter()
-            .flat_map(|_| std::iter::empty::<String>())
-            .collect();
-        // Any slug that appears in all_slugs but has zero inbound links from index entries.
-        // Since the index tracks per-entry link counts but not *which* pages are linked,
-        // we return all slugs that do not appear in any other entry's context.
-        // A simpler correct definition: pages not referenced by any other page's [[links]].
-        // Without page content we flag them all; callers should prefer WikiLinter::find_orphans.
-        all_slugs
-            .iter()
-            .filter(|s| !linked.contains(*s))
-            .cloned()
-            .collect()
-    }
+    // NOTE: `orphan_pages` was removed in Phase C — the implementation was
+    // broken (always returned every slug because the linked-set was built
+    // from an empty iterator). Callers should use [`WikiLinter::find_orphans`],
+    // which has a correct implementation based on actual page content.
 }
 
 fn capitalise(s: &str) -> String {
@@ -3653,7 +3626,6 @@ mod feature_tests_250_255 {
             link_count: 5,
         });
         assert_eq!(index.find_by_category("concept").len(), 1);
-        assert_eq!(index.find_by_query("systems").len(), 1);
         index.remove_entry("rust");
         assert!(index.find_by_category("concept").is_empty());
     }
@@ -3703,23 +3675,6 @@ mod feature_tests_250_255 {
         assert_eq!(e.slug, "alice");
         assert_eq!(e.source_count, 3);
         assert_eq!(e.link_count, 7);
-    }
-
-    #[test]
-    fn wiki_index_orphan_pages() {
-        let mut index = WikiIndex::new();
-        index.add_entry(IndexEntry {
-            slug: "lonely".to_string(),
-            title: "Lonely".to_string(),
-            summary: "".to_string(),
-            category: "entity".to_string(),
-            source_count: 0,
-            link_count: 0,
-        });
-        let all = vec!["lonely".to_string(), "linked".to_string()];
-        // Both are in all_slugs but neither appears in a linked set derived from entries.
-        let orphans = index.orphan_pages(&all);
-        assert!(orphans.contains(&"lonely".to_string()) || orphans.contains(&"linked".to_string()));
     }
 
     // ── #254 WikiLinter ───────────────────────────────────────────────────────
@@ -3785,7 +3740,6 @@ mod feature_tests_250_255 {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].category, LintCategory::StaleContent);
     }
-
 }
 
 // ── Tests for #256-258 ────────────────────────────────────────────────────────
@@ -3794,7 +3748,6 @@ mod feature_tests_250_255 {
 mod feature_tests_256_258 {
     use super::*;
     use std::collections::HashMap;
-
 
     // ── Phase A fix #1: path traversal regression tests ──────────────────
 
@@ -3988,7 +3941,10 @@ mod feature_tests_256_258 {
         );
         let parsed = WikiIndex::from_markdown(&idx.to_markdown());
         assert!(
-            parsed.find_by_query("page-a").len() == 1,
+            parsed
+                .find_by_category("entity")
+                .iter()
+                .any(|e| e.slug == "page-a"),
             "versioned index round-trip lost entry"
         );
     }
