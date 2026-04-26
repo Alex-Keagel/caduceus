@@ -3736,6 +3736,7 @@ impl WikiWatcher {
                 "node_modules".to_string(),
                 ".git".to_string(),
                 "target".to_string(),
+                ".caduceus".to_string(),
             ],
         }
     }
@@ -5514,6 +5515,41 @@ mod feature_tests_256_258 {
         assert!(
             log_after_second.contains("first.rs") && log_after_second.contains("second.rs"),
             "second-cycle log lost first-cycle history: {log_after_second}"
+        );
+    }
+
+    // ── Phase A fix #4: watcher excludes the wiki dir itself ─────────────
+
+    #[test]
+    fn watcher_ignores_caduceus_wiki_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // A normal source file that should be tracked …
+        std::fs::write(dir.path().join("real.rs"), "fn r() {}").unwrap();
+        // … and wiki output that the watcher must NOT see, otherwise an
+        // auto-trigger maintenance write becomes a "file changed" event and
+        // triggers another maintenance cycle, looping forever.
+        std::fs::create_dir_all(dir.path().join(".caduceus/wiki")).unwrap();
+        std::fs::write(
+            dir.path().join(".caduceus/wiki/index.md"),
+            "# Wiki Index\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".caduceus/wiki/whatever.md"),
+            "# whatever\n",
+        )
+        .unwrap();
+
+        let watcher = WikiWatcher::new();
+        let snap = watcher.snapshot_project(dir.path());
+        let keys: Vec<_> = snap.keys().cloned().collect();
+        assert!(
+            keys.iter().any(|k| k.ends_with("real.rs")),
+            "real source missing from snapshot: {keys:?}"
+        );
+        assert!(
+            keys.iter().all(|k| !k.contains(".caduceus")),
+            "wiki dir leaked into snapshot: {keys:?}"
         );
     }
 }
