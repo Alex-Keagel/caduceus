@@ -52,13 +52,13 @@ pub struct AgentHarness {
     max_context_tokens: u32,
     max_turns: usize,
     pub(crate) max_tool_rounds: usize,
-    tool_timeout: std::time::Duration,
+    pub(crate) tool_timeout: std::time::Duration,
     /// G34 / P11.2 — per-tool wall-clock overrides for `tool_timeout`.
     /// When a tool name appears here, its `Duration` is used instead of
     /// the global `tool_timeout`. Lets ops shorten the leash on `bash`
     /// or extend it for known-slow tools (e.g. `index_directory`)
     /// without globally widening the budget.
-    tool_timeout_overrides: std::collections::HashMap<String, std::time::Duration>,
+    pub(crate) tool_timeout_overrides: std::collections::HashMap<String, std::time::Duration>,
     emitter: Option<AgentEventEmitter>,
     instruction_set: Option<instructions::InstructionSet>,
     cancellation_token: Option<CancellationToken>,
@@ -374,7 +374,17 @@ impl AgentHarness {
             max_turns: 100,
             max_tool_rounds: 50,
             tool_timeout: std::time::Duration::from_secs(120),
-            tool_timeout_overrides: std::collections::HashMap::new(),
+            tool_timeout_overrides: {
+                // ST7: spawn_agent gets a 15-minute wall-clock by default
+                // (pre-populated; callers can still override via
+                // `with_tool_timeout_for`). See plan v3.1 §9.
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "spawn_agent".to_string(),
+                    std::time::Duration::from_secs(900),
+                );
+                m
+            },
             emitter: None,
             instruction_set: None,
             cancellation_token: None,
