@@ -3798,7 +3798,6 @@ mod feature_tests_250_255 {
 #[cfg(test)]
 mod feature_tests_256_258 {
     use super::*;
-    use std::collections::HashMap;
 
     // ── Phase A fix #1: path traversal regression tests ──────────────────
 
