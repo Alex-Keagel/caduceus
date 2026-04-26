@@ -2892,12 +2892,19 @@ impl WikiEngine {
     }
 
     /// Absolute path of a page file for the given slug.
-    pub fn page_path(&self, slug: &str) -> PathBuf {
-        self.wiki_dir.join(format!("{slug}.md"))
+    ///
+    /// Returns `Err(Storage)` if the slug is unsafe (path traversal, reserved
+    /// names, control characters). See [`validate_slug`] for the full ruleset.
+    pub fn page_path(&self, slug: &str) -> std::result::Result<PathBuf, CaduceusError> {
+        validate_slug(slug)?;
+        Ok(self.wiki_dir.join(format!("{slug}.md")))
     }
 
     pub fn page_exists(&self, slug: &str) -> bool {
-        self.page_path(slug).exists()
+        match self.page_path(slug) {
+            Ok(p) => p.exists(),
+            Err(_) => false,
+        }
     }
 
     /// List all `.md` pages in the wiki dir, excluding `index.md` and `log.md`.
@@ -2946,17 +2953,33 @@ impl WikiEngine {
     }
 
     pub fn read_page(&self, slug: &str) -> std::result::Result<String, CaduceusError> {
-        let path = self.page_path(slug);
+        let path = self.page_path(slug)?;
+        // Defense-in-depth: refuse to dereference a symlink even if a slug-valid
+        // path was created out-of-band. `symlink_metadata` does not follow links.
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() {
+                return Err(CaduceusError::Storage(format!(
+                    "wiki page {slug:?} is a symlink; refusing to read"
+                )));
+            }
+        }
         fs::read_to_string(&path).map_err(|e| CaduceusError::Storage(e.to_string()))
     }
 
     pub fn write_page(&self, slug: &str, content: &str) -> std::result::Result<(), CaduceusError> {
-        let path = self.page_path(slug);
+        let path = self.page_path(slug)?;
         fs::write(path, content).map_err(|e| CaduceusError::Storage(e.to_string()))
     }
 
     pub fn delete_page(&self, slug: &str) -> std::result::Result<(), CaduceusError> {
-        let path = self.page_path(slug);
+        let path = self.page_path(slug)?;
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() {
+                return Err(CaduceusError::Storage(format!(
+                    "wiki page {slug:?} is a symlink; refusing to delete"
+                )));
+            }
+        }
         fs::remove_file(path).map_err(|e| CaduceusError::Storage(e.to_string()))
     }
 
@@ -2986,6 +3009,57 @@ fn wiki_title_from_content(content: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Validate a wiki slug for safe use as a file name inside `wiki_dir`.
+///
+/// Rejects empty, path separators, parent-dir traversal, hidden / reserved
+/// names, and control characters. This is the primary defence against path
+/// traversal in `WikiEngine::page_path`.
+fn validate_slug(slug: &str) -> std::result::Result<(), CaduceusError> {
+    if slug.is_empty() {
+        return Err(CaduceusError::Storage("wiki slug must not be empty".into()));
+    }
+    if slug == "." || slug == ".." {
+        return Err(CaduceusError::Storage(format!(
+            "wiki slug {slug:?} is reserved"
+        )));
+    }
+    if matches!(slug, "index" | "log") {
+        return Err(CaduceusError::Storage(format!(
+            "wiki slug {slug:?} is reserved (used for wiki metadata)"
+        )));
+    }
+    if slug.starts_with('.') {
+        return Err(CaduceusError::Storage(format!(
+            "wiki slug {slug:?} must not start with '.'"
+        )));
+    }
+    for ch in slug.chars() {
+        match ch {
+            '/' | '\\' | '\0' => {
+                return Err(CaduceusError::Storage(format!(
+                    "wiki slug {slug:?} contains forbidden character {ch:?}"
+                )));
+            }
+            c if c.is_control() => {
+                return Err(CaduceusError::Storage(format!(
+                    "wiki slug {slug:?} contains control character"
+                )));
+            }
+            _ => {}
+        }
+    }
+    // Reject any `..` segment even when wedged between other characters such as
+    // `foo..bar`. Splitting on the path separators above already forbids real
+    // segment traversal; this catches a lone literal `..` that bypassed the
+    // earlier explicit check (e.g. `..` with surrounding whitespace).
+    if slug.split(|c| c == '/' || c == '\\').any(|s| s == "..") {
+        return Err(CaduceusError::Storage(format!(
+            "wiki slug {slug:?} contains parent-directory traversal"
+        )));
+    }
+    Ok(())
 }
 
 /// Extract `[[slug]]` link references from wiki content.
@@ -5241,5 +5315,84 @@ mod feature_tests_256_258 {
         // Second turn: same file, no change → snapshot updated, returns None
         let r2 = trigger.on_agent_turn_complete(dir.path()).unwrap();
         assert!(r2.is_none());
+    }
+
+    // ── Phase A fix #1: path traversal regression tests ──────────────────
+
+    #[test]
+    fn validate_slug_rejects_unsafe_inputs() {
+        // Empty / reserved / hidden / traversal / separator / control.
+        for bad in [
+            "",
+            "..",
+            ".",
+            "index",
+            "log",
+            ".hidden",
+            "../etc/passwd",
+            "..\\windows",
+            "sub/dir",
+            "sub\\dir",
+            "with\0null",
+            "with\nnewline",
+            "with\ttab",
+        ] {
+            assert!(
+                super::validate_slug(bad).is_err(),
+                "validate_slug({bad:?}) should be Err"
+            );
+        }
+        // Sanity: ordinary slugs still accepted.
+        for good in ["foo", "foo-bar", "foo_bar.v2", "café", "a"] {
+            assert!(
+                super::validate_slug(good).is_ok(),
+                "validate_slug({good:?}) should be Ok"
+            );
+        }
+    }
+
+    #[test]
+    fn page_path_blocks_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = WikiEngine::new(dir.path());
+        wiki.init().unwrap();
+
+        // Plant a target file outside the wiki dir.
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, "TOP-SECRET").unwrap();
+
+        // All four entrypoints must refuse the malicious slug.
+        assert!(wiki.read_page("../secret").is_err());
+        assert!(wiki.write_page("../secret", "pwned").is_err());
+        assert!(wiki.delete_page("../secret").is_err());
+        assert!(!wiki.page_exists("../secret"));
+
+        // Outside file is intact and no `../secret.md` was created in wiki_dir
+        // or its parent.
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "TOP-SECRET");
+        assert!(!dir.path().join("secret.md").exists());
+    }
+
+    #[test]
+    fn read_page_rejects_symlink() {
+        // Symlinks may be planted out-of-band (e.g. checked-out repo). Even when
+        // the slug itself is valid, refuse to dereference.
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = WikiEngine::new(dir.path());
+        wiki.init().unwrap();
+
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, "TOP-SECRET").unwrap();
+
+        let link_in_wiki = wiki.wiki_dir().join("trojan.md");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link_in_wiki).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&outside, &link_in_wiki).unwrap();
+
+        let err = wiki.read_page("trojan").expect_err("symlink read must fail");
+        assert!(format!("{err:?}").contains("symlink"));
+        assert!(wiki.delete_page("trojan").is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "TOP-SECRET");
     }
 }
