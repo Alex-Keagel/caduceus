@@ -7,6 +7,7 @@
 //! `#[cfg(test)] mod harness_tests;` in `lib.rs`.
 
 use super::*;
+use crate::agent_harness::SubmitGrantError;
 
 // ── P1b envelope preflight tests ─────────────────────────────────────────
 
@@ -3717,4 +3718,156 @@ async fn default_spawn_agent_timeout_is_900s() {
     );
     // Sanity: generic tool_timeout untouched (still 120s default).
     assert_eq!(harness.tool_timeout, std::time::Duration::from_secs(120));
+}
+
+// ── ST8-PR2 grant plumbing tests ─────────────────────────────────────────
+
+fn mk_plain_harness() -> AgentHarness {
+    use caduceus_providers::mock::MockLlmAdapter;
+    let provider = Arc::new(MockLlmAdapter::new(vec![]));
+    let tools = ToolRegistry::new();
+    AgentHarness::new(provider, tools, 8192, "test")
+}
+
+#[test]
+fn st8_pr2_resume_on_grant_default_off() {
+    let h = mk_plain_harness();
+    assert!(!h.resume_on_grant_enabled);
+    assert_eq!(h.grant_timeout, std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn st8_pr2_with_resume_on_grant_sets_flag() {
+    let h = mk_plain_harness().with_resume_on_grant(true);
+    assert!(h.resume_on_grant_enabled);
+}
+
+#[test]
+fn st8_pr2_with_grant_timeout_overrides_default() {
+    let h = mk_plain_harness().with_grant_timeout(std::time::Duration::from_millis(123));
+    assert_eq!(h.grant_timeout, std::time::Duration::from_millis(123));
+}
+
+#[tokio::test]
+async fn st8_pr2_submit_grant_no_pending_returns_no_such_pending() {
+    let h = mk_plain_harness().with_resume_on_grant(true);
+    let outcome = caduceus_permissions::GrantOutcome::Timeout;
+    let err = h.submit_grant("missing-id", outcome).await.unwrap_err();
+    assert_eq!(err, SubmitGrantError::NoSuchPending);
+}
+
+#[tokio::test]
+async fn st8_pr2_submit_grant_routes_to_registered_oneshot() {
+    let h = mk_plain_harness().with_resume_on_grant(true);
+    let (tx, rx) = tokio::sync::oneshot::channel::<caduceus_permissions::GrantOutcome>();
+    {
+        let mut map = h.pending_grants.lock().await;
+        map.insert("call-1".into(), tx);
+    }
+    let env = caduceus_permissions::PermissionEnvelope::act_preset(
+        vec!["src/**".into()],
+        vec!["src/foo.txt".into()],
+    );
+    h.submit_grant(
+        "call-1",
+        caduceus_permissions::GrantOutcome::Granted {
+            updated: env.clone(),
+        },
+    )
+    .await
+    .expect("submit ok");
+    let received = rx.await.expect("rx ok");
+    match received {
+        caduceus_permissions::GrantOutcome::Granted { updated } => {
+            assert_eq!(updated.write.allow, env.write.allow);
+        }
+        other => panic!("expected Granted, got {other:?}"),
+    }
+    // Map must be drained on success.
+    assert!(h.pending_grants.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn st8_pr2_submit_grant_returns_receiver_dropped_if_rx_gone() {
+    let h = mk_plain_harness().with_resume_on_grant(true);
+    let (tx, rx) = tokio::sync::oneshot::channel::<caduceus_permissions::GrantOutcome>();
+    {
+        let mut map = h.pending_grants.lock().await;
+        map.insert("call-2".into(), tx);
+    }
+    drop(rx);
+    let err = h
+        .submit_grant("call-2", caduceus_permissions::GrantOutcome::Timeout)
+        .await
+        .unwrap_err();
+    assert_eq!(err, SubmitGrantError::ReceiverDropped);
+}
+
+#[tokio::test]
+async fn st8_pr2_submit_grant_idempotent_second_call_no_pending() {
+    let h = mk_plain_harness().with_resume_on_grant(true);
+    let (tx, _rx) = tokio::sync::oneshot::channel::<caduceus_permissions::GrantOutcome>();
+    {
+        let mut map = h.pending_grants.lock().await;
+        map.insert("call-3".into(), tx);
+    }
+    h.submit_grant("call-3", caduceus_permissions::GrantOutcome::Timeout)
+        .await
+        .expect("first submit ok");
+    let err = h
+        .submit_grant("call-3", caduceus_permissions::GrantOutcome::Timeout)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        SubmitGrantError::NoSuchPending,
+        "second submit must report NoSuchPending — first call drained the entry"
+    );
+}
+
+#[tokio::test]
+async fn st8_pr2_submit_grant_routes_denied_outcome() {
+    let h = mk_plain_harness().with_resume_on_grant(true);
+    let (tx, rx) = tokio::sync::oneshot::channel::<caduceus_permissions::GrantOutcome>();
+    {
+        let mut map = h.pending_grants.lock().await;
+        map.insert("call-d".into(), tx);
+    }
+    h.submit_grant(
+        "call-d",
+        caduceus_permissions::GrantOutcome::Denied {
+            reason: "user clicked deny".into(),
+        },
+    )
+    .await
+    .expect("submit ok");
+    match rx.await.expect("rx ok") {
+        caduceus_permissions::GrantOutcome::Denied { reason } => {
+            assert_eq!(reason, "user clicked deny");
+        }
+        other => panic!("expected Denied, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn st8_pr2_submit_grant_routes_timeout_outcome() {
+    let h = mk_plain_harness().with_resume_on_grant(true);
+    let (tx, rx) = tokio::sync::oneshot::channel::<caduceus_permissions::GrantOutcome>();
+    {
+        let mut map = h.pending_grants.lock().await;
+        map.insert("call-t".into(), tx);
+    }
+    h.submit_grant("call-t", caduceus_permissions::GrantOutcome::Timeout)
+        .await
+        .expect("submit ok");
+    assert!(matches!(
+        rx.await.expect("rx ok"),
+        caduceus_permissions::GrantOutcome::Timeout
+    ));
+}
+
+#[tokio::test]
+async fn st8_pr2_pending_grants_starts_empty() {
+    let h = mk_plain_harness();
+    assert!(h.pending_grants.lock().await.is_empty());
 }
