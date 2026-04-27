@@ -10,10 +10,14 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod envelope;
+pub mod grant;
 pub use envelope::{
     ApprovalCadence, Decision, DenyReason, EnvelopeScope, ExecPolicy, ExpansionCapability,
     ExpansionDelta, FanoutPolicy, NetworkPolicy, PathAllowlist, PermissionEnvelope,
     PermissionEvent,
+};
+pub use grant::{
+    validate_widening, DefaultEnvelopeMutator, EnvelopeMutator, GrantOutcome, GrantValidationError,
 };
 
 // ── Capabilities ───────────────────────────────────────────────────────────────
