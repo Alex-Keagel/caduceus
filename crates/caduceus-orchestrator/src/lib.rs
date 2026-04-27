@@ -79,7 +79,7 @@ pub use agent_event_emitter::{
 mod agent_harness;
 pub use agent_harness::{
     execute_tool_calls, extract_memories, preflight_envelope_of, AgentHarness, PreflightOutcome,
-    TestGateConfig, TestGateOutcome,
+    SubmitGrantError, TestGateConfig, TestGateOutcome,
 };
 #[cfg(test)]
 pub(crate) use agent_harness::{extract_host, tail_chars};
