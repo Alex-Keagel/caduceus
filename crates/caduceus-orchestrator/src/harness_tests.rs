@@ -7,7 +7,21 @@
 //! `#[cfg(test)] mod harness_tests;` in `lib.rs`.
 
 use super::*;
-use crate::agent_harness::SubmitGrantError;
+use crate::agent_harness::{PendingGrantEntry, SubmitGrantError, SubmitGrantWideningError};
+
+/// Test helper — wrap a raw oneshot tx in a [`PendingGrantEntry`] with
+/// placeholder capability/resource. Existing routing tests don't exercise
+/// the widening path; the `submit_grant_widening` tests below construct
+/// entries with realistic values explicitly.
+fn entry(
+    tx: tokio::sync::oneshot::Sender<caduceus_permissions::GrantOutcome>,
+) -> PendingGrantEntry {
+    PendingGrantEntry {
+        tx,
+        capability: "read".into(),
+        resource: "/test".into(),
+    }
+}
 
 // ── P1b envelope preflight tests ─────────────────────────────────────────
 
@@ -3762,7 +3776,7 @@ async fn st8_pr2_submit_grant_routes_to_registered_oneshot() {
     let (tx, rx) = tokio::sync::oneshot::channel::<caduceus_permissions::GrantOutcome>();
     {
         let mut map = h.pending_grants.lock().await;
-        map.insert("call-1".into(), tx);
+        map.insert("call-1".into(), entry(tx));
     }
     let env = caduceus_permissions::PermissionEnvelope::act_preset(
         vec!["src/**".into()],
@@ -3793,7 +3807,7 @@ async fn st8_pr2_submit_grant_returns_receiver_dropped_if_rx_gone() {
     let (tx, rx) = tokio::sync::oneshot::channel::<caduceus_permissions::GrantOutcome>();
     {
         let mut map = h.pending_grants.lock().await;
-        map.insert("call-2".into(), tx);
+        map.insert("call-2".into(), entry(tx));
     }
     drop(rx);
     let err = h
@@ -3809,7 +3823,7 @@ async fn st8_pr2_submit_grant_idempotent_second_call_no_pending() {
     let (tx, _rx) = tokio::sync::oneshot::channel::<caduceus_permissions::GrantOutcome>();
     {
         let mut map = h.pending_grants.lock().await;
-        map.insert("call-3".into(), tx);
+        map.insert("call-3".into(), entry(tx));
     }
     h.submit_grant("call-3", caduceus_permissions::GrantOutcome::Timeout)
         .await
@@ -3831,7 +3845,7 @@ async fn st8_pr2_submit_grant_routes_denied_outcome() {
     let (tx, rx) = tokio::sync::oneshot::channel::<caduceus_permissions::GrantOutcome>();
     {
         let mut map = h.pending_grants.lock().await;
-        map.insert("call-d".into(), tx);
+        map.insert("call-d".into(), entry(tx));
     }
     h.submit_grant(
         "call-d",
@@ -3855,7 +3869,7 @@ async fn st8_pr2_submit_grant_routes_timeout_outcome() {
     let (tx, rx) = tokio::sync::oneshot::channel::<caduceus_permissions::GrantOutcome>();
     {
         let mut map = h.pending_grants.lock().await;
-        map.insert("call-t".into(), tx);
+        map.insert("call-t".into(), entry(tx));
     }
     h.submit_grant("call-t", caduceus_permissions::GrantOutcome::Timeout)
         .await
@@ -3870,4 +3884,139 @@ async fn st8_pr2_submit_grant_routes_timeout_outcome() {
 async fn st8_pr2_pending_grants_starts_empty() {
     let h = mk_plain_harness();
     assert!(h.pending_grants.lock().await.is_empty());
+}
+
+// ── ST8 PR-3D — submit_grant_widening tests ─────────────────────────────
+
+/// Test helper — populate `pending_grants` with a custom entry. Distinct
+/// from `entry()` (which uses placeholder capability/resource) because the
+/// widening path's behaviour depends on the exact stored values.
+async fn insert_entry(
+    h: &AgentHarness,
+    id: &str,
+    tx: tokio::sync::oneshot::Sender<caduceus_permissions::GrantOutcome>,
+    capability: &str,
+    resource: &str,
+) {
+    let mut map = h.pending_grants.lock().await;
+    map.insert(
+        id.into(),
+        PendingGrantEntry {
+            tx,
+            capability: capability.into(),
+            resource: resource.into(),
+        },
+    );
+}
+
+#[tokio::test]
+async fn st8_pr3d_widening_constructs_granted_outcome() {
+    let env = caduceus_permissions::PermissionEnvelope::act_preset(vec!["src/**".into()], vec![]);
+    let h = mk_plain_harness()
+        .with_resume_on_grant(true)
+        .with_permission_envelope(env);
+    let (tx, rx) = tokio::sync::oneshot::channel::<caduceus_permissions::GrantOutcome>();
+    insert_entry(&h, "call-w1", tx, "write", "docs/**").await;
+
+    h.submit_grant_widening("call-w1").await.expect("submit ok");
+
+    match rx.await.expect("rx ok") {
+        caduceus_permissions::GrantOutcome::Granted { updated } => {
+            assert!(
+                updated.write.allow.contains(&"docs/**".to_string()),
+                "widened envelope must include the granted resource"
+            );
+            assert!(
+                updated.write.allow.contains(&"src/**".to_string()),
+                "widened envelope must preserve prior allow entries"
+            );
+        }
+        other => panic!("expected Granted, got {other:?}"),
+    }
+    assert!(
+        h.pending_grants.lock().await.is_empty(),
+        "entry must be drained on success"
+    );
+}
+
+#[tokio::test]
+async fn st8_pr3d_widening_no_pending_returns_error() {
+    let h = mk_plain_harness()
+        .with_resume_on_grant(true)
+        .with_permission_envelope(caduceus_permissions::PermissionEnvelope::plan_preset());
+    let err = h
+        .submit_grant_widening("never-registered")
+        .await
+        .unwrap_err();
+    assert_eq!(err, SubmitGrantWideningError::NoSuchPending);
+}
+
+#[tokio::test]
+async fn st8_pr3d_widening_no_envelope_returns_error_and_does_not_drop_receiver() {
+    // No envelope configured. The widening path must reject before
+    // touching the tx — so the deny task can still observe the timeout
+    // path normally rather than seeing a spurious ReceiverDropped.
+    let h = mk_plain_harness().with_resume_on_grant(true);
+    let (tx, rx) = tokio::sync::oneshot::channel::<caduceus_permissions::GrantOutcome>();
+    insert_entry(&h, "call-noenv", tx, "read", "/etc/foo").await;
+
+    let err = h.submit_grant_widening("call-noenv").await.unwrap_err();
+    assert_eq!(err, SubmitGrantWideningError::NoActiveEnvelope);
+    // rx is still alive — sender was consumed by the map.remove but never
+    // sent on. The receiver observes a Canceled (sender dropped), which
+    // the deny task treats as timeout. This is the documented contract.
+    drop(rx);
+}
+
+#[tokio::test]
+async fn st8_pr3d_widening_unknown_capability_returns_error() {
+    let h = mk_plain_harness()
+        .with_resume_on_grant(true)
+        .with_permission_envelope(caduceus_permissions::PermissionEnvelope::plan_preset());
+    let (tx, _rx) = tokio::sync::oneshot::channel::<caduceus_permissions::GrantOutcome>();
+    insert_entry(&h, "call-bad", tx, "telepathy", "neighbor").await;
+
+    let err = h.submit_grant_widening("call-bad").await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SubmitGrantWideningError::Proposal(
+                caduceus_permissions::WidenProposalError::UnknownCapability { .. }
+            )
+        ),
+        "got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn st8_pr3d_widening_returns_receiver_dropped_when_rx_gone() {
+    let h = mk_plain_harness()
+        .with_resume_on_grant(true)
+        .with_permission_envelope(caduceus_permissions::PermissionEnvelope::act_preset(
+            vec!["src/**".into()],
+            vec![],
+        ));
+    let (tx, rx) = tokio::sync::oneshot::channel::<caduceus_permissions::GrantOutcome>();
+    insert_entry(&h, "call-drop", tx, "write", "docs/**").await;
+    drop(rx);
+
+    let err = h.submit_grant_widening("call-drop").await.unwrap_err();
+    assert_eq!(err, SubmitGrantWideningError::ReceiverDropped);
+}
+
+#[tokio::test]
+async fn st8_pr3d_widening_drains_entry_even_on_error() {
+    // NoSuchPending and the success path both drain. NoActiveEnvelope and
+    // Proposal errors take the entry out of the map at the lock site too —
+    // we don't want a stuck entry blocking future submits for the same id.
+    let h = mk_plain_harness().with_resume_on_grant(true);
+    let (tx, _rx) = tokio::sync::oneshot::channel::<caduceus_permissions::GrantOutcome>();
+    insert_entry(&h, "call-stuck", tx, "read", "/x").await;
+
+    // No envelope → error, but the entry must still be drained.
+    let _ = h.submit_grant_widening("call-stuck").await;
+    assert!(
+        h.pending_grants.lock().await.is_empty(),
+        "entry must be drained on error so a retry sees NoSuchPending, not double-fire"
+    );
 }
