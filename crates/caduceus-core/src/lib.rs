@@ -1324,6 +1324,29 @@ pub enum AgentEvent {
         to_lens: Option<String>,
     },
 
+    /// ST8-PR2 — emitted alongside [`AgentEvent::ScopeExpansionRequested`]
+    /// when the harness is configured with `resume_on_grant` enabled. Tells
+    /// the UI that the deny path is *paused* for up to `deadline_ms` waiting
+    /// for the orchestrator to deliver a [`caduceus_permissions::GrantOutcome`]
+    /// via `AgentHarness::submit_grant(tool_use_id, outcome)`.
+    ///
+    /// Routing key is `tool_use_id` — the same id the bridge passes back to
+    /// `submit_grant`. UIs typically render this as a countdown picker
+    /// ("Approve / Deny / wait Ns").
+    GrantPending {
+        tool_use_id: String,
+        deadline_ms: u64,
+    },
+    /// ST8-PR2 — terminal outcome of a pending grant. `outcome` is a stable
+    /// short string for telemetry/UI: `"granted"`, `"denied"`, `"timeout"`,
+    /// or `"rejected:<reason>"` (over-grant defense rejected the granted
+    /// envelope as not a monotonic widening, or as not actually covering
+    /// the originally-denied capability/resource).
+    GrantResolved {
+        tool_use_id: String,
+        outcome: String,
+    },
+
     /// P13 — versioned introspection surface. All envelope/assignment/edge
     /// events ship inside here so schema churn doesn't mint new top-level
     /// variants. Older clients see this under [`AgentEvent::Unknown`].

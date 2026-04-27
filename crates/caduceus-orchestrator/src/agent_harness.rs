@@ -192,6 +192,37 @@ pub struct AgentHarness {
     /// `None` disables envelope enforcement — existing behaviour preserved
     /// for backwards compatibility.
     permission_envelope: Option<PermissionEnvelope>,
+    /// ST8-PR2 — pause-before-deny-commit feature flag. When `true` AND a
+    /// PermissionEnvelope is set AND the deny path fires, the harness will
+    /// emit `GrantPending` and wait up to `grant_timeout` for the orchestrator
+    /// to deliver a [`caduceus_permissions::GrantOutcome`] via
+    /// [`AgentHarness::submit_grant`]. On a successful grant whose updated
+    /// envelope (a) only widens (`validate_widening` passes) and (b) actually
+    /// allows the originally-denied (capability, resource), the original tool
+    /// call is dispatched. Otherwise the deny commits as before.
+    ///
+    /// Default `false` — preserves byte-for-byte behaviour for callers that
+    /// don't opt in.
+    pub(crate) resume_on_grant_enabled: bool,
+    /// ST8-PR2 — wall-clock the harness will wait for a grant before
+    /// committing the deny. Defaults to 5s.
+    pub(crate) grant_timeout: std::time::Duration,
+    /// ST8-PR2 — registry of in-flight pending grants, keyed by tool_use_id.
+    /// Each entry's `oneshot::Sender` is consumed by
+    /// [`AgentHarness::submit_grant`]. The receiver lives on the spawned
+    /// deny task; on drop (sender side) the receiver returns
+    /// `Err(RecvError)` which the deny task treats as "timeout", closing
+    /// the deny commit. The map entry is removed by the deny task on
+    /// completion (success or otherwise) so stale entries don't accumulate.
+    #[allow(clippy::type_complexity)]
+    pub(crate) pending_grants: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                tokio::sync::oneshot::Sender<caduceus_permissions::GrantOutcome>,
+            >,
+        >,
+    >,
     /// P13 / ST-B1 — optional introspection sink. When set, fan-out call
     /// sites that use [`AgentHarness::introspection_sink`] route all 8
     /// `IntrospectionEventV1` variants through this sink so the IDE's
@@ -412,6 +443,9 @@ impl AgentHarness {
             self_consistency_n: 1,
             request_logprobs: false,
             permission_envelope: None,
+            resume_on_grant_enabled: false,
+            grant_timeout: std::time::Duration::from_secs(5),
+            pending_grants: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             introspection_sink: None,
             context_injector: None,
             thread_id: None,
@@ -758,6 +792,49 @@ impl AgentHarness {
     /// Current envelope (if any).
     pub fn permission_envelope(&self) -> Option<&PermissionEnvelope> {
         self.permission_envelope.as_ref()
+    }
+
+    /// ST8-PR2 — opt into pause-before-deny-commit semantics. When enabled,
+    /// the deny path will pause for up to `grant_timeout` waiting for a grant
+    /// before committing the deny. See [`AgentHarness::submit_grant`].
+    ///
+    /// Default `false`.
+    pub fn with_resume_on_grant(mut self, enabled: bool) -> Self {
+        self.resume_on_grant_enabled = enabled;
+        self
+    }
+
+    /// ST8-PR2 — override the default 5s grant-arrival timeout.
+    pub fn with_grant_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.grant_timeout = timeout;
+        self
+    }
+
+    /// ST8-PR2 — deliver a grant outcome for a `tool_use_id` that was
+    /// previously surfaced via [`AgentEvent::GrantPending`].
+    ///
+    /// Returns `Ok(())` if the grant was routed to a waiting deny task,
+    /// `Err(SubmitGrantError::NoSuchPending)` if no pending grant exists for
+    /// that id (e.g. the wait already timed out and the entry was reaped, or
+    /// the bridge submitted a stale/wrong id),
+    /// `Err(SubmitGrantError::ReceiverDropped)` if the receiver-side task
+    /// dropped before consuming the outcome (the deny will have been
+    /// committed already).
+    pub async fn submit_grant(
+        &self,
+        tool_use_id: &str,
+        outcome: caduceus_permissions::GrantOutcome,
+    ) -> std::result::Result<(), SubmitGrantError> {
+        let sender = {
+            let mut map = self.pending_grants.lock().await;
+            map.remove(tool_use_id)
+        };
+        match sender {
+            Some(tx) => tx
+                .send(outcome)
+                .map_err(|_| SubmitGrantError::ReceiverDropped),
+            None => Err(SubmitGrantError::NoSuchPending),
+        }
     }
 
     /// ST-B1 / contract `harness-sink-v1` — install an introspection sink.
@@ -2562,7 +2639,7 @@ impl AgentHarness {
                     }
                     let mut join_set = tokio::task::JoinSet::new();
                     let cancel_token_for_tools = self.cancellation_token.clone();
-                    for (idx, (_id, name, input, skip)) in tool_tasks.iter().enumerate() {
+                    for (idx, (tool_use_id, name, input, skip)) in tool_tasks.iter().enumerate() {
                         if skip.is_some() {
                             continue;
                         }
@@ -2600,18 +2677,368 @@ impl AgentHarness {
                             } => {
                                 if let Some(ref em) = self.emitter {
                                     em.emit(AgentEvent::ScopeExpansionRequested {
-                                        capability,
-                                        resource,
-                                        reason,
+                                        capability: capability.clone(),
+                                        resource: resource.clone(),
+                                        reason: reason.clone(),
                                         tool: name.clone(),
                                     })
                                     .await;
                                 }
                                 let name_owned = name.clone();
+                                let input_owned = input.clone();
                                 let timeout = overrides
                                     .get(&name_owned)
                                     .copied()
                                     .unwrap_or(global_timeout);
+
+                                // ST8-PR2 — pause-before-deny-commit branch.
+                                // When the harness is opted in via
+                                // `with_resume_on_grant(true)` we register a
+                                // oneshot in `pending_grants`, emit
+                                // `GrantPending`, and spawn a task that waits
+                                // up to `grant_timeout` for the orchestrator
+                                // to deliver a [`GrantOutcome`]. On a successful
+                                // grant we (a) re-validate via
+                                // `validate_widening` (envelope only widens) and
+                                // (b) re-validate via `preflight_envelope_of`
+                                // against the granted envelope (the grant
+                                // actually covers the originally-denied
+                                // capability/resource). Both checks are the
+                                // over-grant defense flagged by rubber-duck on
+                                // PR-1: a grant that widens *some* axis but
+                                // not the requested one is rejected as
+                                // `rejected:over-grant-no-coverage`.
+                                if self.resume_on_grant_enabled {
+                                    let tool_use_id_str = tool_use_id.clone();
+                                    // Rubber-duck IMPORTANT #3 — `tool_use_id`
+                                    // collisions across denies in the same
+                                    // turn would let the first task's reap
+                                    // delete the second's sender, misrouting
+                                    // the grant. Fail fast: if an entry
+                                    // already exists, log and synth-deny the
+                                    // *new* call without registering. The
+                                    // existing pending grant remains intact.
+                                    let collision = {
+                                        let map = self.pending_grants.lock().await;
+                                        map.contains_key(&tool_use_id_str)
+                                    };
+                                    if collision {
+                                        tracing::warn!(
+                                            target: "caduceus.grant",
+                                            tool_use_id = %tool_use_id_str,
+                                            "duplicate tool_use_id while a grant is already pending; not registering — synth-deny the colliding call"
+                                        );
+                                        let synth = caduceus_core::ToolResult::error(format!(
+                                            "{content} (concurrent grant in progress for the same tool_use_id; not waiting)"
+                                        ));
+                                        join_set.spawn(async move {
+                                            (
+                                                idx,
+                                                name_owned,
+                                                timeout,
+                                                ToolSpawnOutcome::Completed(Ok(synth)),
+                                                std::time::Duration::ZERO,
+                                            )
+                                        });
+                                        continue;
+                                    }
+
+                                    // Rubber-duck NICE #6 — defense-in-depth.
+                                    // `preflight_envelope` returns Allow when
+                                    // no envelope is set, so reaching the
+                                    // Deny branch implies `prev_env.is_some()`.
+                                    debug_assert!(
+                                        self.permission_envelope.is_some(),
+                                        "Deny branch unreachable without an active envelope"
+                                    );
+                                    let prev_env = self.permission_envelope.clone();
+                                    let pending_grants = self.pending_grants.clone();
+                                    let grant_timeout = self.grant_timeout;
+                                    let emitter = self.emitter.clone();
+                                    let tools = self.tools.clone_registry();
+                                    let cancel_token = cancel_token_for_tools.clone();
+                                    let synth_deny_content = content.clone();
+
+                                    let (tx, rx) = tokio::sync::oneshot::channel::<
+                                        caduceus_permissions::GrantOutcome,
+                                    >();
+                                    {
+                                        let mut map = pending_grants.lock().await;
+                                        map.insert(tool_use_id_str.clone(), tx);
+                                    }
+
+                                    let deadline_ms =
+                                        grant_timeout.as_millis().min(u64::MAX as u128) as u64;
+                                    if let Some(ref em) = self.emitter {
+                                        em.emit(AgentEvent::GrantPending {
+                                            tool_use_id: tool_use_id_str.clone(),
+                                            deadline_ms,
+                                        })
+                                        .await;
+                                    }
+
+                                    join_set.spawn(async move {
+                                        let started = std::time::Instant::now();
+                                        // Rubber-duck IMPORTANT #4 — race the
+                                        // grant against cancel. Without this,
+                                        // a cancelled run waits the full
+                                        // grant_timeout before draining.
+                                        let recv_result = if let Some(token) = cancel_token.as_ref()
+                                        {
+                                            let token = token.clone();
+                                            tokio::select! {
+                                                biased;
+                                                res = tokio::time::timeout(grant_timeout, rx) => Some(res),
+                                                _ = async {
+                                                    loop {
+                                                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                                        if token.is_cancelled() { break; }
+                                                    }
+                                                } => None,
+                                            }
+                                        } else {
+                                            Some(tokio::time::timeout(grant_timeout, rx).await)
+                                        };
+
+                                        // Always reap the pending entry —
+                                        // submit_grant already removes on the
+                                        // happy path, but on timeout / dropped
+                                        // sender / cancel / over-grant
+                                        // rejection we still want the map
+                                        // clean.
+                                        {
+                                            let mut map = pending_grants.lock().await;
+                                            map.remove(&tool_use_id_str);
+                                        }
+
+                                        let synth_error = |s: &str| {
+                                            ToolSpawnOutcome::Completed(Ok(
+                                                caduceus_core::ToolResult::error(s),
+                                            ))
+                                        };
+
+                                        let recv_result = match recv_result {
+                                            Some(r) => r,
+                                            None => {
+                                                if let Some(ref em) = emitter {
+                                                    em.emit(AgentEvent::GrantResolved {
+                                                        tool_use_id: tool_use_id_str.clone(),
+                                                        outcome: "cancelled".into(),
+                                                    })
+                                                    .await;
+                                                }
+                                                return (
+                                                    idx,
+                                                    name_owned,
+                                                    timeout,
+                                                    ToolSpawnOutcome::Cancelled,
+                                                    started.elapsed(),
+                                                );
+                                            }
+                                        };
+
+                                        match recv_result {
+                                            Ok(Ok(caduceus_permissions::GrantOutcome::Granted {
+                                                updated: granted_env,
+                                            })) => {
+                                                let widening_ok = match prev_env.as_ref() {
+                                                    Some(prev) => {
+                                                        caduceus_permissions::validate_widening(
+                                                            prev,
+                                                            &granted_env,
+                                                        )
+                                                        .is_ok()
+                                                    }
+                                                    None => true,
+                                                };
+                                                // Rubber-duck CRITICAL #1 —
+                                                // explicitly branch on the
+                                                // recheck outcome. Treating
+                                                // `Intercept` as "execute" is
+                                                // a real-write/exec bypass for
+                                                // grants that flip the envelope
+                                                // to a plan-style preset. We
+                                                // honour the simulation here
+                                                // exactly as the normal
+                                                // preflight path would.
+                                                let recheck = preflight_envelope_of(
+                                                    &granted_env,
+                                                    &name_owned,
+                                                    &input_owned,
+                                                );
+                                                if !widening_ok {
+                                                    if let Some(ref em) = emitter {
+                                                        em.emit(AgentEvent::GrantResolved {
+                                                            tool_use_id: tool_use_id_str.clone(),
+                                                            outcome:
+                                                                "rejected:not-monotonic-widening"
+                                                                    .into(),
+                                                        })
+                                                        .await;
+                                                    }
+                                                    return (
+                                                        idx,
+                                                        name_owned,
+                                                        timeout,
+                                                        synth_error(&format!(
+                                                            "{synth_deny_content} (grant rejected: granted envelope is not a monotonic widening of the active envelope)"
+                                                        )),
+                                                        started.elapsed(),
+                                                    );
+                                                }
+                                                match recheck {
+                                                    PreflightOutcome::Deny { .. } => {
+                                                        if let Some(ref em) = emitter {
+                                                            em.emit(AgentEvent::GrantResolved {
+                                                                tool_use_id: tool_use_id_str.clone(),
+                                                                outcome:
+                                                                    "rejected:over-grant-no-coverage"
+                                                                        .into(),
+                                                            })
+                                                            .await;
+                                                        }
+                                                        return (
+                                                            idx,
+                                                            name_owned,
+                                                            timeout,
+                                                            synth_error(&format!(
+                                                                "{synth_deny_content} (grant rejected: granted envelope does not cover the originally-denied action)"
+                                                            )),
+                                                            started.elapsed(),
+                                                        );
+                                                    }
+                                                    PreflightOutcome::Intercept(sim_content) => {
+                                                        if let Some(ref em) = emitter {
+                                                            em.emit(AgentEvent::GrantResolved {
+                                                                tool_use_id: tool_use_id_str.clone(),
+                                                                outcome: "granted:simulated".into(),
+                                                            })
+                                                            .await;
+                                                        }
+                                                        // Granted envelope is
+                                                        // plan-style — return a
+                                                        // simulated-success
+                                                        // result without
+                                                        // actually invoking
+                                                        // the tool.
+                                                        return (
+                                                            idx,
+                                                            name_owned,
+                                                            timeout,
+                                                            ToolSpawnOutcome::Completed(Ok(
+                                                                caduceus_core::ToolResult::success(
+                                                                    &sim_content,
+                                                                ),
+                                                            )),
+                                                            started.elapsed(),
+                                                        );
+                                                    }
+                                                    PreflightOutcome::Allow => { /* fall through to dispatch */
+                                                    }
+                                                }
+                                                if let Some(ref em) = emitter {
+                                                    em.emit(AgentEvent::GrantResolved {
+                                                        tool_use_id: tool_use_id_str.clone(),
+                                                        outcome: "granted".into(),
+                                                    })
+                                                    .await;
+                                                }
+                                                // Dispatch the originally-denied
+                                                // tool call now that the grant is
+                                                // verified. Mirrors the normal
+                                                // path's timeout/cancel race so
+                                                // resumed calls obey the same
+                                                // budget bookkeeping.
+                                                let exec_outcome = if let Some(token) =
+                                                    cancel_token.as_ref()
+                                                {
+                                                    if token.is_cancelled() {
+                                                        ToolSpawnOutcome::Cancelled
+                                                    } else {
+                                                        let token = token.clone();
+                                                        tokio::select! {
+                                                            biased;
+                                                            res = tokio::time::timeout(timeout, tools.execute(&name_owned, input_owned)) => {
+                                                                match res {
+                                                                    Ok(r) => ToolSpawnOutcome::Completed(r),
+                                                                    Err(_) => ToolSpawnOutcome::TimedOut,
+                                                                }
+                                                            }
+                                                            _ = async {
+                                                                loop {
+                                                                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                                                    if token.is_cancelled() { break; }
+                                                                }
+                                                            } => ToolSpawnOutcome::Cancelled,
+                                                        }
+                                                    }
+                                                } else {
+                                                    match tokio::time::timeout(
+                                                        timeout,
+                                                        tools.execute(&name_owned, input_owned),
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(r) => ToolSpawnOutcome::Completed(r),
+                                                        Err(_) => ToolSpawnOutcome::TimedOut,
+                                                    }
+                                                };
+                                                (
+                                                    idx,
+                                                    name_owned,
+                                                    timeout,
+                                                    exec_outcome,
+                                                    started.elapsed(),
+                                                )
+                                            }
+                                            Ok(Ok(caduceus_permissions::GrantOutcome::Denied {
+                                                reason,
+                                            })) => {
+                                                if let Some(ref em) = emitter {
+                                                    em.emit(AgentEvent::GrantResolved {
+                                                        tool_use_id: tool_use_id_str.clone(),
+                                                        outcome: "denied".into(),
+                                                    })
+                                                    .await;
+                                                }
+                                                (
+                                                    idx,
+                                                    name_owned,
+                                                    timeout,
+                                                    synth_error(&format!(
+                                                        "{synth_deny_content} (grant denied: {reason})"
+                                                    )),
+                                                    started.elapsed(),
+                                                )
+                                            }
+                                            Ok(Ok(caduceus_permissions::GrantOutcome::Timeout))
+                                            | Ok(Err(_))
+                                            | Err(_) => {
+                                                // Explicit Timeout, sender
+                                                // dropped, or wall-clock
+                                                // expired → commit the deny.
+                                                if let Some(ref em) = emitter {
+                                                    em.emit(AgentEvent::GrantResolved {
+                                                        tool_use_id: tool_use_id_str.clone(),
+                                                        outcome: "timeout".into(),
+                                                    })
+                                                    .await;
+                                                }
+                                                (
+                                                    idx,
+                                                    name_owned,
+                                                    timeout,
+                                                    synth_error(&synth_deny_content),
+                                                    started.elapsed(),
+                                                )
+                                            }
+                                        }
+                                    });
+                                    continue;
+                                }
+
+                                // Flag off → preserve historical behaviour:
+                                // commit the synth deny error immediately.
                                 let synth = caduceus_core::ToolResult::error(&content);
                                 join_set.spawn(async move {
                                     (
@@ -3487,6 +3914,31 @@ pub async fn execute_tool_calls(
 }
 
 // ── P1b: envelope preflight helpers ───────────────────────────────────────────
+
+/// ST8-PR2 — error type for [`AgentHarness::submit_grant`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitGrantError {
+    /// No pending grant for this `tool_use_id`. Either the id was never
+    /// registered (typo / wrong id) or the wait already timed out and the
+    /// entry was reaped.
+    NoSuchPending,
+    /// The receiving deny-task dropped before consuming the outcome — the
+    /// deny has already been committed.
+    ReceiverDropped,
+}
+
+impl std::fmt::Display for SubmitGrantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubmitGrantError::NoSuchPending => f.write_str("no pending grant for this tool_use_id"),
+            SubmitGrantError::ReceiverDropped => {
+                f.write_str("grant receiver dropped before outcome was consumed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SubmitGrantError {}
 
 /// Outcome of [`AgentHarness::preflight_envelope`].
 #[derive(Debug, Clone)]
