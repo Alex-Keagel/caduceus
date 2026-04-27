@@ -97,22 +97,17 @@ pub use scoped_context::{
 };
 
 #[cfg(test)]
-use caduceus_core::{
-    AgentEvent, CancellationToken, ModelId, PermissionOutcome, SessionPhase, SessionState,
-    StopReason, TokenUsage, WarningLevel,
-};
+use caduceus_core::{AgentEvent, CancellationToken, ModelId, SessionPhase, StopReason};
 use caduceus_core::{CaduceusError, Result};
 #[cfg(test)]
-use caduceus_permissions::envelope::{
-    Decision, DenyReason, ExpansionCapability, PermissionEnvelope,
-};
+use caduceus_permissions::envelope::PermissionEnvelope;
 #[cfg(test)]
-use caduceus_providers::{ChatRequest, LlmAdapter};
+use caduceus_providers::LlmAdapter;
 #[cfg(test)]
 use caduceus_tools::ToolRegistry;
 use std::sync::Arc;
 #[cfg(test)]
-use std::time::{Duration, Instant};
+use std::time::Duration;
 #[cfg(test)]
 use tokio::sync::mpsc;
 
