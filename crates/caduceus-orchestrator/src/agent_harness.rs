@@ -4043,13 +4043,27 @@ fn classify_tool_call(
     };
 
     // ── Exec ──────────────────────────────────────────────────────────────────
+    // NOTE: This match arm is the ST8 follow-up workaround for issue #15.
+    // The right fix is capability metadata on `ToolRegistry` so each tool
+    // declares its `{ capability, side_effect }` shape and `classify_tool_call`
+    // becomes a registry lookup. Until then, every registered exec-class
+    // tool MUST be listed here or it will fall through to Read and bypass
+    // envelope enforcement.
     if matches!(
         name.as_str(),
-        "bash" | "shell" | "terminal" | "exec" | "run_command" | "unsafe_shell"
+        "bash"
+            | "shell"
+            | "terminal"
+            | "exec"
+            | "run_command"
+            | "unsafe_shell"
+            | "powershell"
+            | "repl"
     ) {
         let cmd = get_str("command")
             .or_else(|| get_str("cmd"))
             .or_else(|| get_str("script"))
+            .or_else(|| get_str("code"))
             .unwrap_or_else(|| "<unknown>".into());
         return (ExpansionCapability::Exec, env.check_exec(&cmd), cmd);
     }
@@ -4057,7 +4071,7 @@ fn classify_tool_call(
     // ── Network ───────────────────────────────────────────────────────────────
     if matches!(
         name.as_str(),
-        "web_fetch" | "fetch" | "http_get" | "http_post" | "web_search"
+        "web_fetch" | "fetch" | "http_get" | "http_post" | "web_search" | "browser_action"
     ) {
         let url = get_str("url")
             .or_else(|| get_str("query"))
@@ -4082,6 +4096,9 @@ fn classify_tool_call(
             | "move_file"
             | "delete_file"
             | "rename_file"
+            | "notebook_edit"
+            | "insert_code"
+            | "multi_edit"
     ) {
         let path = get_str("path")
             .or_else(|| get_str("file"))
