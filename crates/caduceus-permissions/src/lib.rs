@@ -17,7 +17,8 @@ pub use envelope::{
     PermissionEvent,
 };
 pub use grant::{
-    validate_widening, DefaultEnvelopeMutator, EnvelopeMutator, GrantOutcome, GrantValidationError,
+    propose_widened_envelope, validate_widening, DefaultEnvelopeMutator, EnvelopeMutator,
+    GrantOutcome, GrantValidationError, WidenProposalError,
 };
 
 // ── Capabilities ───────────────────────────────────────────────────────────────
