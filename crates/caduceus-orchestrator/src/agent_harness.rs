@@ -214,15 +214,14 @@ pub struct AgentHarness {
     /// `Err(RecvError)` which the deny task treats as "timeout", closing
     /// the deny commit. The map entry is removed by the deny task on
     /// completion (success or otherwise) so stale entries don't accumulate.
+    ///
+    /// ST8 PR-3D — entries also carry the originally-denied `capability`
+    /// and `resource` so [`AgentHarness::submit_grant_widening`] can
+    /// construct a widened envelope without the caller having to plumb
+    /// them through the wire.
     #[allow(clippy::type_complexity)]
-    pub(crate) pending_grants: Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<
-                String,
-                tokio::sync::oneshot::Sender<caduceus_permissions::GrantOutcome>,
-            >,
-        >,
-    >,
+    pub(crate) pending_grants:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingGrantEntry>>>,
     /// P13 / ST-B1 — optional introspection sink. When set, fan-out call
     /// sites that use [`AgentHarness::introspection_sink`] route all 8
     /// `IntrospectionEventV1` variants through this sink so the IDE's
@@ -825,16 +824,62 @@ impl AgentHarness {
         tool_use_id: &str,
         outcome: caduceus_permissions::GrantOutcome,
     ) -> std::result::Result<(), SubmitGrantError> {
-        let sender = {
+        let entry = {
             let mut map = self.pending_grants.lock().await;
             map.remove(tool_use_id)
         };
-        match sender {
-            Some(tx) => tx
-                .send(outcome)
-                .map_err(|_| SubmitGrantError::ReceiverDropped),
+        match entry {
+            Some(e) => {
+                e.tx.send(outcome)
+                    .map_err(|_| SubmitGrantError::ReceiverDropped)
+            }
             None => Err(SubmitGrantError::NoSuchPending),
         }
+    }
+
+    /// ST8 PR-3D — convenience for the UI Allow path.
+    ///
+    /// Looks up the pending grant by `tool_use_id`, reads the originally
+    /// denied `(capability, resource)` stored on the entry, runs
+    /// [`caduceus_permissions::propose_widened_envelope`] against the
+    /// harness's active envelope, wraps the result in
+    /// [`caduceus_permissions::GrantOutcome::Granted`], and submits it.
+    ///
+    /// This keeps `(capability, resource)` and the active envelope on the
+    /// caduceus side. UIs only need the `tool_use_id` they observed on
+    /// [`AgentEvent::GrantPending`] — no envelope plumbing across the wire.
+    ///
+    /// The orchestrator's own deny task still re-validates (monotonic
+    /// widening + over-grant defense), so a misbehaving caller cannot use
+    /// this method to bypass the grant contract.
+    pub async fn submit_grant_widening(
+        &self,
+        tool_use_id: &str,
+    ) -> std::result::Result<(), SubmitGrantWideningError> {
+        // Take the entry out under the lock. If the receiver has already
+        // been dropped the send below errors with ReceiverDropped — same
+        // semantics as submit_grant.
+        let entry = {
+            let mut map = self.pending_grants.lock().await;
+            map.remove(tool_use_id)
+        };
+        let entry = entry.ok_or(SubmitGrantWideningError::NoSuchPending)?;
+
+        let current = self
+            .permission_envelope
+            .as_ref()
+            .ok_or(SubmitGrantWideningError::NoActiveEnvelope)?;
+
+        let updated = caduceus_permissions::propose_widened_envelope(
+            current,
+            &entry.capability,
+            &entry.resource,
+        )?;
+
+        entry
+            .tx
+            .send(caduceus_permissions::GrantOutcome::Granted { updated })
+            .map_err(|_| SubmitGrantWideningError::ReceiverDropped)
     }
 
     /// ST-B1 / contract `harness-sink-v1` — install an introspection sink.
@@ -2764,7 +2809,14 @@ impl AgentHarness {
                                     >();
                                     {
                                         let mut map = pending_grants.lock().await;
-                                        map.insert(tool_use_id_str.clone(), tx);
+                                        map.insert(
+                                            tool_use_id_str.clone(),
+                                            crate::agent_harness::PendingGrantEntry {
+                                                tx,
+                                                capability: capability.clone(),
+                                                resource: resource.clone(),
+                                            },
+                                        );
                                     }
 
                                     let deadline_ms =
@@ -3915,6 +3967,17 @@ pub async fn execute_tool_calls(
 
 // ── P1b: envelope preflight helpers ───────────────────────────────────────────
 
+/// ST8 PR-3D — entry stored in [`AgentHarness::pending_grants`]. Carries
+/// the oneshot sender plus the originally-denied capability/resource so
+/// [`AgentHarness::submit_grant_widening`] can construct a widened
+/// envelope server-side without the caller having to re-supply them.
+#[derive(Debug)]
+pub(crate) struct PendingGrantEntry {
+    pub(crate) tx: tokio::sync::oneshot::Sender<caduceus_permissions::GrantOutcome>,
+    pub(crate) capability: String,
+    pub(crate) resource: String,
+}
+
 /// ST8-PR2 — error type for [`AgentHarness::submit_grant`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitGrantError {
@@ -3939,6 +4002,51 @@ impl std::fmt::Display for SubmitGrantError {
 }
 
 impl std::error::Error for SubmitGrantError {}
+
+/// ST8 PR-3D — error type for [`AgentHarness::submit_grant_widening`].
+///
+/// Distinct from [`SubmitGrantError`] because the widening path has
+/// additional failure modes (no active envelope to widen; helper rejects
+/// the proposal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitGrantWideningError {
+    /// No pending grant for this `tool_use_id`. See
+    /// [`SubmitGrantError::NoSuchPending`].
+    NoSuchPending,
+    /// The receiving deny-task dropped before consuming the outcome.
+    ReceiverDropped,
+    /// The harness has no active [`PermissionEnvelope`] — widening is
+    /// undefined. Configure one with
+    /// [`AgentHarness::with_permission_envelope`] before opting into
+    /// resume-on-grant.
+    NoActiveEnvelope,
+    /// The widening helper rejected the `(capability, resource)` pair
+    /// (unknown capability tag, empty resource).
+    Proposal(caduceus_permissions::WidenProposalError),
+}
+
+impl std::fmt::Display for SubmitGrantWideningError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSuchPending => f.write_str("no pending grant for this tool_use_id"),
+            Self::ReceiverDropped => {
+                f.write_str("grant receiver dropped before outcome was consumed")
+            }
+            Self::NoActiveEnvelope => f.write_str(
+                "harness has no active permission envelope; cannot construct a widening",
+            ),
+            Self::Proposal(e) => write!(f, "widening proposal rejected: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SubmitGrantWideningError {}
+
+impl From<caduceus_permissions::WidenProposalError> for SubmitGrantWideningError {
+    fn from(e: caduceus_permissions::WidenProposalError) -> Self {
+        Self::Proposal(e)
+    }
+}
 
 /// Outcome of [`AgentHarness::preflight_envelope`].
 #[derive(Debug, Clone)]
