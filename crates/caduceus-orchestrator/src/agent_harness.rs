@@ -4110,6 +4110,7 @@ fn deny_reason_tag(r: &DenyReason) -> &'static str {
         DenyReason::HostDenied(_) => "HostDenied",
         DenyReason::ExecDisabled => "ExecDisabled",
         DenyReason::CommandBlacklisted(_) => "CommandBlacklisted",
+        DenyReason::SensitivePath(_) => "SensitivePath",
     }
 }
 

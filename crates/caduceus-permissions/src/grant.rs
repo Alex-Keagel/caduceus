@@ -72,6 +72,7 @@ use thiserror::Error;
 /// granted envelope to widen `current` only along the requested
 /// capability/resource axis). Tracking note: see ST8 deferral doc.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum GrantOutcome {
     /// User approved; this is the proposed updated envelope. Must be
     /// validated by an [`EnvelopeMutator`] before being applied — the
