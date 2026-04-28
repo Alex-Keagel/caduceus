@@ -2852,9 +2852,25 @@ impl AgentHarness {
                         // `ScopeExpansionRequested` so the orchestrator/UI
                         // can re-prompt the user. This runs BEFORE the tool
                         // is dispatched; the tool never sees the call.
-                        match self.preflight_envelope(name, input) {
-                            PreflightOutcome::Allow => { /* fall through */ }
-                            PreflightOutcome::Intercept(content) => {
+                        //
+                        // ST8 PR-B2 — `preflight_envelope_with_profile`
+                        // wraps the legacy `preflight_envelope` with the
+                        // PR-B1 denial classifier. When the active mode
+                        // has a "classical fit" in a more-permissive
+                        // canonical mode (Plan/Research + Write/Exec →
+                        // Act), the classifier returns `SuggestSwitch`
+                        // and we route through `pending_switches` +
+                        // ProfileSwitchPending instead of the grant
+                        // flow. Sensitive-path denials never reach
+                        // SuggestSwitch (the classifier's bypass keeps
+                        // them on `Standard(Deny{...})` → grant flow).
+                        match self.preflight_envelope_with_profile(name, input) {
+                            ProfilePreflightOutcome::Standard(PreflightOutcome::Allow) => {
+                                /* fall through */
+                            }
+                            ProfilePreflightOutcome::Standard(PreflightOutcome::Intercept(
+                                content,
+                            )) => {
                                 let name_owned = name.clone();
                                 let timeout = overrides
                                     .get(&name_owned)
@@ -2872,12 +2888,12 @@ impl AgentHarness {
                                 });
                                 continue;
                             }
-                            PreflightOutcome::Deny {
+                            ProfilePreflightOutcome::Standard(PreflightOutcome::Deny {
                                 content,
                                 capability,
                                 resource,
                                 reason,
-                            } => {
+                            }) => {
                                 if let Some(ref em) = self.emitter {
                                     em.emit(AgentEvent::ScopeExpansionRequested {
                                         capability: capability.clone(),
@@ -3275,6 +3291,222 @@ impl AgentHarness {
                                         timeout,
                                         ToolSpawnOutcome::Completed(Ok(synth)),
                                         std::time::Duration::ZERO,
+                                    )
+                                });
+                                continue;
+                            }
+                            ProfilePreflightOutcome::SuggestSwitch {
+                                target_mode,
+                                capability,
+                                resource,
+                                deny_content,
+                            } => {
+                                // ST8 PR-B2 — denial classifier returned a
+                                // suggested target mode. Mirror the grant-
+                                // flow shape (resume_on_grant gate, collision
+                                // check, oneshot wait task with cancel race)
+                                // but emit ProfileSwitchPending /
+                                // ProfileSwitchResolved instead of
+                                // GrantPending / GrantResolved, and never
+                                // emit ScopeExpansionRequested (that signal
+                                // is grant-flow-specific; emitting it on a
+                                // switch path would leak as a stale grant
+                                // in zed's reducer).
+                                let name_owned = name.clone();
+                                let timeout = overrides
+                                    .get(&name_owned)
+                                    .copied()
+                                    .unwrap_or(global_timeout);
+
+                                if !self.resume_on_grant_enabled {
+                                    // Flag off → synth-deny immediately,
+                                    // identical to the legacy Deny path.
+                                    let synth = caduceus_core::ToolResult::error(&deny_content);
+                                    join_set.spawn(async move {
+                                        (
+                                            idx,
+                                            name_owned,
+                                            timeout,
+                                            ToolSpawnOutcome::Completed(Ok(synth)),
+                                            std::time::Duration::ZERO,
+                                        )
+                                    });
+                                    continue;
+                                }
+
+                                let tool_use_id_str = tool_use_id.clone();
+                                let collision = {
+                                    let map = self.pending_switches.lock().await;
+                                    map.contains_key(&tool_use_id_str)
+                                };
+                                if collision {
+                                    tracing::warn!(
+                                        target: "caduceus.switch",
+                                        tool_use_id = %tool_use_id_str,
+                                        "duplicate tool_use_id while a profile switch is already pending; not registering — synth-deny the colliding call"
+                                    );
+                                    let synth = caduceus_core::ToolResult::error(format!(
+                                        "{deny_content} (concurrent profile switch in progress for the same tool_use_id; not waiting)"
+                                    ));
+                                    join_set.spawn(async move {
+                                        (
+                                            idx,
+                                            name_owned,
+                                            timeout,
+                                            ToolSpawnOutcome::Completed(Ok(synth)),
+                                            std::time::Duration::ZERO,
+                                        )
+                                    });
+                                    continue;
+                                }
+
+                                let target_mode_str = target_mode
+                                    .canonical_name()
+                                    .unwrap_or("custom")
+                                    .to_string();
+                                let capability_str_owned =
+                                    capability_str(&capability).to_string();
+                                let resource_owned = resource.clone();
+
+                                let pending_switches = self.pending_switches.clone();
+                                let switch_timeout = self.grant_timeout;
+                                let emitter = self.emitter.clone();
+                                let cancel_token = cancel_token_for_tools.clone();
+                                let synth_deny = deny_content.clone();
+
+                                let (tx, rx) = tokio::sync::oneshot::channel::<SwitchOutcome>();
+                                {
+                                    let mut map = pending_switches.lock().await;
+                                    map.insert(
+                                        tool_use_id_str.clone(),
+                                        PendingSwitchEntry {
+                                            tx,
+                                            target_mode: target_mode_str.clone(),
+                                            capability: capability_str_owned.clone(),
+                                            resource: resource_owned.clone(),
+                                        },
+                                    );
+                                }
+
+                                let deadline_ms =
+                                    switch_timeout.as_millis().min(u64::MAX as u128) as u64;
+                                if let Some(ref em) = self.emitter {
+                                    em.emit(AgentEvent::ProfileSwitchPending {
+                                        tool_use_id: tool_use_id_str.clone(),
+                                        target_mode: target_mode_str.clone(),
+                                        capability: capability_str_owned.clone(),
+                                        resource: resource_owned.clone(),
+                                        deadline_ms,
+                                    })
+                                    .await;
+                                }
+
+                                join_set.spawn(async move {
+                                    let started = std::time::Instant::now();
+                                    // Race the oneshot against cancel — same
+                                    // pattern as the grant wait task. `None`
+                                    // arm = cancel won the race.
+                                    let recv_result = if let Some(token) = cancel_token.as_ref() {
+                                        let token = token.clone();
+                                        tokio::select! {
+                                            biased;
+                                            res = tokio::time::timeout(switch_timeout, rx) => Some(res),
+                                            _ = async {
+                                                loop {
+                                                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                                    if token.is_cancelled() { break; }
+                                                }
+                                            } => None,
+                                        }
+                                    } else {
+                                        Some(tokio::time::timeout(switch_timeout, rx).await)
+                                    };
+
+                                    // Always reap the entry — submit_profile_switch
+                                    // already removes on the happy path, but
+                                    // on timeout / dropped sender / cancel we
+                                    // still want the map clean.
+                                    {
+                                        let mut map = pending_switches.lock().await;
+                                        map.remove(&tool_use_id_str);
+                                    }
+
+                                    let synth_error = |s: &str| {
+                                        ToolSpawnOutcome::Completed(Ok(
+                                            caduceus_core::ToolResult::error(s),
+                                        ))
+                                    };
+
+                                    let spawn_outcome: ToolSpawnOutcome = match recv_result {
+                                        None => {
+                                            if let Some(ref em) = emitter {
+                                                em.emit(AgentEvent::ProfileSwitchResolved {
+                                                    tool_use_id: tool_use_id_str.clone(),
+                                                    outcome: "cancelled".into(),
+                                                })
+                                                .await;
+                                            }
+                                            ToolSpawnOutcome::Cancelled
+                                        }
+                                        Some(Ok(Ok(SwitchOutcome::Switched))) => {
+                                            if let Some(ref em) = emitter {
+                                                em.emit(AgentEvent::ProfileSwitchResolved {
+                                                    tool_use_id: tool_use_id_str.clone(),
+                                                    outcome: "switched".into(),
+                                                })
+                                                .await;
+                                            }
+                                            // Bridge owns the rebuild + re-issue.
+                                            // Synth a deny that carries enough
+                                            // breadcrumb for the agent's next
+                                            // turn to know what happened.
+                                            synth_error(&format!(
+                                                "{synth_deny} (profile switch accepted: target={target_mode_str}; the bridge will rebuild the harness and re-issue the call on the next turn)"
+                                            ))
+                                        }
+                                        Some(Ok(Ok(SwitchOutcome::Denied))) => {
+                                            if let Some(ref em) = emitter {
+                                                em.emit(AgentEvent::ProfileSwitchResolved {
+                                                    tool_use_id: tool_use_id_str.clone(),
+                                                    outcome: "denied".into(),
+                                                })
+                                                .await;
+                                            }
+                                            synth_error(&synth_deny)
+                                        }
+                                        Some(Ok(Ok(SwitchOutcome::Cancelled))) => {
+                                            if let Some(ref em) = emitter {
+                                                em.emit(AgentEvent::ProfileSwitchResolved {
+                                                    tool_use_id: tool_use_id_str.clone(),
+                                                    outcome: "cancelled".into(),
+                                                })
+                                                .await;
+                                            }
+                                            ToolSpawnOutcome::Cancelled
+                                        }
+                                        Some(Ok(Ok(SwitchOutcome::Timeout)))
+                                        | Some(Ok(Err(_)))
+                                        | Some(Err(_)) => {
+                                            // Explicit Timeout, sender
+                                            // dropped, or wall-clock expired
+                                            // → commit the deny.
+                                            if let Some(ref em) = emitter {
+                                                em.emit(AgentEvent::ProfileSwitchResolved {
+                                                    tool_use_id: tool_use_id_str.clone(),
+                                                    outcome: "timeout".into(),
+                                                })
+                                                .await;
+                                            }
+                                            synth_error(&synth_deny)
+                                        }
+                                    };
+
+                                    (
+                                        idx,
+                                        name_owned,
+                                        timeout,
+                                        spawn_outcome,
+                                        started.elapsed(),
                                     )
                                 });
                                 continue;
