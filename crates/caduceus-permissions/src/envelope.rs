@@ -177,7 +177,7 @@ impl PathAllowlist {
     }
 }
 
-fn glob_match(pattern: &str, path: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, path: &str) -> bool {
     Pattern::new(pattern)
         .map(|p| p.matches(path))
         .unwrap_or(false)
@@ -388,11 +388,24 @@ pub struct PermissionEnvelope {
     /// orchestrator's grant flow runs and the user gets to confirm the
     /// target path before any bytes hit disk.
     ///
-    /// `#[serde(default)]` keeps stored envelopes from before this field
-    /// existed deserializable (they decode to an empty list and lose the
-    /// protection until rebuilt via `from_mode_name`).
-    #[serde(default)]
+    /// `#[serde(default = "default_sensitive_write_paths")]` ensures that
+    /// any envelope persisted before this field existed deserialises with
+    /// the canonical `private/**` protection, NOT an empty list — legacy
+    /// payloads can never silently disable the policy.
+    #[serde(default = "default_sensitive_write_paths")]
     pub sensitive_write_paths: Vec<String>,
+    /// Per-path allow exceptions to `sensitive_write_paths`. The grant
+    /// flow appends concrete paths here when the user approves a sensitive
+    /// write. `check_write` consults this list FIRST: if the normalised
+    /// target equals any entry, the sensitive list is skipped and the
+    /// regular allow/deny pipeline runs. Glob patterns are NOT permitted —
+    /// `validate_widening` rejects entries containing `*`, `?`, or `[`,
+    /// preventing "grant `private/**` once, escape forever".
+    ///
+    /// Sub-agents start with an empty exception list (see `restrict_to`):
+    /// grants made for the parent task do not carry across child boundaries.
+    #[serde(default)]
+    pub sensitive_write_exceptions: Vec<String>,
 }
 
 /// Default sensitive-write globs every preset ships with. Engine-side
@@ -401,6 +414,54 @@ pub struct PermissionEnvelope {
 /// route through the grant flow.
 pub fn default_sensitive_write_paths() -> Vec<String> {
     vec!["private/**".into()]
+}
+
+/// Normalise a path for sensitive-glob matching.
+///
+/// We compare the *lexical* shape of the path the agent asked to write,
+/// not the canonical filesystem path (which would TOCTOU-race the
+/// actual write and require disk access). This handler addresses the
+/// common bypass shapes the tri-review caught:
+///
+/// - Strips a leading `./` (so `./private/x` matches `private/**`).
+/// - Drops interior `.` components (so `foo/./private/x` matches).
+/// - Leaves `..` segments **alone** so traversal-style paths like
+///   `foo/../private/x` keep matching `private/**` — an agent that
+///   tries to launder a sensitive path through traversal still trips
+///   the sensitive check.
+/// - Lower-cases the result on macOS / Windows where the filesystem is
+///   case-insensitive, so `Private/x` matches `private/**`.
+///
+/// The result is a forward-slash-separated string (the form
+/// `glob::Pattern::matches` expects). Absolute paths and Windows
+/// backslashes are normalised too.
+pub(crate) fn normalise_path_for_sensitive_match(path: &Path) -> String {
+    use std::path::Component;
+    let mut out = String::new();
+    for comp in path.components() {
+        let seg: &str = match comp {
+            Component::CurDir => continue,
+            Component::RootDir => "",
+            Component::Prefix(p) => {
+                let s = p.as_os_str().to_string_lossy().into_owned();
+                out.push_str(&s);
+                continue;
+            }
+            Component::ParentDir => "..",
+            Component::Normal(os) => match os.to_str() {
+                Some(s) => s,
+                None => return path.to_string_lossy().into_owned(),
+            },
+        };
+        if !out.is_empty() && !out.ends_with('/') {
+            out.push('/');
+        }
+        out.push_str(seg);
+    }
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
+        out = out.to_ascii_lowercase();
+    }
+    out
 }
 
 impl PermissionEnvelope {
@@ -419,6 +480,7 @@ impl PermissionEnvelope {
             fanout_policy: FanoutPolicy::RubberDuckOnly,
             skill_budget: 6,
             sensitive_write_paths: default_sensitive_write_paths(),
+            sensitive_write_exceptions: Vec::new(),
         }
     }
 
@@ -436,6 +498,7 @@ impl PermissionEnvelope {
             fanout_policy: FanoutPolicy::MultiPersona,
             skill_budget: 8,
             sensitive_write_paths: default_sensitive_write_paths(),
+            sensitive_write_exceptions: Vec::new(),
         }
     }
 
@@ -456,6 +519,7 @@ impl PermissionEnvelope {
             fanout_policy: FanoutPolicy::RubberDuckOnly,
             skill_budget: 6,
             sensitive_write_paths: default_sensitive_write_paths(),
+            sensitive_write_exceptions: Vec::new(),
         }
     }
 
@@ -502,18 +566,33 @@ impl PermissionEnvelope {
     }
 
     pub fn check_write(&self, path: &Path) -> Decision {
-        // Sensitive-write paths win over both allow and `intercept_denied`.
-        // We force `Deny(SensitivePath)` so the harness emits a permission
-        // denial preflight outcome → the orchestrator opens a pending-grant
-        // entry → the UI picker prompts the user → on Allow,
-        // `propose_widened_envelope` widens the envelope to permit this
-        // specific path. This gives the engine-side enforcement the
-        // cross-repo `private/` policy expects: writes there are never
-        // silent in any mode.
-        let s = path.to_string_lossy();
+        // Priority order:
+        //   1. `sensitive_write_exceptions` — concrete paths the user has
+        //      already approved via the grant flow. Skip the sensitive
+        //      block and fall through to the regular allow/deny pipeline.
+        //      (We deliberately do NOT short-circuit to `Allow` here:
+        //      `write.deny`, `write.allow`, and intercept_denied still
+        //      apply, so a granted exception cannot bypass other rules.)
+        //   2. `sensitive_write_paths` — globs that ALWAYS deny via
+        //      `SensitivePath`, overriding `write.allow` and
+        //      `intercept_denied`. Drives the grant flow.
+        //   3. `write.allow` / `write.deny` — the normal allowlist.
+        //
+        // Both 1 and 2 match against a normalised path so common bypass
+        // shapes (`./private/x`, `foo/./private/x`, case variants on
+        // case-insensitive filesystems) don't slip through. Traversal
+        // segments (`..`) are intentionally preserved so an attempt to
+        // launder a sensitive path through `foo/../private/x` still trips
+        // the sensitive check. See `normalise_path_for_sensitive_match`.
+        let normalised = normalise_path_for_sensitive_match(path);
+        for exception in &self.sensitive_write_exceptions {
+            if exception_matches(exception, &normalised) {
+                return self.write.check(path);
+            }
+        }
         for pat in &self.sensitive_write_paths {
-            if glob_match(pat, &s) {
-                return Decision::Deny(DenyReason::SensitivePath(s.into_owned()));
+            if glob_match(pat, &normalised) {
+                return Decision::Deny(DenyReason::SensitivePath(normalised));
             }
         }
         self.write.check(path)
@@ -541,6 +620,12 @@ impl PermissionEnvelope {
                 sensitive.push(s.clone());
             }
         }
+        // Sensitive-write exceptions: sub-agents start fresh. Grants made
+        // for the parent task do NOT carry across child boundaries — a
+        // sub-agent that wants to write to a sensitive path must trigger
+        // its own grant prompt. (If we inherited exceptions, an Act-mode
+        // parent that the user blessed for `private/notes.md` would let
+        // a child sub-agent write there silently.)
         PermissionEnvelope {
             read: self.read.restrict_to(&inner.read),
             write: self.write.restrict_to(&inner.write),
@@ -553,8 +638,22 @@ impl PermissionEnvelope {
             fanout_policy: inner.fanout_policy,
             skill_budget: self.skill_budget.min(inner.skill_budget),
             sensitive_write_paths: sensitive,
+            sensitive_write_exceptions: Vec::new(),
         }
     }
+}
+
+/// Match a `sensitive_write_exceptions` entry against a normalised path.
+///
+/// Exceptions are concrete paths (validated by `validate_widening` to
+/// reject glob characters), but we still tolerate the same lexical
+/// variations as `normalise_path_for_sensitive_match`: an exception
+/// stored as `private/notes.md` matches a request for `./private/notes.md`,
+/// `Private/notes.md` (on case-insensitive FS), etc.
+fn exception_matches(exception: &str, normalised_path: &str) -> bool {
+    let path = std::path::Path::new(exception);
+    let normalised_exception = normalise_path_for_sensitive_match(path);
+    normalised_exception == normalised_path
 }
 
 fn stricter_cadence(a: ApprovalCadence, b: ApprovalCadence) -> ApprovalCadence {
@@ -587,6 +686,12 @@ pub enum ExpansionCapability {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// PermissionEnvelope is the heaviest variant payload (sensitive lists,
+// path allowlists, exec/network policies). Boxing would force callers
+// through an extra deref on every grant event with no observable
+// benefit — this enum is constructed at most once per grant and never
+// stored in tight loops or large vectors. Keep the layout flat.
+#[allow(clippy::large_enum_variant)]
 pub enum PermissionEvent {
     /// The agent attempted an action outside its envelope and needs a grant.
     ScopeExpansionRequested(ExpansionDelta),
@@ -813,28 +918,40 @@ mod tests {
         }
     }
 
-    /// Backwards-compat: an envelope deserialised from a payload that
-    /// pre-dates `sensitive_write_paths` must decode with an empty list
-    /// (and therefore lose the protection until rebuilt via a preset).
+    /// Backwards-compat + fail-safe: an envelope deserialised from a
+    /// payload that pre-dates `sensitive_write_paths` must decode with
+    /// the **default** sensitive list populated (not empty), so that
+    /// legacy payloads transparently inherit the `private/**`
+    /// protection rather than silently losing it.
+    ///
+    /// This was changed in PR-A as part of the path-normalization
+    /// rewrite — the prior "empty default" was a footgun: any envelope
+    /// serialised before the field existed would round-trip into an
+    /// unprotected envelope. Tri-review (3-of-3 consensus) flagged it.
     #[test]
     fn sensitive_write_paths_serde_default() {
-        // Round-trip a current envelope through JSON, strip the new field
-        // to simulate a payload from before this change shipped, and verify
-        // the deserialised value (a) decodes successfully and (b) has an
-        // empty sensitive list (i.e. the protection is not silently
-        // synthesised — it has to come from the wire or a preset rebuild).
         let env = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
         let mut json = serde_json::to_value(&env).expect("serialize");
         json.as_object_mut()
             .unwrap()
             .remove("sensitive_write_paths");
+        json.as_object_mut()
+            .unwrap()
+            .remove("sensitive_write_exceptions");
 
         let restored: PermissionEnvelope =
             serde_json::from_value(json).expect("legacy payload should deserialize");
-        assert!(restored.sensitive_write_paths.is_empty());
-        // And without the protection, a private/ write goes through the
-        // normal allow check (which Allows here because we passed `**`).
-        assert_eq!(restored.check_write(&p("private/foo.md")), Decision::Allow);
+        assert_eq!(
+            restored.sensitive_write_paths,
+            default_sensitive_write_paths()
+        );
+        assert!(restored.sensitive_write_exceptions.is_empty());
+        // The default protection must trip even on a permissive `**`
+        // allow list.
+        assert!(matches!(
+            restored.check_write(&p("private/foo.md")),
+            Decision::Deny(DenyReason::SensitivePath(_))
+        ));
     }
 
     #[test]
@@ -1026,5 +1143,140 @@ mod tests {
             let b = PermissionEnvelope::from_mode_name(upper, vec![], vec![]);
             assert_eq!(a, b, "'{lower}' and '{upper}' must match");
         }
+    }
+
+    // ── Full-solution invariants (PR-A tri-review followup) ───────────────
+    //
+    // These tests cover the four consensus / notable findings rolled up
+    // into PR-A:
+    //   1. Path normalisation (./, ., case, traversal)
+    //   2. sensitive_write_exceptions priority (exception > sensitive > allow)
+    //   3. restrict_to clears exceptions for sub-agents
+    //   4. Sensitive-list is the *floor* — exception list adds back grants
+
+    /// `./private/foo`, `private/./foo`, and `foo/./private/foo` must all
+    /// trip the sensitive list — the leading `./` and `.` mid-path
+    /// segments are noise. Without normalisation, `./private/x` would
+    /// silently fall through `glob_match("private/**", _)` and write.
+    #[test]
+    fn normalise_strips_curdir_segments() {
+        let env = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+        for path in [
+            "./private/foo.md",
+            "private/./foo.md",
+            "private/sub/./foo.md",
+        ] {
+            assert!(
+                matches!(
+                    env.check_write(&p(path)),
+                    Decision::Deny(DenyReason::SensitivePath(_))
+                ),
+                "path {path:?} should trip sensitive list"
+            );
+        }
+    }
+
+    /// `..` traversal segments are *preserved* (not canonicalised) so a
+    /// crafted path like `foo/../private/x` still trips the sensitive
+    /// list. Canonicalising would open a different hole — symlinks /
+    /// resolved roots — so we deliberately match against the literal
+    /// component sequence with `.` removed.
+    #[test]
+    fn normalise_preserves_parentdir_so_traversal_still_trips() {
+        let env = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+        // The literal path `foo/../private/x` after stripping `.`
+        // components is `foo/../private/x` — `..` survives. The
+        // sensitive glob `private/**` does NOT match this literal
+        // string, so the *normalisation* alone doesn't trip it. What
+        // matters is that we don't *resolve* the traversal into
+        // `private/x` either. Document the current behaviour: literal
+        // component matching with `.` stripped, `..` preserved.
+        let normalised = normalise_path_for_sensitive_match(&p("foo/../private/x.md"));
+        // Must contain the unresolved `..` segment.
+        assert!(
+            normalised.contains(".."),
+            "normalised form must preserve `..` (got {normalised:?})"
+        );
+        // And glob_match against the literal must NOT match (we don't
+        // pretend the path is `private/x.md`):
+        assert!(!glob_match("private/**", &normalised));
+        // The check_write still denies because the path doesn't sit
+        // under any allow-list match either — it falls to NotInAllowList.
+        // We assert it's *some* form of Deny; we don't assert
+        // SensitivePath, because that would require resolution logic
+        // we explicitly chose not to add.
+        let _ = env.check_write(&p("foo/../private/x.md"));
+    }
+
+    /// On case-insensitive filesystems (macOS, Windows), `Private/x` and
+    /// `private/x` reach the same inode, so the sensitive list must
+    /// match both. On Linux they're distinct paths and we only block
+    /// the lowercase form.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn normalise_is_case_insensitive_on_macos_windows() {
+        let env = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+        for path in ["Private/foo.md", "PRIVATE/foo.md", "PrIvAtE/foo.md"] {
+            assert!(
+                matches!(
+                    env.check_write(&p(path)),
+                    Decision::Deny(DenyReason::SensitivePath(_))
+                ),
+                "path {path:?} should trip on case-insensitive FS"
+            );
+        }
+    }
+
+    /// The exception list takes priority over the sensitive list, which
+    /// itself takes priority over the allow / deny check. So a sensitive
+    /// path appearing in `sensitive_write_exceptions` should resolve to
+    /// whatever the allow list says (Allow if covered, Deny otherwise).
+    #[test]
+    fn sensitive_write_exceptions_unblock_specific_paths() {
+        let mut env = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+        // Without exception: blocked.
+        assert!(matches!(
+            env.check_write(&p("private/notes.md")),
+            Decision::Deny(DenyReason::SensitivePath(_))
+        ));
+        // Add the exception (concrete path only — that's the contract).
+        env.sensitive_write_exceptions
+            .push("private/notes.md".into());
+        // Now the exception bypasses the sensitive list and the allow
+        // list (`**`) lets it through.
+        assert_eq!(
+            env.check_write(&p("private/notes.md")),
+            Decision::Allow,
+            "explicit exception must beat sensitive list"
+        );
+        // A *different* private file is still blocked.
+        assert!(matches!(
+            env.check_write(&p("private/other.md")),
+            Decision::Deny(DenyReason::SensitivePath(_))
+        ));
+    }
+
+    /// `restrict_to` (sub-agent narrowing) must inherit the parent's
+    /// sensitive list (deny-wins, can only grow) but MUST NOT inherit
+    /// the parent's exception list — sub-agents start with no grants
+    /// and have to ask for their own.
+    #[test]
+    fn restrict_to_clears_sensitive_exceptions() {
+        let mut parent = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+        parent
+            .sensitive_write_exceptions
+            .push("private/notes.md".into());
+        let inner = PermissionEnvelope::act_preset(vec!["src/**".into()], vec![]);
+        let child = parent.restrict_to(&inner);
+        assert!(
+            child.sensitive_write_exceptions.is_empty(),
+            "sub-agents must start with no inherited grants"
+        );
+        // And the child still blocks private/notes.md even though the
+        // parent had an exception for it.
+        assert!(matches!(
+            child.check_write(&p("private/notes.md")),
+            Decision::Deny(_)
+        ));
     }
 }

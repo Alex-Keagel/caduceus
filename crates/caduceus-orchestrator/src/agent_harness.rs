@@ -4909,6 +4909,52 @@ fn classify_tool_call(
             | "insert_code"
             | "multi_edit"
     ) {
+        // `apply_patch` carries its target file paths inside a `patch`
+        // string (unified diff `+++ b/<path>` headers), not in a top-
+        // level `path` / `file` field. Without parsing those headers,
+        // sensitive-path enforcement would always run against
+        // `<unknown>` and a patch editing `private/**` would slip
+        // through. Tri-review caught this — see denial-routing-design.md.
+        if name == "apply_patch" {
+            if let Some(patch) = get_str("patch") {
+                let touched = extract_apply_patch_targets(&patch);
+                if touched.is_empty() {
+                    // Fail closed: a patch we can't parse paths from
+                    // must not bypass envelope enforcement.
+                    return (
+                        ExpansionCapability::Write,
+                        Decision::Deny(DenyReason::NotInAllowList),
+                        "<apply_patch:unparsed>".to_string(),
+                    );
+                }
+                // Check every touched path. Surface the worst offender:
+                // SensitivePath > other Deny > Intercept > Allow.
+                let mut worst: Option<(Decision, String)> = None;
+                for path in &touched {
+                    let decision = env.check_write(std::path::Path::new(path));
+                    let rank = decision_rank(&decision);
+                    let take = match &worst {
+                        None => true,
+                        Some((d, _)) => rank > decision_rank(d),
+                    };
+                    if take {
+                        worst = Some((decision.clone(), path.clone()));
+                        if matches!(decision, Decision::Deny(DenyReason::SensitivePath(_))) {
+                            // Sensitive-path is the maximum rank; can short-circuit.
+                            break;
+                        }
+                    }
+                }
+                let (decision, resource) = worst.expect("touched is non-empty");
+                return (ExpansionCapability::Write, decision, resource);
+            }
+            // No patch payload at all — fail closed.
+            return (
+                ExpansionCapability::Write,
+                Decision::Deny(DenyReason::NotInAllowList),
+                "<apply_patch:no-patch>".to_string(),
+            );
+        }
         let path = get_str("path")
             .or_else(|| get_str("file"))
             .or_else(|| get_str("file_path"))
@@ -4939,5 +4985,62 @@ pub(crate) fn extract_host(url: &str) -> Option<String> {
         None
     } else {
         Some(host.to_string())
+    }
+}
+
+/// Extract the set of file paths an `apply_patch` payload targets.
+///
+/// Walks the unified-diff headers (`+++ b/<path>`) and returns each
+/// destination path with the `a/` / `b/` prefix stripped. Mirrors the
+/// `parse_patch_path` logic in `caduceus-tools` so preflight and the
+/// actual write target the same set of paths.
+///
+/// Returns an empty vec for malformed or empty patches — callers
+/// should treat that as a fail-closed denial.
+pub(crate) fn extract_apply_patch_targets(patch: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in patch.lines() {
+        let value = if let Some(rest) = line.strip_prefix("+++ ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            // Only use `---` (source) when `+++` is `/dev/null` (file
+            // deletion); for adds and edits, `+++` is the target.
+            // We collect both and de-dupe at the end.
+            rest
+        } else {
+            continue;
+        };
+        let trimmed = value.trim();
+        if trimmed == "/dev/null" {
+            continue;
+        }
+        let stripped = trimmed
+            .strip_prefix("a/")
+            .or_else(|| trimmed.strip_prefix("b/"))
+            .unwrap_or(trimmed);
+        let owned = stripped.to_string();
+        if !paths.contains(&owned) {
+            paths.push(owned);
+        }
+    }
+    paths
+}
+
+/// Rank a `Decision` for "worst-offender" comparison across multiple
+/// touched paths in a single `apply_patch` call. Higher = worse.
+///
+/// Ordering rationale:
+/// - `Deny(SensitivePath)` is the highest rank because it must surface
+///   to the grant flow even when other paths in the same patch are
+///   merely out-of-allow-list.
+/// - Other `Deny` reasons rank above `Intercept` (intercept is
+///   plan-mode soft-fail; deny is hard).
+/// - `Allow` is rank 0.
+fn decision_rank(d: &Decision) -> u8 {
+    match d {
+        Decision::Allow => 0,
+        Decision::Intercept => 1,
+        Decision::Deny(DenyReason::SensitivePath(_)) => 3,
+        Decision::Deny(_) => 2,
     }
 }
