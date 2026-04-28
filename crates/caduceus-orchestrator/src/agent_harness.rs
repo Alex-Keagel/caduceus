@@ -249,6 +249,29 @@ pub struct AgentHarness {
     /// prompt caching can group requests from the same thread.
     /// `None` preserves pre-T8 behaviour (wire field omitted).
     thread_id: Option<Arc<str>>,
+    /// ST8 PR-B2 — current permission mode label (e.g. `"plan"`, `"act"`,
+    /// `"research"`). Used by the denial classifier (`PR-B1`) to decide
+    /// whether an envelope denial has a classical fit in a more-permissive
+    /// canonical mode and should surface a profile-switch suggestion
+    /// instead of falling into the grant flow.
+    ///
+    /// Kept **separate** from [`PermissionEnvelope`] (which can be
+    /// widened by grants and so loses its "this came from mode X"
+    /// identity over time): the envelope describes what the agent
+    /// *can* currently do, and `permission_mode` describes which
+    /// preset built it. They diverge after the first widening grant.
+    ///
+    /// `None` → `ModeKind::Custom` → classifier always returns
+    /// `GrantRequired`, preserving pre-PR-B2 behaviour byte-for-byte.
+    permission_mode: Option<String>,
+    /// ST8 PR-B2 — registry of in-flight pending profile switches,
+    /// keyed by `tool_use_id`. Mirrors [`AgentHarness::pending_grants`]
+    /// in shape and reaping discipline. The receiver lives on the
+    /// spawned switch-wait task; on shutdown / drop / timeout the
+    /// task removes its entry so stale ids don't accumulate.
+    #[allow(clippy::type_complexity)]
+    pub(crate) pending_switches:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingSwitchEntry>>>,
 }
 
 /// Configuration for the post-loop test-gate (gap G3 / P2.2).
@@ -448,6 +471,8 @@ impl AgentHarness {
             introspection_sink: None,
             context_injector: None,
             thread_id: None,
+            permission_mode: None,
+            pending_switches: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -793,6 +818,24 @@ impl AgentHarness {
         self.permission_envelope.as_ref()
     }
 
+    /// ST8 PR-B2 — set the current permission-mode label. Used by the
+    /// denial classifier to decide whether to surface a profile-switch
+    /// suggestion (`bash` denied in Plan → suggest Act) or fall through
+    /// to the grant flow. Names accepted by
+    /// [`caduceus_permissions::ModeKind::from_mode_name`] (canonical
+    /// names + common aliases) classify into one of the four canonical
+    /// kinds; anything else is `Custom` and never produces a switch
+    /// suggestion. See `caduceus-permissions::denial_classifier`.
+    pub fn with_permission_mode(mut self, mode: impl Into<String>) -> Self {
+        self.permission_mode = Some(mode.into());
+        self
+    }
+
+    /// Current permission-mode label (if any).
+    pub fn permission_mode(&self) -> Option<&str> {
+        self.permission_mode.as_deref()
+    }
+
     /// ST8-PR2 — opt into pause-before-deny-commit semantics. When enabled,
     /// the deny path will pause for up to `grant_timeout` waiting for a grant
     /// before committing the deny. See [`AgentHarness::submit_grant`].
@@ -834,6 +877,33 @@ impl AgentHarness {
                     .map_err(|_| SubmitGrantError::ReceiverDropped)
             }
             None => Err(SubmitGrantError::NoSuchPending),
+        }
+    }
+
+    /// ST8 PR-B2 — deliver a profile-switch outcome for a `tool_use_id`
+    /// that was previously surfaced via [`AgentEvent::ProfileSwitchPending`].
+    /// Mirror of [`AgentHarness::submit_grant`] but for the switch flow.
+    ///
+    /// Returns `Ok(())` if the outcome was routed,
+    /// `Err(SubmitSwitchError::NoSuchPending)` if no pending switch
+    /// exists for that id (already timed out, cancelled, or never
+    /// registered), `Err(SubmitSwitchError::ReceiverDropped)` if the
+    /// wait task dropped before consuming.
+    pub async fn submit_profile_switch(
+        &self,
+        tool_use_id: &str,
+        outcome: SwitchOutcome,
+    ) -> std::result::Result<(), SubmitSwitchError> {
+        let entry = {
+            let mut map = self.pending_switches.lock().await;
+            map.remove(tool_use_id)
+        };
+        match entry {
+            Some(e) => {
+                e.tx.send(outcome)
+                    .map_err(|_| SubmitSwitchError::ReceiverDropped)
+            }
+            None => Err(SubmitSwitchError::NoSuchPending),
         }
     }
 
@@ -960,6 +1030,84 @@ impl AgentHarness {
         };
         let (capability, decision, resource) = classify_tool_call(env, tool_name, input);
         format_preflight_outcome(capability, decision, resource)
+    }
+
+    /// ST8 PR-B2 — typed wrapper over [`AgentHarness::preflight_envelope`]
+    /// that hands [`Decision::Deny`] denials to the
+    /// [`caduceus_permissions::DenialClassification`] table.
+    ///
+    /// When the active permission mode + denied capability has a
+    /// "classical fit" in a more-permissive canonical mode (e.g.
+    /// Plan + Exec → Act), returns
+    /// [`ProfilePreflightOutcome::SuggestSwitch`]. The caller is
+    /// responsible for emitting [`AgentEvent::ProfileSwitchPending`]
+    /// and routing the user's decision back via
+    /// [`AgentHarness::submit_profile_switch`]. Otherwise returns
+    /// [`ProfilePreflightOutcome::Standard`] with the same
+    /// [`PreflightOutcome`] the legacy method would have produced.
+    ///
+    /// Backwards-compat: if `permission_mode` is `None`, classification
+    /// uses [`caduceus_permissions::ModeKind::Custom`], whose
+    /// `classical_fit` row is empty by design — every denial routes
+    /// through the existing grant flow exactly as before.
+    pub fn preflight_envelope_with_profile(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> ProfilePreflightOutcome {
+        let Some(env) = self.permission_envelope.as_ref() else {
+            return ProfilePreflightOutcome::Standard(PreflightOutcome::Allow);
+        };
+        let (capability, decision, resource) = classify_tool_call(env, tool_name, input);
+
+        if let Decision::Deny(ref reason) = decision {
+            let mode_kind = self
+                .permission_mode
+                .as_deref()
+                .map(caduceus_permissions::ModeKind::from_mode_name)
+                .unwrap_or(caduceus_permissions::ModeKind::Custom);
+            let classification = caduceus_permissions::DenialClassification::classify(
+                mode_kind,
+                capability.clone(),
+                resource.clone(),
+                reason.clone(),
+            );
+            if let caduceus_permissions::DenialClassification::SuggestProfileSwitch {
+                target_mode,
+                ..
+            } = classification
+            {
+                // Defense in depth — `classical_fit` should never
+                // suggest the current mode. If a future table edit
+                // ever produces this, fall through to grant rather
+                // than emit a bogus self-switch.
+                debug_assert_ne!(
+                    Some(target_mode),
+                    Some(mode_kind),
+                    "classical_fit returned current mode; falling back to grant flow"
+                );
+                if Some(target_mode) != Some(mode_kind) {
+                    let deny_content = match format_preflight_outcome(
+                        capability.clone(),
+                        decision.clone(),
+                        resource.clone(),
+                    ) {
+                        PreflightOutcome::Deny { content, .. } => content,
+                        // Unreachable: format_preflight_outcome of a
+                        // Decision::Deny always produces Deny.
+                        _ => String::new(),
+                    };
+                    return ProfilePreflightOutcome::SuggestSwitch {
+                        target_mode,
+                        capability,
+                        resource,
+                        deny_content,
+                    };
+                }
+            }
+        }
+
+        ProfilePreflightOutcome::Standard(format_preflight_outcome(capability, decision, resource))
     }
 
     /// P13.8 — Vote on a set of candidate tool argument payloads. Returns
@@ -4074,6 +4222,102 @@ impl From<caduceus_permissions::WidenProposalError> for SubmitGrantWideningError
     fn from(e: caduceus_permissions::WidenProposalError) -> Self {
         Self::Proposal(e)
     }
+}
+
+/// ST8 PR-B2 — entry stored in [`AgentHarness::pending_switches`].
+/// Mirror of [`PendingGrantEntry`]: the oneshot sender plus the
+/// originally-denied capability/resource and the suggested target mode
+/// so the wait task can synthesize useful deny content if the user
+/// declines the switch.
+#[derive(Debug)]
+pub(crate) struct PendingSwitchEntry {
+    pub(crate) tx: tokio::sync::oneshot::Sender<SwitchOutcome>,
+    #[allow(dead_code)]
+    pub(crate) target_mode: String,
+    #[allow(dead_code)]
+    pub(crate) capability: String,
+    #[allow(dead_code)]
+    pub(crate) resource: String,
+}
+
+/// ST8 PR-B2 — terminal outcome of a profile-switch suggestion.
+///
+/// `AllowedOnce` is intentionally **not** in this enum yet: PR-B2 wires
+/// only the three terminal outcomes the orchestrator can drive on its
+/// own (Switched / Denied / Timeout / Cancelled). A bridge can
+/// implement "Allow once" by submitting `Denied` and immediately
+/// re-issuing the original tool call with a one-shot grant; that path
+/// will be reified in PR-B3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwitchOutcome {
+    /// User accepted the switch suggestion. The orchestrator does not
+    /// itself rebuild the harness — that's the bridge's job — but
+    /// surfacing this outcome lets the bridge sequence the rebuild
+    /// before re-dispatching the originally-denied tool call.
+    Switched,
+    /// User declined; commit the deny exactly as if the classifier had
+    /// returned `GrantRequired` and the grant flow had timed out.
+    Denied,
+    /// Wall-clock expired before the user responded.
+    Timeout,
+    /// Run-level cancel token fired while the wait was in flight
+    /// (Cmd-Q / shutdown / abort). Distinct from `Timeout` so
+    /// shutdown bookkeeping doesn't false-positive as a user inaction.
+    Cancelled,
+}
+
+/// ST8 PR-B2 — error type for [`AgentHarness::submit_profile_switch`].
+/// Same shape as [`SubmitGrantError`] — no widening-specific failure
+/// modes because profile switches don't mutate the envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitSwitchError {
+    /// No pending switch for this `tool_use_id`. Either the id was
+    /// never registered or the wait already timed out / was cancelled
+    /// and the entry was reaped.
+    NoSuchPending,
+    /// The receiving wait task dropped before consuming the outcome —
+    /// the deny has already been committed.
+    ReceiverDropped,
+}
+
+impl std::fmt::Display for SubmitSwitchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSuchPending => f.write_str("no pending profile switch for this tool_use_id"),
+            Self::ReceiverDropped => {
+                f.write_str("profile-switch receiver dropped before outcome was consumed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SubmitSwitchError {}
+
+/// ST8 PR-B2 — typed wrapper around [`PreflightOutcome`] that lets the
+/// orchestrator's tool-call loop distinguish "ordinary deny → grant
+/// flow" from "deny that the classifier wants routed as a profile-
+/// switch suggestion". Lives at the harness layer so the classifier
+/// receives typed [`ExpansionCapability`] / [`DenyReason`] instead of
+/// the stringified shapes already baked into `PreflightOutcome::Deny`.
+#[derive(Debug, Clone)]
+pub enum ProfilePreflightOutcome {
+    /// Existing behaviour — pass through to the matching arm of
+    /// [`PreflightOutcome`].
+    Standard(PreflightOutcome),
+    /// Classifier returned `SuggestProfileSwitch`. The caller MUST
+    /// emit [`AgentEvent::ProfileSwitchPending`] (NOT
+    /// `ScopeExpansionRequested` — the latter is grant-flow-specific
+    /// and would leak as a stale grant in zed's reducer).
+    SuggestSwitch {
+        target_mode: caduceus_permissions::ModeKind,
+        capability: ExpansionCapability,
+        resource: String,
+        /// Synthesized deny content to use if the switch is declined,
+        /// kept identical to what `format_preflight_outcome` would
+        /// have produced so the agent observes the same string in
+        /// both `Standard(Deny)` and "switch declined" cases.
+        deny_content: String,
+    },
 }
 
 /// Outcome of [`AgentHarness::preflight_envelope`].

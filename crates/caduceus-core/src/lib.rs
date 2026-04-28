@@ -1347,6 +1347,35 @@ pub enum AgentEvent {
         outcome: String,
     },
 
+    /// ST8 PR-B2 — profile-switch suggestion. Emitted instead of
+    /// [`AgentEvent::GrantPending`] when a denial has a "classical fit"
+    /// in a more-permissive canonical mode (e.g. Plan-mode `bash` →
+    /// Act). UIs offer the user a switch picker (Switch / Deny);
+    /// sensitive-path denials never reach this event — they always
+    /// route through the grant flow.
+    ///
+    /// Mirror of [`AgentEvent::GrantPending`]'s lifecycle: a paired
+    /// [`AgentEvent::ProfileSwitchResolved`] always follows.
+    ProfileSwitchPending {
+        tool_use_id: String,
+        /// Canonical name of the suggested target mode
+        /// (`"act"` is the only producer today; future expansions
+        /// of the classical-fit table may add others).
+        target_mode: String,
+        /// Capability tag of the originally-denied action: one of
+        /// `"read"`, `"write"`, `"network"`, `"exec"`.
+        capability: String,
+        resource: String,
+        deadline_ms: u64,
+    },
+    /// ST8 PR-B2 — terminal outcome of a pending profile switch.
+    /// `outcome` is a stable short string for telemetry/UI:
+    /// `"switched"`, `"denied"`, `"timeout"`, or `"cancelled"`.
+    ProfileSwitchResolved {
+        tool_use_id: String,
+        outcome: String,
+    },
+
     /// P13 — versioned introspection surface. All envelope/assignment/edge
     /// events ship inside here so schema churn doesn't mint new top-level
     /// variants. Older clients see this under [`AgentEvent::Unknown`].
