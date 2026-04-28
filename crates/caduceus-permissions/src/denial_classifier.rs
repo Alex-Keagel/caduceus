@@ -30,12 +30,20 @@ impl ModeKind {
     /// Map a mode name (matching [`crate::PermissionEnvelope::from_mode_name`]'s
     /// accepted set) to a `ModeKind`. Case-insensitive. Unknown names
     /// → [`ModeKind::Custom`].
+    ///
+    /// Common community aliases collapse to their nearest canonical
+    /// kind so a denial classifier never accidentally falls through to
+    /// `Custom` (which short-circuits the deny-routing table) just
+    /// because someone wired a UI label like "architect" or "debug"
+    /// into the orchestrator. Defence-in-depth — today the
+    /// orchestrator always emits canonical names, but if that
+    /// invariant ever breaks, deny routing keeps working.
     pub fn from_mode_name(name: &str) -> Self {
         match name.to_ascii_lowercase().as_str() {
-            "plan" => Self::Plan,
-            "research" => Self::Research,
-            "act" => Self::Act,
-            "autopilot" => Self::Autopilot,
+            "plan" | "architect" | "arch" | "planning" => Self::Plan,
+            "research" | "explore" | "investigate" => Self::Research,
+            "act" | "code" | "coding" | "implement" | "debug" | "dbg" | "review" => Self::Act,
+            "autopilot" | "auto" | "yolo" => Self::Autopilot,
             _ => Self::Custom,
         }
     }
@@ -176,9 +184,42 @@ mod tests {
 
     #[test]
     fn unknown_mode_names_become_custom() {
-        assert_eq!(ModeKind::from_mode_name("review"), ModeKind::Custom);
+        // Truly unrecognised names — not in the canonical set, not in
+        // the alias set — collapse to Custom.
         assert_eq!(ModeKind::from_mode_name(""), ModeKind::Custom);
         assert_eq!(ModeKind::from_mode_name("plan-strict"), ModeKind::Custom);
+        assert_eq!(ModeKind::from_mode_name("xyzzy"), ModeKind::Custom);
+    }
+
+    /// Common community aliases must collapse to their nearest
+    /// canonical kind so deny-routing keeps working even if the
+    /// orchestrator forwards a non-canonical name. Today this is
+    /// theoretical (orchestrator always emits canonical names) — this
+    /// test pins the contract so the alias defence doesn't silently
+    /// regress.
+    #[test]
+    fn common_mode_aliases_collapse_to_canonical_kinds() {
+        for (alias, kind) in [
+            ("architect", ModeKind::Plan),
+            ("ARCH", ModeKind::Plan),
+            ("planning", ModeKind::Plan),
+            ("explore", ModeKind::Research),
+            ("Investigate", ModeKind::Research),
+            ("code", ModeKind::Act),
+            ("CODING", ModeKind::Act),
+            ("implement", ModeKind::Act),
+            ("debug", ModeKind::Act),
+            ("dbg", ModeKind::Act),
+            ("review", ModeKind::Act),
+            ("auto", ModeKind::Autopilot),
+            ("YOLO", ModeKind::Autopilot),
+        ] {
+            assert_eq!(
+                ModeKind::from_mode_name(alias),
+                kind,
+                "alias {alias:?} should collapse to {kind:?}"
+            );
+        }
     }
 
     #[test]
