@@ -9,8 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod denial_classifier;
 pub mod envelope;
 pub mod grant;
+pub use denial_classifier::{classical_fit, DenialClassification, ModeKind};
 pub use envelope::{
     ApprovalCadence, Decision, DenyReason, EnvelopeScope, ExecPolicy, ExpansionCapability,
     ExpansionDelta, FanoutPolicy, NetworkPolicy, PathAllowlist, PermissionEnvelope,

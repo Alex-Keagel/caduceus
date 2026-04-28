@@ -36,6 +36,11 @@ pub enum DenyReason {
     HostDenied(String),
     ExecDisabled,
     CommandBlacklisted(String),
+    /// Path matches a sensitive-write pattern (e.g. `private/**`). Always
+    /// denied at the engine level so writes go through an explicit grant
+    /// flow regardless of the active mode's allow rules. The grant prompt
+    /// also gives the user a chance to confirm or override the target path.
+    SensitivePath(String),
 }
 
 impl std::fmt::Display for DenyReason {
@@ -47,6 +52,10 @@ impl std::fmt::Display for DenyReason {
             Self::HostDenied(h) => write!(f, "host '{h}' is denied"),
             Self::ExecDisabled => write!(f, "command execution is disabled"),
             Self::CommandBlacklisted(c) => write!(f, "command '{c}' is always denied"),
+            Self::SensitivePath(p) => write!(
+                f,
+                "path '{p}' is a sensitive location and requires explicit grant + path confirmation"
+            ),
         }
     }
 }
@@ -370,6 +379,28 @@ pub struct PermissionEnvelope {
     /// Maximum number of skills that may activate per `resolve_lazy()` call.
     /// Fixes the "skill starvation" issue where only 3 skills could activate.
     pub skill_budget: usize,
+    /// Globs (path-allowlist style) for write paths that ALWAYS require an
+    /// explicit grant prompt regardless of the preset's allow/deny lists.
+    /// Default: `["private/**"]` — the `private/` convention used across
+    /// every Caduceus repo for user-curated context, audits, and reviewer
+    /// outputs. Sensitive paths win over both `write.allow` and
+    /// `intercept_denied`, forcing a `Decision::Deny(SensitivePath)` so the
+    /// orchestrator's grant flow runs and the user gets to confirm the
+    /// target path before any bytes hit disk.
+    ///
+    /// `#[serde(default)]` keeps stored envelopes from before this field
+    /// existed deserializable (they decode to an empty list and lose the
+    /// protection until rebuilt via `from_mode_name`).
+    #[serde(default)]
+    pub sensitive_write_paths: Vec<String>,
+}
+
+/// Default sensitive-write globs every preset ships with. Engine-side
+/// enforcement of the cross-repo `private/` policy: reads are open
+/// (so agents can ground in user-provided context), writes always
+/// route through the grant flow.
+pub fn default_sensitive_write_paths() -> Vec<String> {
+    vec!["private/**".into()]
 }
 
 impl PermissionEnvelope {
@@ -387,6 +418,7 @@ impl PermissionEnvelope {
             treat_tool_output_as_untrusted: true,
             fanout_policy: FanoutPolicy::RubberDuckOnly,
             skill_budget: 6,
+            sensitive_write_paths: default_sensitive_write_paths(),
         }
     }
 
@@ -403,6 +435,7 @@ impl PermissionEnvelope {
             treat_tool_output_as_untrusted: true,
             fanout_policy: FanoutPolicy::MultiPersona,
             skill_budget: 8,
+            sensitive_write_paths: default_sensitive_write_paths(),
         }
     }
 
@@ -422,6 +455,7 @@ impl PermissionEnvelope {
             treat_tool_output_as_untrusted: true,
             fanout_policy: FanoutPolicy::RubberDuckOnly,
             skill_budget: 6,
+            sensitive_write_paths: default_sensitive_write_paths(),
         }
     }
 
@@ -468,6 +502,20 @@ impl PermissionEnvelope {
     }
 
     pub fn check_write(&self, path: &Path) -> Decision {
+        // Sensitive-write paths win over both allow and `intercept_denied`.
+        // We force `Deny(SensitivePath)` so the harness emits a permission
+        // denial preflight outcome → the orchestrator opens a pending-grant
+        // entry → the UI picker prompts the user → on Allow,
+        // `propose_widened_envelope` widens the envelope to permit this
+        // specific path. This gives the engine-side enforcement the
+        // cross-repo `private/` policy expects: writes there are never
+        // silent in any mode.
+        let s = path.to_string_lossy();
+        for pat in &self.sensitive_write_paths {
+            if glob_match(pat, &s) {
+                return Decision::Deny(DenyReason::SensitivePath(s.into_owned()));
+            }
+        }
         self.write.check(path)
     }
 
@@ -485,6 +533,14 @@ impl PermissionEnvelope {
     /// requested envelope. Sub-agents cannot widen: deny-wins for paths,
     /// enabled-AND for network/exec, the stricter cadence wins.
     pub fn restrict_to(&self, inner: &PermissionEnvelope) -> PermissionEnvelope {
+        // Sensitive paths union: a child can ADD sensitive globs but never
+        // drop them. Deny-wins semantics extended to the sensitive list.
+        let mut sensitive = self.sensitive_write_paths.clone();
+        for s in &inner.sensitive_write_paths {
+            if !sensitive.contains(s) {
+                sensitive.push(s.clone());
+            }
+        }
         PermissionEnvelope {
             read: self.read.restrict_to(&inner.read),
             write: self.write.restrict_to(&inner.write),
@@ -496,6 +552,7 @@ impl PermissionEnvelope {
                 || inner.treat_tool_output_as_untrusted,
             fanout_policy: inner.fanout_policy,
             skill_budget: self.skill_budget.min(inner.skill_budget),
+            sensitive_write_paths: sensitive,
         }
     }
 }
@@ -625,6 +682,159 @@ mod tests {
         let e = PermissionEnvelope::plan_preset();
         assert_eq!(e.check_read(&p("src/main.rs")), Decision::Allow);
         assert_eq!(e.check_read(&p("any/path/deep.txt")), Decision::Allow);
+    }
+
+    /// Cross-profile contract — the project-local `private/` convention
+    /// (research notes, audits, scratch context) MUST be readable from
+    /// every preset. The corresponding write-side rule (writes always
+    /// require a grant prompt with target-path confirmation) is a
+    /// behavioral rule enforced by the agent contract in
+    /// `Dev/.github/copilot-instructions.md` — this test only locks the
+    /// envelope-level READ guarantee so future preset edits can't
+    /// silently regress it.
+    #[test]
+    fn all_presets_allow_reading_private_directory() {
+        let private_paths = [
+            p("private/notes.md"),
+            p("private/audits/wiring-2026.md"),
+            p("private/reviews/pr-42.md"),
+            p("private/skills/draft.md"),
+        ];
+        for path in &private_paths {
+            assert_eq!(
+                PermissionEnvelope::plan_preset().check_read(path),
+                Decision::Allow,
+                "plan must read {path:?}"
+            );
+            assert_eq!(
+                PermissionEnvelope::research_preset().check_read(path),
+                Decision::Allow,
+                "research must read {path:?}"
+            );
+            assert_eq!(
+                PermissionEnvelope::act_preset(vec!["src/**".into()], vec![]).check_read(path),
+                Decision::Allow,
+                "act must read {path:?}"
+            );
+            assert_eq!(
+                PermissionEnvelope::autopilot_preset(vec!["src/**".into()], vec![])
+                    .check_read(path),
+                Decision::Allow,
+                "autopilot must read {path:?}"
+            );
+        }
+    }
+
+    /// Locks engine-side enforcement of the cross-repo `private/` policy:
+    /// every preset MUST deny writes under `private/**` with
+    /// `DenyReason::SensitivePath`, regardless of whether the preset's
+    /// `write` allowlist would otherwise permit the path. The orchestrator's
+    /// existing grant flow then prompts the user to confirm both the intent
+    /// and the target path before any bytes hit disk.
+    #[test]
+    fn all_presets_intercept_writes_to_private_directory() {
+        let private_writes = [
+            p("private/notes.md"),
+            p("private/audits/wiring-2026.md"),
+            p("private/reviews/pr-42.md"),
+            p("private/skills/draft.md"),
+        ];
+        for path in &private_writes {
+            for (label, env) in [
+                ("plan", PermissionEnvelope::plan_preset()),
+                ("research", PermissionEnvelope::research_preset()),
+                (
+                    "act-with-private-allow",
+                    PermissionEnvelope::act_preset(
+                        // Even an explicit allow for `private/**` must NOT
+                        // override the sensitive-path block.
+                        vec!["src/**".into(), "private/**".into()],
+                        vec![],
+                    ),
+                ),
+                (
+                    "autopilot-with-private-allow",
+                    PermissionEnvelope::autopilot_preset(
+                        vec!["src/**".into(), "private/**".into()],
+                        vec![],
+                    ),
+                ),
+            ] {
+                match env.check_write(path) {
+                    Decision::Deny(DenyReason::SensitivePath(_)) => {}
+                    other => panic!(
+                        "{label} must Deny(SensitivePath) on write to {path:?}, got {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Sensitive-path block must NOT bleed into reads (reads remain open).
+    #[test]
+    fn sensitive_paths_do_not_block_reads() {
+        let env = PermissionEnvelope::plan_preset();
+        assert_eq!(env.check_read(&p("private/audits/foo.md")), Decision::Allow);
+    }
+
+    /// Non-private writes must remain unaffected by the sensitive-path block.
+    #[test]
+    fn sensitive_paths_do_not_affect_non_private_writes() {
+        let env = PermissionEnvelope::act_preset(vec!["src/**".into()], vec![]);
+        assert_eq!(env.check_write(&p("src/main.rs")), Decision::Allow);
+        // Out-of-allow path still denies for the original reason
+        // (NotInAllowList), not SensitivePath.
+        match env.check_write(&p("docs/readme.md")) {
+            Decision::Deny(DenyReason::NotInAllowList | DenyReason::MatchesDeny) => {}
+            other => panic!("expected NotInAllowList / MatchesDeny, got {other:?}"),
+        }
+    }
+
+    /// `restrict_to` must union sensitive-path globs (a child can ADD
+    /// sensitive globs but never drop them — deny-wins).
+    #[test]
+    fn restrict_to_unions_sensitive_write_paths() {
+        let parent = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+        let mut child = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+        child.sensitive_write_paths.push("secrets/**".into());
+
+        let restricted = parent.restrict_to(&child);
+        assert!(restricted
+            .sensitive_write_paths
+            .contains(&"private/**".to_string()));
+        assert!(restricted
+            .sensitive_write_paths
+            .contains(&"secrets/**".to_string()));
+
+        // And the union actually fires on writes to either glob.
+        match restricted.check_write(&p("secrets/key.pem")) {
+            Decision::Deny(DenyReason::SensitivePath(_)) => {}
+            other => panic!("expected SensitivePath, got {other:?}"),
+        }
+    }
+
+    /// Backwards-compat: an envelope deserialised from a payload that
+    /// pre-dates `sensitive_write_paths` must decode with an empty list
+    /// (and therefore lose the protection until rebuilt via a preset).
+    #[test]
+    fn sensitive_write_paths_serde_default() {
+        // Round-trip a current envelope through JSON, strip the new field
+        // to simulate a payload from before this change shipped, and verify
+        // the deserialised value (a) decodes successfully and (b) has an
+        // empty sensitive list (i.e. the protection is not silently
+        // synthesised — it has to come from the wire or a preset rebuild).
+        let env = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+        let mut json = serde_json::to_value(&env).expect("serialize");
+        json.as_object_mut()
+            .unwrap()
+            .remove("sensitive_write_paths");
+
+        let restored: PermissionEnvelope =
+            serde_json::from_value(json).expect("legacy payload should deserialize");
+        assert!(restored.sensitive_write_paths.is_empty());
+        // And without the protection, a private/ write goes through the
+        // normal allow check (which Allows here because we passed `**`).
+        assert_eq!(restored.check_write(&p("private/foo.md")), Decision::Allow);
     }
 
     #[test]

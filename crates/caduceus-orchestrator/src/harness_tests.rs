@@ -7,7 +7,10 @@
 //! `#[cfg(test)] mod harness_tests;` in `lib.rs`.
 
 use super::*;
-use crate::agent_harness::{PendingGrantEntry, SubmitGrantError, SubmitGrantWideningError};
+use crate::agent_harness::{
+    PendingGrantEntry, PendingSwitchEntry, SubmitGrantError, SubmitGrantWideningError,
+    SubmitSwitchError, SwitchOutcome,
+};
 
 /// Test helper — wrap a raw oneshot tx in a [`PendingGrantEntry`] with
 /// placeholder capability/resource. Existing routing tests don't exercise
@@ -4019,4 +4022,148 @@ async fn st8_pr3d_widening_drains_entry_even_on_error() {
         h.pending_grants.lock().await.is_empty(),
         "entry must be drained on error so a retry sees NoSuchPending, not double-fire"
     );
+}
+
+// ── ST8 PR-B2 — submit_profile_switch unit-style tests ──────────────────
+
+/// Helper — register a [`PendingSwitchEntry`] under `id` and return the
+/// corresponding receiver. Mirrors `insert_entry` for the grant flow.
+async fn insert_switch_entry(
+    h: &AgentHarness,
+    id: &str,
+    tx: tokio::sync::oneshot::Sender<SwitchOutcome>,
+    target_mode: &str,
+    capability: &str,
+    resource: &str,
+) {
+    let mut map = h.pending_switches.lock().await;
+    map.insert(
+        id.into(),
+        PendingSwitchEntry {
+            tx,
+            target_mode: target_mode.into(),
+            capability: capability.into(),
+            resource: resource.into(),
+        },
+    );
+}
+
+#[tokio::test]
+async fn pr_b2_submit_profile_switch_no_pending_returns_error() {
+    let h = mk_plain_harness();
+    let err = h
+        .submit_profile_switch("never-registered", SwitchOutcome::Switched)
+        .await
+        .unwrap_err();
+    assert_eq!(err, SubmitSwitchError::NoSuchPending);
+}
+
+#[tokio::test]
+async fn pr_b2_submit_profile_switch_routes_outcome_and_clears_entry() {
+    let h = mk_plain_harness();
+    let (tx, rx) = tokio::sync::oneshot::channel::<SwitchOutcome>();
+    insert_switch_entry(&h, "call-1", tx, "act", "exec", "ls").await;
+
+    h.submit_profile_switch("call-1", SwitchOutcome::Switched)
+        .await
+        .expect("submit ok");
+    assert_eq!(rx.await.unwrap(), SwitchOutcome::Switched);
+    assert!(
+        h.pending_switches.lock().await.is_empty(),
+        "entry must be drained on submit"
+    );
+}
+
+#[tokio::test]
+async fn pr_b2_submit_profile_switch_receiver_dropped_returns_error() {
+    let h = mk_plain_harness();
+    let (tx, rx) = tokio::sync::oneshot::channel::<SwitchOutcome>();
+    insert_switch_entry(&h, "call-2", tx, "act", "exec", "ls").await;
+    drop(rx);
+    let err = h
+        .submit_profile_switch("call-2", SwitchOutcome::Denied)
+        .await
+        .unwrap_err();
+    assert_eq!(err, SubmitSwitchError::ReceiverDropped);
+}
+
+#[tokio::test]
+async fn pr_b2_submit_profile_switch_second_call_returns_no_pending() {
+    let h = mk_plain_harness();
+    let (tx, rx) = tokio::sync::oneshot::channel::<SwitchOutcome>();
+    insert_switch_entry(&h, "call-3", tx, "act", "write", "src/main.rs").await;
+    let _ = h
+        .submit_profile_switch("call-3", SwitchOutcome::Switched)
+        .await;
+    let _ = rx.await;
+    let err = h
+        .submit_profile_switch("call-3", SwitchOutcome::Switched)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        SubmitSwitchError::NoSuchPending,
+        "second submit on the same id must not double-fire"
+    );
+}
+
+#[test]
+fn pr_b2_with_permission_mode_sets_field() {
+    let h = mk_plain_harness().with_permission_mode("plan");
+    assert_eq!(h.permission_mode(), Some("plan"));
+}
+
+#[test]
+fn pr_b2_default_permission_mode_is_none() {
+    let h = mk_plain_harness();
+    assert_eq!(h.permission_mode(), None);
+}
+
+#[test]
+fn pr_b2_preflight_with_profile_no_envelope_is_standard_allow() {
+    let h = mk_plain_harness();
+    let out = h.preflight_envelope_with_profile("write_file", &serde_json::json!({"path": "x"}));
+    assert!(matches!(
+        out,
+        crate::agent_harness::ProfilePreflightOutcome::Standard(PreflightOutcome::Allow)
+    ));
+}
+
+#[test]
+fn pr_b2_preflight_with_profile_plan_exec_suggests_switch() {
+    // Plan + bash → exec deny → classifier returns SuggestSwitch{Act}.
+    let h = mk_harness_with_env(PermissionEnvelope::plan_preset()).with_permission_mode("plan");
+    let out = h.preflight_envelope_with_profile("bash", &serde_json::json!({"command": "ls"}));
+    match out {
+        crate::agent_harness::ProfilePreflightOutcome::SuggestSwitch {
+            target_mode,
+            capability,
+            resource,
+            ..
+        } => {
+            assert_eq!(target_mode, caduceus_permissions::ModeKind::Act);
+            assert_eq!(capability, caduceus_permissions::ExpansionCapability::Exec);
+            assert!(
+                !resource.is_empty(),
+                "resource must be populated from the bash input"
+            );
+        }
+        other => panic!("expected SuggestSwitch, got {other:?}"),
+    }
+}
+
+#[test]
+fn pr_b2_preflight_with_profile_act_deny_is_standard_deny() {
+    // Act + write outside allow → classifier returns GrantRequired
+    // (Act has no classical fit) → ProfilePreflightOutcome::Standard.
+    let env = PermissionEnvelope::act_preset(vec!["src/**".into()], vec![]);
+    let h = mk_harness_with_env(env).with_permission_mode("act");
+    let out = h.preflight_envelope_with_profile(
+        "write_file",
+        &serde_json::json!({"path": "tools/x.sh", "content": "echo hi"}),
+    );
+    assert!(matches!(
+        out,
+        crate::agent_harness::ProfilePreflightOutcome::Standard(PreflightOutcome::Deny { .. })
+    ));
 }
