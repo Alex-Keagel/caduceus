@@ -3360,12 +3360,9 @@ impl AgentHarness {
                                     continue;
                                 }
 
-                                let target_mode_str = target_mode
-                                    .canonical_name()
-                                    .unwrap_or("custom")
-                                    .to_string();
-                                let capability_str_owned =
-                                    capability_str(&capability).to_string();
+                                let target_mode_str =
+                                    target_mode.canonical_name().unwrap_or("custom").to_string();
+                                let capability_str_owned = capability_str(&capability).to_string();
                                 let resource_owned = resource.clone();
 
                                 let pending_switches = self.pending_switches.clone();
