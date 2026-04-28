@@ -865,10 +865,20 @@ impl AgentHarness {
         };
         let entry = entry.ok_or(SubmitGrantWideningError::NoSuchPending)?;
 
-        let current = self
-            .permission_envelope
-            .as_ref()
-            .ok_or(SubmitGrantWideningError::NoActiveEnvelope)?;
+        let current = self.permission_envelope.as_ref().ok_or_else(|| {
+            // Configuration error, not a race: the harness was set up
+            // without an envelope but resume-on-grant was enabled. Logged
+            // at WARN so it doesn't get misread as a benign timeout
+            // (the deny task observes the dropped tx as Canceled, which
+            // it treats as Timeout). See ST8 PR-3D wiring audit.
+            tracing::warn!(
+                tool_use_id = %tool_use_id,
+                "submit_grant_widening: harness has no active envelope; \
+                 grant cannot be widened. Configure permission_envelope \
+                 before enabling resume-on-grant."
+            );
+            SubmitGrantWideningError::NoActiveEnvelope
+        })?;
 
         let updated = caduceus_permissions::propose_widened_envelope(
             current,
@@ -2808,6 +2818,24 @@ impl AgentHarness {
                                         caduceus_permissions::GrantOutcome,
                                     >();
                                     {
+                                        // Defense in depth — the capability tag
+                                        // SHOULD always be one of the four
+                                        // canonical strings handled by
+                                        // propose_widened_envelope. If a
+                                        // future classification path ever
+                                        // produces a malformed tag we want
+                                        // it to fail loudly in debug builds
+                                        // rather than only at user-click time
+                                        // with UnknownCapability. See ST8
+                                        // PR-3D wiring audit (Finding #3).
+                                        debug_assert!(
+                                            matches!(
+                                                capability.as_str(),
+                                                "read" | "write" | "network" | "exec"
+                                            ),
+                                            "PendingGrantEntry: invalid capability tag {capability:?}; \
+                                             expected one of read|write|network|exec"
+                                        );
                                         let mut map = pending_grants.lock().await;
                                         map.insert(
                                             tool_use_id_str.clone(),

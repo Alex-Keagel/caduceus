@@ -627,6 +627,47 @@ mod tests {
         assert_eq!(e.check_read(&p("any/path/deep.txt")), Decision::Allow);
     }
 
+    /// Cross-profile contract — the project-local `private/` convention
+    /// (research notes, audits, scratch context) MUST be readable from
+    /// every preset. The corresponding write-side rule (writes always
+    /// require a grant prompt with target-path confirmation) is a
+    /// behavioral rule enforced by the agent contract in
+    /// `Dev/.github/copilot-instructions.md` — this test only locks the
+    /// envelope-level READ guarantee so future preset edits can't
+    /// silently regress it.
+    #[test]
+    fn all_presets_allow_reading_private_directory() {
+        let private_paths = [
+            p("private/notes.md"),
+            p("private/audits/wiring-2026.md"),
+            p("private/reviews/pr-42.md"),
+            p("private/skills/draft.md"),
+        ];
+        for path in &private_paths {
+            assert_eq!(
+                PermissionEnvelope::plan_preset().check_read(path),
+                Decision::Allow,
+                "plan must read {path:?}"
+            );
+            assert_eq!(
+                PermissionEnvelope::research_preset().check_read(path),
+                Decision::Allow,
+                "research must read {path:?}"
+            );
+            assert_eq!(
+                PermissionEnvelope::act_preset(vec!["src/**".into()], vec![]).check_read(path),
+                Decision::Allow,
+                "act must read {path:?}"
+            );
+            assert_eq!(
+                PermissionEnvelope::autopilot_preset(vec!["src/**".into()], vec![])
+                    .check_read(path),
+                Decision::Allow,
+                "autopilot must read {path:?}"
+            );
+        }
+    }
+
     #[test]
     fn act_preset_per_folder_allow() {
         let e = PermissionEnvelope::act_preset(
