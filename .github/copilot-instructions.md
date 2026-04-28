@@ -83,6 +83,21 @@ For non-trivial features (multi-file, architectural, new tools):
 - Auto-compact MUST trigger before context explosion (threshold: 40 messages)
 - All `.unwrap()` calls are forbidden — use `?` or `.map_err()`
 
+## Project-local `private/` files — read open, write requires grant + path
+
+This repo's top-level `private/` directory holds audits, reviews, scratch notes, and reviewer/critique artifacts. The convention is **profile-agnostic** (same rules in plan, research, act, autopilot, and any custom mode) and is also enforced as an **envelope-level invariant**: all four presets in `caduceus-permissions/src/envelope.rs` allow reading `private/**` (locked in by the `all_presets_allow_reading_private_directory` test).
+
+**Read access — always permitted.** Any agent in any profile may read freely from `private/**` to ground its work. No prompt, no grant flow.
+
+**Write access — never silent.** Before writing, creating, or modifying any file under `private/`, the agent MUST do BOTH of the following in a single `ask_user` interaction:
+
+1. **Ask permission to write** — explicitly state intent (kind of artifact, which workflow produced it, why `private/` vs. session workspace).
+2. **Ask where to write** — propose a target subpath (e.g. `private/audits/<slug>-<date>.md`, `private/reviews/<pr>-<date>.md`) AND offer the user the chance to override the slug, subdirectory, or filename.
+
+This applies to every write tool — `create`, `edit`, `bash` redirects (`> private/foo`, `tee private/foo`), `git add` of newly authored `private/**` files, and any agent-generated artifact a workflow would otherwise auto-place there. **Exception:** an explicit user request to update a specific `private/` file (e.g. *"update `private/audits/foo.md` with X"*) does not need re-prompting for that same file in that same turn.
+
+See `~/Dev/.github/copilot-instructions.md` for the cross-repo source of truth.
+
 ## Conventions
 
 - Crate names: `caduceus-{name}` (kebab-case)
