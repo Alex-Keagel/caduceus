@@ -2779,4 +2779,56 @@ at the same commit.
 
 ---
 
+## Appendix Z. Z-namespace registry (normative)
+
+This appendix is the canonical index of all `Z-N` invariants
+referenced throughout the four P0 specs (orchestrator algorithm,
+agent runner contract, multi-repo workspace model, orchestrator
+status snapshot).  Implementations MUST satisfy every Z-N invariant
+that appears in their owning spec; this index is a navigation aid,
+NOT a substitute for the in-line definitions.
+
+Resolves DAG todo `xs02-z-namespace-registry-appendix`.  Iter-28
+backlog item carried forward from spec #4 review B18 fix 8.
+
+| Z-N | Owner | Topic |
+|-----|-------|-------|
+| Z-1 | spec #1 | `disconnect_generation` freshness key paired with `attempt`; on_reattach MUST NOT mutate (iter-28 #1-6). |
+| Z-2 | spec #1, spec #4 | Spec #1 §3.0; cross-cited from spec #4 §3.4 fingerprint stability. |
+| Z-3 | spec #1 | Common terminal-path helper (`terminate_and_finish`); §3.5/§3.6/`DaemonTerminated` arm. |
+| Z-4 | spec #4 | §4.1 RunRow shape stability between snapshots. |
+| Z-5 | spec #1, spec #4 | `RunAttempt` monotonicity caveat (iter-28 #1-2); ring eviction semantics. |
+| Z-6 | spec #1, spec #2, spec #4 | `boot_id` scope; per-process random; survives across handlers; replayed in subscribe (iter-28 #4-5). |
+| Z-7 | spec #4 | I-7 `SnapshotFingerprint` derivation. |
+| Z-8 | spec #1 | Engine-attested last-reported tokens are authoritative; daemon MUST NOT inflate. |
+| Z-9 | spec #1, spec #2, spec #4 | Livelock guard counter (`dispatch_defer_attempts`); `max_dispatch_defer_attempts` config field; surfaces in snapshot diagnostics. |
+| Z-10 | spec #3 | §3.5 placeholder row insertion ordering (iter-28 #3-2). |
+| Z-11 | spec #2 | §4.1 closed v1 event-kind set; cross_run_handoff is reserved out (iter-28 #2-8). |
+| Z-12 | spec #3 | §3.6 cleanup short-circuit semantics (iter-28 #3-4): `OrphanedNoSlug` / `OrphanedNoLeaf`. |
+| Z-13 | spec #3 | §3.7 caller table — synchronous create vs OrphanReclaim vs cleanup (iter-28 #3-6). |
+| Z-14 | spec #3 | I-7 hook-failure rollback contract; `Error::HookFailed` MUST surface unaltered. |
+| Z-15 | spec #3 | I-9 hook isolation; default-deny daemon-env inheritance. |
+| Z-16 | spec #3 | I-6 derivable `workspace_id` (iter-28 #3-3 + #3-10: BLAKE3-128 keyed, 32-byte key, `safe_run_id` input). |
+| Z-17 | spec #4 | §3.4 subscribe outcome algorithm single normative source (iter-28 #4-4). |
+| Z-18 | spec #1, spec #4 | Trust boundary capability-scoped Cmd senders (iter-28 #1-1); spec #4 §1.2 local-only transport gate cross-references. |
+| Z-19 | spec #3 | §5B.2 OrphanReclaim canonical bypass scope: skip ONLY step 4 (probe) regardless of enqueue source (iter-28 #3-9). |
+| Z-20 | spec #4 | §4.5 `RunDetail.exit_reason` invariant: `Some` iff `RunStatus::Finished` (iter-28 #4-2). |
+| Z-21 | spec #2 | §3.1 `shell_wrap` fail-closed gate (iter-28 #2-5): runtime input forbidden. |
+| Z-22 | spec #2 | §3.3 stop_cascade composite bound `ε₁ + 2·grace_period_ms + ε₂` holds on all platforms (iter-28 #2-4). |
+| Z-23 | spec #2 | §4.4 `runner_seq` post-Ok stamp rule (iter-28 #2-7): single canonical statement; stamp ONLY after `forward_to_daemon` returns Ok. |
+| Z-24 | spec #2 | §4.1 `seq=0` reserved-value stutter classifier (iter-28 #2-6): fires BEFORE high-water comparison. |
+| Z-25 | spec #2 | §4.1 heartbeat-timeout policy (iter-28 #2-3): `protocol_violation` + `stop_cascade(reason="heartbeat_timeout")`. |
+| Z-26 | spec #2 | §3.3 stage 3b SIGKILL outcome honesty (iter-28 #2-2): `signal_error` on dispatch fail; `reap_timeout` + `stage="sigkill_timeout"` on reap timeout. |
+| Z-27 | spec #2 | §3.2 token reconciliation absolute-mode wins on `turn_end.tokens_at_turn_end` and `exit.final_tokens` (iter-28 #2-1). |
+| Z-28 | spec #2 | §3.2 advertised-exit recording on `Exit` frame so the cascade reaper avoids racing the runner's own exit path. |
+| Z-29 | spec #4 | §3.4 boot-edge clause (a)/(P) routing when `s_c` absent from replay index (iter-28 #4-3); replay index starts empty on boot. |
+
+**Stability:** Z-numbers MUST NOT be reused after retirement.  When a
+Z-N is retired (because the underlying invariant is subsumed or
+contradicted by a successor invariant), this table MUST mark it
+`RETIRED` with a pointer to the replacement.  No retired Z-numbers
+exist as of iter-27.
+
+---
+
 *End of spec.*
