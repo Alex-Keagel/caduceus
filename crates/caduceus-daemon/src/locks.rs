@@ -145,6 +145,12 @@ pub struct CreateGuards {
     _ws: parking_lot::ArcMutexGuard<parking_lot::RawMutex, ()>,
 }
 
+impl std::fmt::Debug for CreateGuards {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateGuards").finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

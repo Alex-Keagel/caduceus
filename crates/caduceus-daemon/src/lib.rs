@@ -18,12 +18,15 @@
 
 pub mod clock;
 pub mod config;
+pub mod env_exports;
 pub mod error;
 pub mod ipc;
 pub mod lifecycle;
 pub mod locks;
 pub mod mailbox;
 pub mod registry;
+pub mod registry_store;
+pub mod shared_repo_lock;
 pub mod storage;
 pub mod telemetry;
 pub mod test_harness;
@@ -31,6 +34,7 @@ pub mod workspace;
 
 pub use clock::{Clock, RealClock, SharedClock, VirtualClock};
 pub use config::{Config, ConfigError};
+pub use env_exports::workspace_env_exports;
 pub use error::{DaemonError, DaemonResult};
 pub use lifecycle::{Lifecycle, LifecycleState, ShutdownReason};
 pub use locks::{CreateGuards, RegistryGuard, WorkspaceLocks};
@@ -39,6 +43,8 @@ pub use mailbox::{
     SnapshotClientSender, SubsystemSender, TimerSender,
 };
 pub use registry::{RepoCoordinate, WorkspaceRegistryRow, WorkspaceStatus};
+pub use registry_store::{RegistryError, RegistryStore};
+pub use shared_repo_lock::{SharedRepoCaller, SharedRepoLockStrategy};
 pub use storage::{atomic_write, JsonRowStore, Row, StorageError, StorageResult};
 pub use telemetry::{init_tracing, Counter, Metrics};
 pub use workspace::{
