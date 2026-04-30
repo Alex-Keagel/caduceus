@@ -32,6 +32,7 @@ pub mod mailbox;
 pub mod orphan_reclaim;
 pub mod registry;
 pub mod registry_store;
+pub mod runner_process;
 pub mod shared_repo_lock;
 pub mod storage;
 pub mod telemetry;
@@ -65,6 +66,10 @@ pub use orphan_reclaim::{
 };
 pub use registry::{RepoCoordinate, WorkspaceRegistryRow, WorkspaceStatus};
 pub use registry_store::{RegistryError, RegistryStore};
+pub use runner_process::{
+    validate_shell_wrap, CascadeOutcome, CascadeStage, RunnerError, RunnerProcess, RunnerState,
+    SpawnSpec, StopReason,
+};
 pub use shared_repo_lock::{SharedRepoCaller, SharedRepoLockStrategy};
 pub use storage::{atomic_write, JsonRowStore, Row, StorageError, StorageResult};
 pub use telemetry::{init_tracing, Counter, Metrics};
