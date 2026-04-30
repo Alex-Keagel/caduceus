@@ -48,6 +48,7 @@ pub mod storage;
 pub mod telemetry;
 pub mod test_harness;
 pub mod wire_codec;
+pub mod workflow;
 pub mod workspace;
 
 pub use cleanup_workspace::{cleanup_workspace, CleanupArgs, CleanupCallerClass, CleanupOutcome};
@@ -127,6 +128,10 @@ pub use telemetry::{init_tracing, Counter, Metrics};
 pub use wire_codec::{
     decode_line, encode_frame, DropReason, ExitKind, Frame, FrameId, FramePayload, TokenMode,
     TokensAbsolute, MAX_FRAME_BYTES,
+};
+pub use workflow::{
+    resolve_profile, shell_quote, HotReloadableWorkflow, Workflow, WorkflowError, WorkflowHook,
+    WorkflowHookPhase, WorkflowProtocol,
 };
 pub use workspace::{
     build_workspace_path, sanitize_repo_slug, sanitize_run_id, validate_workspace_path,
