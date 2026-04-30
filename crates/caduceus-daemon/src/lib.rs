@@ -23,6 +23,7 @@ pub mod create_workspace;
 pub mod env_exports;
 pub mod error;
 pub mod hooks;
+pub mod inbound_queue;
 pub mod ipc;
 pub mod leaf_ownership;
 pub mod lifecycle;
@@ -35,6 +36,7 @@ pub mod shared_repo_lock;
 pub mod storage;
 pub mod telemetry;
 pub mod test_harness;
+pub mod wire_codec;
 pub mod workspace;
 
 pub use cleanup_workspace::{cleanup_workspace, CleanupArgs, CleanupCallerClass, CleanupOutcome};
@@ -46,6 +48,10 @@ pub use error::{DaemonError, DaemonResult};
 pub use hooks::{
     HookExecutor, HookOutcome, HookSpec, NoopHookExecutor, SubprocessHookExecutor,
     DEFAULT_HOOK_TIMEOUT,
+};
+pub use inbound_queue::{
+    classify_seq, inbound_queue, FrameIdAllocator, InboundQueue, InboundReceiver, RunnerSeqCounter,
+    SeqClassification,
 };
 pub use leaf_ownership::{hand_off_leaf, RunnerIdentity};
 pub use lifecycle::{Lifecycle, LifecycleState, ShutdownReason};
@@ -62,6 +68,10 @@ pub use registry_store::{RegistryError, RegistryStore};
 pub use shared_repo_lock::{SharedRepoCaller, SharedRepoLockStrategy};
 pub use storage::{atomic_write, JsonRowStore, Row, StorageError, StorageResult};
 pub use telemetry::{init_tracing, Counter, Metrics};
+pub use wire_codec::{
+    decode_line, encode_frame, DropReason, ExitKind, Frame, FrameId, FramePayload, TokenMode,
+    TokensAbsolute, MAX_FRAME_BYTES,
+};
 pub use workspace::{
     build_workspace_path, sanitize_repo_slug, sanitize_run_id, validate_workspace_path,
     workspace_id, RepoSlug, SafeRunId, WorkspaceIdKey,
