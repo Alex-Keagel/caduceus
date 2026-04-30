@@ -22,9 +22,7 @@
 >    `safe_run_id`, `target`, and step 9's `workspace_id`. Reorder so step
 >    1.4 first computes `safe_run_id`, `target`, `workspace_id` (per I-6),
 >    then inserts the `Status::Creating` row; step 2 MUST NOT re-derive.
-> 3. **§3.5 step 9 vs §5 I-6 `workspace_id` derivation** — one site keys
->    from raw `run_id`, the other from sanitized form. Canonicalize to
->    `BLAKE3_128_keyed(slug || 0x1F || safe_run_id)` everywhere.
+> 3. ~~**§3.5 step 9 vs §5 I-6 `workspace_id` derivation**~~ — **RESOLVED 2026-04-30**: §3.5 step 9 and §5 I-6 both now use `BLAKE3_128_keyed(slug || 0x1F || safe_run_id)`.
 > 4. **§3.6 cleanup short-circuit** — "short-circuit to cleanup-cleared"
 >    is undefined: which steps skip, do hooks run, when is the registry
 >    row deleted? Specify: on `ENOENT` at slug → classify
@@ -50,8 +48,7 @@
 >    rationale wall, drift-prone. Reduce to single-source-of-truth
 >    statement: `OrphanReclaim` re-entry skips ONLY step 4 (layered
 >    liveness probe) regardless of enqueue source.
-> 10. **§5 I-6 BLAKE3 key size** — currently says 16-byte key; BLAKE3
->     keyed mode uses 32-byte key. Correct invariant text.
+> 10. ~~**§5 I-6 BLAKE3 key size**~~ — **RESOLVED 2026-04-30**: I-6 now correctly specifies a 32-byte key per BLAKE3 keyed-mode requirements.
 
 ## 0. Header & Attribution
 
@@ -745,7 +742,7 @@ This is the highest-risk algorithm in the spec. Implementations MUST cover it wi
    write access (EACCES) under the leaf's mode. See §5A.5 for
    the full normative form and rationale.
 9. **Snapshot metadata.** Construct the `Workspace` record with:
-   - `workspace_id = wsp_<hex(BLAKE3_128_keyed(slug || 0x1F || run_id))>`
+   - `workspace_id = wsp_<hex(BLAKE3_128_keyed(slug || 0x1F || safe_run_id))>`
    - `path = canonical_target` (the canonicalized form returned by
      `validate_workspace_path` in step 3; see Invariant I-1). The
      pre-canonical `target` from step 2 MUST NOT be persisted.
@@ -1598,7 +1595,7 @@ The following invariants are normative. Implementations MUST establish these by 
 
 - **I-4 (Slug stickiness).** Once a `RepoCoordinate` is recorded with `slug = S`, S MUST NOT change for the lifetime of that RepoCoordinate's registry row. If `remote_url` changes (owner rename, host migration), the registry MUST keep S and update only `remote_url` and `default_branch`. Rationale: existing Workspace paths embed S; mutating S would require an on-disk move with full `cleanup_workspace` semantics, which is operator-territory, not automatic.
 - **I-5 (Shared-repo serialization).** Two Workspaces with the same `repo_coordinate.slug` MAY coexist in the registry **only** under §3.7 strategy (b) or (c). Under strategy (a) (v1 default), at most one Workspace per `repo_coordinate.slug` exists at any time. Concurrent writes to the same working tree are forbidden by all strategies; the lock guard mediates.
-- **I-6 (Derivable workspace_id).** `workspace_id = "wsp_" + lower_hex(BLAKE3_128_keyed(slug || 0x1F || run_id))` where the key is a daemon-instance-stable but non-secret 16-byte value (e.g. derived from the workspace_root path and a hardcoded domain separator). Two daemons computing this for the same `(slug, run_id)` and the same `workspace_root` MUST produce the same `workspace_id`. This makes the id derivable for diagnostics; it MUST NOT be relied upon as a security token. Random workspace ids are FORBIDDEN — they would break reconcile (spec #1).
+- **I-6 (Derivable workspace_id).** `workspace_id = "wsp_" + lower_hex(BLAKE3_128_keyed(slug || 0x1F || safe_run_id))` where the key is a daemon-instance-stable but non-secret 32-byte value (BLAKE3 keyed mode requires a 32-byte key; e.g. derived from the workspace_root path and a hardcoded domain separator via `BLAKE3_256(workspace_root || domain_separator)`). `safe_run_id = sanitize_run_id(run_id)` per §3.2, matching the §3.5 step 9 derivation. Two daemons computing this for the same `(slug, safe_run_id)` and the same `workspace_root` MUST produce the same `workspace_id`. This makes the id derivable for diagnostics; it MUST NOT be relied upon as a security token. Random workspace ids are FORBIDDEN — they would break reconcile (spec #1).
 - **I-7 (No orphan dirs on hook failure).** If `before_create` or `after_create` returns non-zero, the leaf directory created in §3.5 step 5 MUST be removed before `create_workspace` returns to the caller iff rollback reaches step 10c; on rollback abort at `CleanupOwnershipFailed`, `ParentRevalidationFailed`, or mid-walk unlinkat failure, the leaf is retained for reconcile alongside the `CleanupFailed` row. The error returned MUST be `Error::HookFailed`, NOT a cleanup error from the rollback. See §3.5 step 10. Placeholder-row handling is conditional: rows are removed (terminal per §4.3; `Cleaned` is not a persisted status) iff rollback reaches step 10c; rollback-side aborts at `CleanupOwnershipFailed`, `ParentRevalidationFailed`, or mid-walk unlinkat failure retain the row as `Status::CleanupFailed` for reconcile (§3.5 step 1b).
 - **I-8 (Single-writer registry).** At most one `caduceusd` process per `workspace_root` MAY hold an exclusive advisory lock (e.g. `flock(2)` on `<workspace_root>/.caduceusd.lock`) at any time. A second daemon started against the same root MUST refuse to come up. See test T-7. Rationale: two daemons would race the registry and produce orphaned leaves and double-locks.
 - **I-9 (Hook isolation).** Hooks MUST observe only the environment specified in §3.5 step 6. They MUST NOT inherit the daemon's full environment (which may carry tokens) by default. Workflow-declared opt-in forwarding is permitted; default is deny.
