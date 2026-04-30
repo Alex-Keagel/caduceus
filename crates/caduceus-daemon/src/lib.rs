@@ -30,6 +30,8 @@ pub mod leaf_ownership;
 pub mod lifecycle;
 pub mod locks;
 pub mod mailbox;
+pub mod orchestrator_dispatch;
+pub mod orchestrator_loop;
 pub mod orchestrator_state;
 pub mod orphan_reclaim;
 pub mod registry;
@@ -67,6 +69,12 @@ pub use locks::{CreateGuards, RegistryGuard, WorkspaceLocks};
 pub use mailbox::{
     Cmd, EngineSender, MailboxError, MailboxFactory, Receiver, RetryToken, RunId, SessionId,
     SnapshotClientSender, SubsystemSender, TimerSender,
+};
+pub use orchestrator_dispatch::{
+    dispatch_run, DispatchDeferReason, DispatchResult, DispatchRunArgs,
+};
+pub use orchestrator_loop::{
+    boot_reconcile_sweep, run_dispatch_loop, BootReconcileSummary, DispatchLoopOutcome,
 };
 pub use orchestrator_state::{
     eligible_for_dispatch, revalidate, ClaimEntry, ClaimedMap, DispatchDeferAttempts,
