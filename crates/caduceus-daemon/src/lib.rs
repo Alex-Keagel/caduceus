@@ -25,6 +25,7 @@ pub mod mailbox;
 pub mod storage;
 pub mod telemetry;
 pub mod test_harness;
+pub mod workspace;
 
 pub use clock::{Clock, RealClock, SharedClock, VirtualClock};
 pub use config::{Config, ConfigError};
@@ -36,6 +37,10 @@ pub use mailbox::{
 };
 pub use storage::{atomic_write, JsonRowStore, Row, StorageError, StorageResult};
 pub use telemetry::{init_tracing, Counter, Metrics};
+pub use workspace::{
+    build_workspace_path, sanitize_repo_slug, sanitize_run_id, validate_workspace_path,
+    workspace_id, RepoSlug, SafeRunId, WorkspaceIdKey,
+};
 
 #[cfg(unix)]
 pub use ipc::{IpcConfig, IpcConnection, IpcError, IpcListener, PeerCreds};
