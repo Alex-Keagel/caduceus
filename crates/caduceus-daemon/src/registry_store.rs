@@ -258,7 +258,6 @@ mod tests {
     use super::*;
     use crate::registry::RepoCoordinate;
     use crate::workspace::{sanitize_repo_slug, sanitize_run_id, workspace_id, WorkspaceIdKey};
-    use std::path::PathBuf;
     use std::time::SystemTime;
 
     fn fixture_row(root: &Path, run_id: &str) -> WorkspaceRegistryRow {

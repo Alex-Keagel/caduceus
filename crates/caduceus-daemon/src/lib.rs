@@ -16,6 +16,7 @@
 //! Implementation status: **P0 foundations** (`f01-daemon-scaffold`,
 //! `f02-config-loader`, `f03-error-types`) per the implementation DAG.
 
+pub mod cleanup_workspace;
 pub mod clock;
 pub mod config;
 pub mod create_workspace;
@@ -27,6 +28,7 @@ pub mod leaf_ownership;
 pub mod lifecycle;
 pub mod locks;
 pub mod mailbox;
+pub mod orphan_reclaim;
 pub mod registry;
 pub mod registry_store;
 pub mod shared_repo_lock;
@@ -35,6 +37,7 @@ pub mod telemetry;
 pub mod test_harness;
 pub mod workspace;
 
+pub use cleanup_workspace::{cleanup_workspace, CleanupArgs, CleanupCallerClass, CleanupOutcome};
 pub use clock::{Clock, RealClock, SharedClock, VirtualClock};
 pub use config::{Config, ConfigError};
 pub use create_workspace::{create_workspace, CreateWorkspaceArgs, Workspace};
@@ -50,6 +53,9 @@ pub use locks::{CreateGuards, RegistryGuard, WorkspaceLocks};
 pub use mailbox::{
     Cmd, EngineSender, MailboxError, MailboxFactory, Receiver, RetryToken, RunId, SessionId,
     SnapshotClientSender, SubsystemSender, TimerSender,
+};
+pub use orphan_reclaim::{
+    spawn_orphan_reclaim_worker, OrphanReclaimEntry, OrphanReclaimSender, ReclaimReason,
 };
 pub use registry::{RepoCoordinate, WorkspaceRegistryRow, WorkspaceStatus};
 pub use registry_store::{RegistryError, RegistryStore};
