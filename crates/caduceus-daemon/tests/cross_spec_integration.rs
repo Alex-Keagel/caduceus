@@ -20,9 +20,7 @@
 use caduceus_daemon::orchestrator_handlers::{
     on_engine_disconnected, on_reattach, on_runner_exit, ReattachOutcome,
 };
-use caduceus_daemon::orchestrator_state::{
-    ClaimEntry, OrchestratorState, Run, RunAttempt,
-};
+use caduceus_daemon::orchestrator_state::{ClaimEntry, OrchestratorState, Run, RunAttempt};
 use caduceus_daemon::snapshot_shapes::{SnapshotStruct, TokensAggregate};
 use caduceus_daemon::{
     boot_reconcile_sweep, classify_denial, cleanup_workspace, create_workspace,
