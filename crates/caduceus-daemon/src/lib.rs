@@ -31,6 +31,7 @@ pub mod lifecycle;
 pub mod locks;
 pub mod mailbox;
 pub mod orchestrator_dispatch;
+pub mod orchestrator_handlers;
 pub mod orchestrator_loop;
 pub mod orchestrator_state;
 pub mod orphan_reclaim;
@@ -72,6 +73,11 @@ pub use mailbox::{
 };
 pub use orchestrator_dispatch::{
     dispatch_run, DispatchDeferReason, DispatchResult, DispatchRunArgs,
+};
+pub use orchestrator_handlers::{
+    cmd_reattach, on_disconnect_timer_expired, on_engine_disconnected, on_reattach, on_retry_timer,
+    on_runner_exit, on_shutdown, on_snapshot_request, on_token_update, on_workflow_reloaded,
+    ReattachOutcome, RetryFireOutcome,
 };
 pub use orchestrator_loop::{
     boot_reconcile_sweep, run_dispatch_loop, BootReconcileSummary, DispatchLoopOutcome,
