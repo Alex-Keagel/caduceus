@@ -19,8 +19,10 @@
 pub mod clock;
 pub mod config;
 pub mod error;
+pub mod ipc;
 pub mod lifecycle;
 pub mod mailbox;
+pub mod storage;
 pub mod telemetry;
 pub mod test_harness;
 
@@ -32,4 +34,8 @@ pub use mailbox::{
     Cmd, EngineSender, MailboxError, MailboxFactory, Receiver, RetryToken, RunId, SessionId,
     SnapshotClientSender, SubsystemSender, TimerSender,
 };
+pub use storage::{atomic_write, JsonRowStore, Row, StorageError, StorageResult};
 pub use telemetry::{init_tracing, Counter, Metrics};
+
+#[cfg(unix)]
+pub use ipc::{IpcConfig, IpcConnection, IpcError, IpcListener, PeerCreds};
