@@ -35,10 +35,12 @@ pub mod orchestrator_handlers;
 pub mod orchestrator_loop;
 pub mod orchestrator_state;
 pub mod orphan_reclaim;
+pub mod permissions;
 pub mod registry;
 pub mod registry_store;
 pub mod runner_extras;
 pub mod runner_process;
+pub mod session_lifecycle;
 pub mod shared_repo_lock;
 pub mod snapshot_rpc;
 pub mod snapshot_shapes;
@@ -92,6 +94,10 @@ pub use orchestrator_state::{
 pub use orphan_reclaim::{
     spawn_orphan_reclaim_worker, OrphanReclaimEntry, OrphanReclaimSender, ReclaimReason,
 };
+pub use permissions::{
+    classify_denial, resolve, route_denial, Capability, CapabilityClass, DefaultPolicy,
+    DenialOutcome, PermissionEnvelope, PermissionRequest,
+};
 pub use registry::{RepoCoordinate, WorkspaceRegistryRow, WorkspaceStatus};
 pub use registry_store::{RegistryError, RegistryStore};
 pub use runner_extras::{
@@ -102,6 +108,9 @@ pub use runner_extras::{
 pub use runner_process::{
     validate_shell_wrap, CascadeOutcome, CascadeStage, RunnerError, RunnerProcess, RunnerState,
     SpawnSpec, StopReason,
+};
+pub use session_lifecycle::{
+    BoundSession, SessionEvent, SessionEventKind, SessionIdAllocator, SessionRegistry,
 };
 pub use shared_repo_lock::{SharedRepoCaller, SharedRepoLockStrategy};
 pub use snapshot_rpc::{
