@@ -18,6 +18,7 @@
 
 pub mod cleanup_workspace;
 pub mod clock;
+pub mod collab;
 pub mod config;
 pub mod create_workspace;
 pub mod env_exports;
@@ -53,6 +54,9 @@ pub mod workspace;
 
 pub use cleanup_workspace::{cleanup_workspace, CleanupArgs, CleanupCallerClass, CleanupOutcome};
 pub use clock::{Clock, RealClock, SharedClock, VirtualClock};
+pub use collab::{
+    admit_target, apply_handoff, merge_state, HandoffError, HandoffMergeState, HandoffPayload,
+};
 pub use config::{Config, ConfigError};
 pub use create_workspace::{create_workspace, CreateWorkspaceArgs, Workspace};
 pub use env_exports::workspace_env_exports;
