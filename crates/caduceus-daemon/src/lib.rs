@@ -20,6 +20,7 @@ pub mod clock;
 pub mod config;
 pub mod error;
 pub mod lifecycle;
+pub mod mailbox;
 pub mod telemetry;
 pub mod test_harness;
 
@@ -27,4 +28,8 @@ pub use clock::{Clock, RealClock, SharedClock, VirtualClock};
 pub use config::{Config, ConfigError};
 pub use error::{DaemonError, DaemonResult};
 pub use lifecycle::{Lifecycle, LifecycleState, ShutdownReason};
+pub use mailbox::{
+    Cmd, EngineSender, MailboxError, MailboxFactory, Receiver, RetryToken, RunId, SessionId,
+    SnapshotClientSender, SubsystemSender, TimerSender,
+};
 pub use telemetry::{init_tracing, Counter, Metrics};
