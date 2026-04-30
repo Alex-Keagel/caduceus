@@ -33,6 +33,7 @@ pub mod mailbox;
 pub mod orphan_reclaim;
 pub mod registry;
 pub mod registry_store;
+pub mod runner_extras;
 pub mod runner_process;
 pub mod shared_repo_lock;
 pub mod storage;
@@ -71,6 +72,11 @@ pub use orphan_reclaim::{
 };
 pub use registry::{RepoCoordinate, WorkspaceRegistryRow, WorkspaceStatus};
 pub use registry_store::{RegistryError, RegistryStore};
+pub use runner_extras::{
+    cascade_for_drop, drop_reason_to_stop_reason, forward_permission_request, AcpAdapter,
+    ElevationDecision, ElevationForwarder, LifecycleSession, RunnerProtocol, SessionState,
+    StubAcpAdapter,
+};
 pub use runner_process::{
     validate_shell_wrap, CascadeOutcome, CascadeStage, RunnerError, RunnerProcess, RunnerState,
     SpawnSpec, StopReason,
