@@ -21,7 +21,9 @@ pub mod config;
 pub mod error;
 pub mod ipc;
 pub mod lifecycle;
+pub mod locks;
 pub mod mailbox;
+pub mod registry;
 pub mod storage;
 pub mod telemetry;
 pub mod test_harness;
@@ -31,10 +33,12 @@ pub use clock::{Clock, RealClock, SharedClock, VirtualClock};
 pub use config::{Config, ConfigError};
 pub use error::{DaemonError, DaemonResult};
 pub use lifecycle::{Lifecycle, LifecycleState, ShutdownReason};
+pub use locks::{CreateGuards, RegistryGuard, WorkspaceLocks};
 pub use mailbox::{
     Cmd, EngineSender, MailboxError, MailboxFactory, Receiver, RetryToken, RunId, SessionId,
     SnapshotClientSender, SubsystemSender, TimerSender,
 };
+pub use registry::{RepoCoordinate, WorkspaceRegistryRow, WorkspaceStatus};
 pub use storage::{atomic_write, JsonRowStore, Row, StorageError, StorageResult};
 pub use telemetry::{init_tracing, Counter, Metrics};
 pub use workspace::{
