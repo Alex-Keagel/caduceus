@@ -18,9 +18,12 @@
 
 pub mod clock;
 pub mod config;
+pub mod create_workspace;
 pub mod env_exports;
 pub mod error;
+pub mod hooks;
 pub mod ipc;
+pub mod leaf_ownership;
 pub mod lifecycle;
 pub mod locks;
 pub mod mailbox;
@@ -34,8 +37,14 @@ pub mod workspace;
 
 pub use clock::{Clock, RealClock, SharedClock, VirtualClock};
 pub use config::{Config, ConfigError};
+pub use create_workspace::{create_workspace, CreateWorkspaceArgs, Workspace};
 pub use env_exports::workspace_env_exports;
 pub use error::{DaemonError, DaemonResult};
+pub use hooks::{
+    HookExecutor, HookOutcome, HookSpec, NoopHookExecutor, SubprocessHookExecutor,
+    DEFAULT_HOOK_TIMEOUT,
+};
+pub use leaf_ownership::{hand_off_leaf, RunnerIdentity};
 pub use lifecycle::{Lifecycle, LifecycleState, ShutdownReason};
 pub use locks::{CreateGuards, RegistryGuard, WorkspaceLocks};
 pub use mailbox::{
