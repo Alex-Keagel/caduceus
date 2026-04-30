@@ -22,6 +22,7 @@ pub mod config;
 pub mod create_workspace;
 pub mod env_exports;
 pub mod error;
+pub mod forward;
 pub mod hooks;
 pub mod inbound_queue;
 pub mod ipc;
@@ -46,6 +47,10 @@ pub use config::{Config, ConfigError};
 pub use create_workspace::{create_workspace, CreateWorkspaceArgs, Workspace};
 pub use env_exports::workspace_env_exports;
 pub use error::{DaemonError, DaemonResult};
+pub use forward::{
+    forward_to_daemon, observe_heartbeat, reconcile_absolute, reconcile_delta,
+    spawn_heartbeat_emit, spawn_heartbeat_timeout_tracker, RunAccounting, RunTokens, StampedFrame,
+};
 pub use hooks::{
     HookExecutor, HookOutcome, HookSpec, NoopHookExecutor, SubprocessHookExecutor,
     DEFAULT_HOOK_TIMEOUT,
