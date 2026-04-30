@@ -31,6 +31,7 @@ pub mod leaf_ownership;
 pub mod lifecycle;
 pub mod locks;
 pub mod mailbox;
+pub mod metrics_endpoint;
 pub mod orchestrator_dispatch;
 pub mod orchestrator_handlers;
 pub mod orchestrator_loop;
@@ -45,6 +46,7 @@ pub mod session_lifecycle;
 pub mod shared_repo_lock;
 pub mod snapshot_rpc;
 pub mod snapshot_shapes;
+pub mod startup_secret;
 pub mod storage;
 pub mod telemetry;
 pub mod test_harness;
@@ -80,6 +82,7 @@ pub use mailbox::{
     Cmd, EngineSender, MailboxError, MailboxFactory, Receiver, RetryToken, RunId, SessionId,
     SnapshotClientSender, SubsystemSender, TimerSender,
 };
+pub use metrics_endpoint::render_prometheus;
 pub use orchestrator_dispatch::{
     dispatch_run, DispatchDeferReason, DispatchResult, DispatchRunArgs,
 };
@@ -127,6 +130,7 @@ pub use snapshot_shapes::{
     EventRecord, ExitReason, HookExecutionRecord, LastEvent, RunDetail, RunRow, RunRowTokens,
     RunStatus, SnapshotStruct, TokensAggregate, WorkspaceMeta,
 };
+pub use startup_secret::DaemonStartupSecret;
 pub use storage::{atomic_write, JsonRowStore, Row, StorageError, StorageResult};
 pub use telemetry::{init_tracing, Counter, Metrics};
 pub use wire_codec::{

@@ -1,0 +1,98 @@
+# ops03 — caduceusd prebuilt binaries release pipeline.
+#
+# Triggers on `v*` tags. Builds release binaries for the v1 target
+# matrix and publishes them as a GitHub Release. CI matrix:
+#
+# - linux-x64    (ubuntu-latest)
+# - linux-arm64  (cross-compiled via `cross` on ubuntu-latest)
+# - darwin-x64   (macos-13, Intel)
+# - darwin-arm64 (macos-14, Apple Silicon)
+# - windows-x64  (windows-latest)
+#
+# Each artifact is a tarball / zip containing:
+#   bin/caduceusd
+#   dist/{service-unit}
+#   dist/README.md
+#   LICENSE
+name: caduceusd-release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,    os: ubuntu-latest,  archive: tar.gz }
+          - { target: aarch64-unknown-linux-gnu,   os: ubuntu-latest,  archive: tar.gz, cross: true }
+          - { target: x86_64-apple-darwin,         os: macos-13,        archive: tar.gz }
+          - { target: aarch64-apple-darwin,        os: macos-14,        archive: tar.gz }
+          - { target: x86_64-pc-windows-msvc,      os: windows-latest, archive: zip }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (linux-arm64)
+        if: matrix.cross
+        run: cargo install --locked cross
+
+      - name: Build (cargo)
+        if: '!matrix.cross'
+        run: cargo build --release -p caduceus-daemon --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release -p caduceus-daemon --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p caduceusd-${{ matrix.target }}/bin
+          cp target/${{ matrix.target }}/release/caduceusd caduceusd-${{ matrix.target }}/bin/
+          cp -R crates/caduceus-daemon/dist caduceusd-${{ matrix.target }}/dist
+          cp LICENSE caduceusd-${{ matrix.target }}/LICENSE 2>/dev/null || true
+          tar -czf caduceusd-${{ matrix.target }}.tar.gz caduceusd-${{ matrix.target }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p caduceusd-${{ matrix.target }}/bin
+          cp target/${{ matrix.target }}/release/caduceusd.exe caduceusd-${{ matrix.target }}/bin/
+          cp -R crates/caduceus-daemon/dist caduceusd-${{ matrix.target }}/dist
+          cp LICENSE caduceusd-${{ matrix.target }}/LICENSE 2>/dev/null || true
+          7z a caduceusd-${{ matrix.target }}.zip caduceusd-${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: caduceusd-${{ matrix.target }}
+          path: caduceusd-${{ matrix.target }}.${{ matrix.archive }}
+
+  release:
+    name: github-release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*/*
+          draft: false
+          generate_release_notes: true
