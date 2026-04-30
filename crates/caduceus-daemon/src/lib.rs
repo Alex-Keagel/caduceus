@@ -16,10 +16,15 @@
 //! Implementation status: **P0 foundations** (`f01-daemon-scaffold`,
 //! `f02-config-loader`, `f03-error-types`) per the implementation DAG.
 
+pub mod clock;
 pub mod config;
 pub mod error;
 pub mod lifecycle;
+pub mod telemetry;
+pub mod test_harness;
 
+pub use clock::{Clock, RealClock, SharedClock, VirtualClock};
 pub use config::{Config, ConfigError};
 pub use error::{DaemonError, DaemonResult};
 pub use lifecycle::{Lifecycle, LifecycleState, ShutdownReason};
+pub use telemetry::{init_tracing, Counter, Metrics};

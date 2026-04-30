@@ -21,7 +21,7 @@
 //!   sets `state.shutting_down = true`.  Here that's
 //!   `Lifecycle::mark_draining()`.
 
-use caduceus_daemon::{Config, DaemonError, DaemonResult, Lifecycle, ShutdownReason};
+use caduceus_daemon::{init_tracing, Config, DaemonError, DaemonResult, Lifecycle, ShutdownReason};
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -66,17 +66,6 @@ async fn run() -> DaemonResult<()> {
     tracing::info!("caduceusd: drain complete");
     lifecycle.mark_halted();
     Ok(())
-}
-
-fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let filter =
-        EnvFilter::try_from_env("CADUCEUSD_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .compact()
-        .init();
 }
 
 #[derive(Debug)]
