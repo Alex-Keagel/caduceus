@@ -40,6 +40,8 @@ pub mod registry_store;
 pub mod runner_extras;
 pub mod runner_process;
 pub mod shared_repo_lock;
+pub mod snapshot_rpc;
+pub mod snapshot_shapes;
 pub mod storage;
 pub mod telemetry;
 pub mod test_harness;
@@ -102,6 +104,15 @@ pub use runner_process::{
     SpawnSpec, StopReason,
 };
 pub use shared_repo_lock::{SharedRepoCaller, SharedRepoLockStrategy};
+pub use snapshot_rpc::{
+    build_replay_cancelled_resub, check_local_only_gate, fingerprint, snapshot_rpc,
+    subscribe_outcome, subscribe_rpc, ReplayIndex, SnapshotDelta, SnapshotProjection,
+    SnapshotPubSub, SubscribeAck, SubscribeRequest,
+};
+pub use snapshot_shapes::{
+    EventRecord, ExitReason, HookExecutionRecord, LastEvent, RunDetail, RunRow, RunRowTokens,
+    RunStatus, SnapshotStruct, TokensAggregate, WorkspaceMeta,
+};
 pub use storage::{atomic_write, JsonRowStore, Row, StorageError, StorageResult};
 pub use telemetry::{init_tracing, Counter, Metrics};
 pub use wire_codec::{

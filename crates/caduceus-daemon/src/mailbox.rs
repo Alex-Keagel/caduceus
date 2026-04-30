@@ -34,11 +34,11 @@ use tokio::sync::mpsc;
 
 /// Run identifier carried by most `Cmd` variants.  Newtyped to prevent
 /// accidental swap with `runner_seq` (u64) or `attempt` (u32).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct RunId(pub String);
 
 /// Opaque session identifier issued by the runner on first frame.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SessionId(pub String);
 
 /// Per-process monotonic counter (spec #1 §3.5; iter-28 #1-3).
