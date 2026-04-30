@@ -14,6 +14,7 @@ members = [
     "crates/caduceus-mcp",
     "crates/caduceus-marketplace",
     "crates/caduceus-eval",
+    "crates/caduceus-daemon",
     ]
 resolver = "2"
 
