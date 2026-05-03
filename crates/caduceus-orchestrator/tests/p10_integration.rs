@@ -244,6 +244,7 @@ async fn p10_06_envelope_cascades_unchanged_to_every_fanout_worker() {
         fanout_policy: FanoutPolicy::MultiPersona,
         skill_budget: 5,
         sensitive_write_paths: vec![],
+        sensitive_write_exceptions: vec![],
     };
     let reg = PersonaRegistry::builtin_personas();
     let runner = Capture {

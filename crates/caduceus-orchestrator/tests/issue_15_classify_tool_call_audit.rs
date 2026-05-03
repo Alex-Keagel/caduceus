@@ -121,7 +121,10 @@ fn write_tools_route_to_write_capability() {
         ("edit", json!({ "path": "/tmp/x" })),
         ("create", json!({ "path": "/tmp/x" })),
         ("create_file", json!({ "path": "/tmp/x" })),
-        ("apply_patch", json!({ "path": "/tmp/x" })),
+        (
+            "apply_patch",
+            json!({ "patch": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n" }),
+        ),
         ("move_file", json!({ "path": "/tmp/x" })),
         ("delete_file", json!({ "path": "/tmp/x" })),
         ("rename_file", json!({ "path": "/tmp/x" })),
@@ -232,5 +235,93 @@ fn notebook_edit_resource_extracts_path() {
             assert_eq!(resource, "/tmp/x.ipynb");
         }
         other => panic!("expected Deny, got {other:?}"),
+    }
+}
+
+// ── apply_patch destination-path preflight (PR-A tri-review followup) ───
+//
+// `apply_patch` doesn't carry its target paths in `path` / `file` / etc.
+// — they live inside the unified-diff `+++ b/<path>` headers. Without
+// parsing those headers, sensitive-path enforcement always saw
+// `<unknown>` and a malicious patch editing `private/**` would slip
+// through. These tests pin the parsing + worst-offender selection.
+
+/// A patch whose destination is `private/notes.md` must Deny with
+/// capability=write under the act preset (which protects `private/**`
+/// via its sensitive list).
+#[test]
+fn apply_patch_preflight_blocks_sensitive_destination() {
+    // Use the act preset — wide allow list, but private/** is in the
+    // sensitive list and should win.
+    let env = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+    let patch = "--- a/private/notes.md\n+++ b/private/notes.md\n@@ -1 +1 @@\n-old\n+new\n";
+    let outcome = preflight_envelope_of(&env, "apply_patch", &json!({ "patch": patch }));
+    match outcome {
+        PreflightOutcome::Deny {
+            capability,
+            resource,
+            ..
+        } => {
+            assert_eq!(capability, "write");
+            assert_eq!(resource, "private/notes.md");
+        }
+        other => panic!("expected Deny for sensitive destination, got {other:?}"),
+    }
+}
+
+/// A patch with mixed destinations — one safe, one sensitive — must
+/// surface the sensitive denial (worst-offender ranking).
+#[test]
+fn apply_patch_preflight_picks_worst_offender() {
+    let env = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+    let patch = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-x\n+y\n\
+                 --- a/private/secret.md\n+++ b/private/secret.md\n@@ -1 +1 @@\n-x\n+y\n";
+    let outcome = preflight_envelope_of(&env, "apply_patch", &json!({ "patch": patch }));
+    match outcome {
+        PreflightOutcome::Deny {
+            capability,
+            resource,
+            ..
+        } => {
+            assert_eq!(capability, "write");
+            assert_eq!(resource, "private/secret.md");
+        }
+        other => panic!("expected Deny on the sensitive entry, got {other:?}"),
+    }
+}
+
+/// A patch with no parseable target headers must fail closed
+/// (deny=write) — we never let an unparseable apply_patch slip past
+/// envelope enforcement.
+#[test]
+fn apply_patch_preflight_fails_closed_on_unparseable_patch() {
+    let env = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+    let outcome = preflight_envelope_of(&env, "apply_patch", &json!({ "patch": "garbage" }));
+    match outcome {
+        PreflightOutcome::Deny {
+            capability,
+            resource,
+            ..
+        } => {
+            assert_eq!(capability, "write");
+            assert!(
+                resource.contains("apply_patch"),
+                "got resource {resource:?}"
+            );
+        }
+        other => panic!("expected fail-closed Deny, got {other:?}"),
+    }
+}
+
+/// A patch with a missing `patch` field entirely must also fail closed.
+#[test]
+fn apply_patch_preflight_fails_closed_on_missing_patch_field() {
+    let env = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+    let outcome = preflight_envelope_of(&env, "apply_patch", &json!({}));
+    match outcome {
+        PreflightOutcome::Deny { capability, .. } => {
+            assert_eq!(capability, "write");
+        }
+        other => panic!("expected fail-closed Deny, got {other:?}"),
     }
 }

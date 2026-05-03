@@ -184,6 +184,25 @@ pub enum GrantValidationError {
 
     #[error("skill_budget shrunk: prev={prev}, next={next} (grants cannot narrow)")]
     SkillBudgetShrunk { prev: usize, next: usize },
+
+    #[error(
+        "sensitive_write_paths shrunk: removed {removed:?} (grants cannot drop sensitive globs — \
+         deny-wins)"
+    )]
+    SensitivePathsShrunk { removed: Vec<String> },
+
+    #[error(
+        "sensitive_write_exceptions shrunk: removed {removed:?} (grants only add exceptions; \
+         removal would re-block an already-approved path)"
+    )]
+    SensitiveExceptionsShrunk { removed: Vec<String> },
+
+    #[error(
+        "sensitive_write_exceptions entry {entry:?} contains glob characters \
+         (`*`, `?`, `[`); only concrete paths are permitted to prevent \
+         'grant private/** once, escape forever' style escapes"
+    )]
+    SensitiveExceptionContainsGlob { entry: String },
 }
 
 /// Trait for composing grants onto an existing envelope.
@@ -246,6 +265,16 @@ pub enum WidenProposalError {
     /// caller bug, not a user choice.
     #[error("resource for capability '{capability}' is empty")]
     EmptyResource { capability: String },
+
+    /// A `"write"` grant whose `resource` matched a sensitive glob also
+    /// contained glob characters itself. Sensitive-path grants must
+    /// resolve to a single concrete path so the user is approving one
+    /// specific file, not a wildcard.
+    #[error(
+        "resource {resource:?} for sensitive-path grant contains glob \
+         characters (`*`, `?`, `[`) — only concrete paths are permitted"
+    )]
+    GlobInSensitiveResource { resource: String },
 }
 
 /// ST8 PR-3D — produce a minimally-widened envelope that approves the
@@ -262,7 +291,7 @@ pub enum WidenProposalError {
 /// | `capability` (string) | Effect on a clone of `current`                                          |
 /// |-----------------------|-------------------------------------------------------------------------|
 /// | `"read"`              | Append `resource` to `read.allow` if absent (de-duped).                |
-/// | `"write"`             | Append `resource` to `write.allow` if absent (de-duped).               |
+/// | `"write"`             | If `resource` matches any glob in `current.sensitive_write_paths`, append the concrete path to `sensitive_write_exceptions` (the sensitive-path grant axis — `write.allow` would still be overridden by the sensitive list). Otherwise append to `write.allow`. Glob characters in `resource` are rejected so a sensitive grant cannot smuggle `private/**` into the exception list. |
 /// | `"network"`           | Force `network.enabled = true`. If `host_allow` is non-empty and does not already contain `resource`, append it. **Empty `host_allow` (open-all) stays empty** — appending would *narrow* the policy. |
 /// | `"exec"`              | Force `exec.enabled = true`. (Exec has no resource allowlist; the deny-substrings guard remains untouched, satisfying the grant's safety-flag invariance.) |
 ///
@@ -311,7 +340,35 @@ pub fn propose_widened_envelope(
             push_unique_path(&mut next.read.allow, resource);
         }
         "write" => {
-            push_unique_path(&mut next.write.allow, resource);
+            // Sensitive-path bypass: if the resource matches any glob
+            // in `current.sensitive_write_paths`, the grant flow MUST
+            // route it to the exception list, not `write.allow` —
+            // because `check_write` consults the sensitive list before
+            // `write.allow`. Without this, the user-approved path
+            // would re-deny on retry (infinite deny loop).
+            //
+            // Glob characters in `resource` are rejected here. The
+            // orchestrator emits concrete paths (the path the agent
+            // tool tried to write); a glob in `resource` indicates
+            // either a caller bug or an attempt to smuggle a
+            // wildcard exception (which `validate_widening` would
+            // also reject).
+            let normalised =
+                crate::envelope::normalise_path_for_sensitive_match(std::path::Path::new(resource));
+            let is_sensitive = current
+                .sensitive_write_paths
+                .iter()
+                .any(|pat| crate::envelope::glob_match(pat, &normalised));
+            if is_sensitive {
+                if resource.contains('*') || resource.contains('?') || resource.contains('[') {
+                    return Err(WidenProposalError::GlobInSensitiveResource {
+                        resource: resource.to_string(),
+                    });
+                }
+                push_unique_path(&mut next.sensitive_write_exceptions, resource);
+            } else {
+                push_unique_path(&mut next.write.allow, resource);
+            }
         }
         "network" => {
             next.network.enabled = true;
@@ -430,6 +487,48 @@ pub fn validate_widening(
         return Err(GrantValidationError::SkillBudgetShrunk {
             prev: prev.skill_budget,
             next: next.skill_budget,
+        });
+    }
+
+    // Sensitive write paths ────────────────────────────────────────────────
+    // Deny-wins: grants can ADD sensitive globs but never drop them. The
+    // engine-level `private/**` policy must be non-bypassable through a
+    // crafted grant proposal.
+    let removed_sensitive: Vec<String> = prev
+        .sensitive_write_paths
+        .iter()
+        .filter(|p| !next.sensitive_write_paths.contains(p))
+        .cloned()
+        .collect();
+    if !removed_sensitive.is_empty() {
+        return Err(GrantValidationError::SensitivePathsShrunk {
+            removed: removed_sensitive,
+        });
+    }
+
+    // Sensitive write exceptions ───────────────────────────────────────────
+    // Per-grant additive widening axis: grants can ADD concrete exception
+    // paths (this is HOW a sensitive-path grant works), but cannot remove
+    // entries the user has already approved. Each entry must be a
+    // concrete path — glob characters are rejected so an attacker cannot
+    // smuggle a `private/**` exception through and bypass the policy
+    // wholesale.
+    for entry in &next.sensitive_write_exceptions {
+        if entry.contains('*') || entry.contains('?') || entry.contains('[') {
+            return Err(GrantValidationError::SensitiveExceptionContainsGlob {
+                entry: entry.clone(),
+            });
+        }
+    }
+    let removed_exceptions: Vec<String> = prev
+        .sensitive_write_exceptions
+        .iter()
+        .filter(|p| !next.sensitive_write_exceptions.contains(p))
+        .cloned()
+        .collect();
+    if !removed_exceptions.is_empty() {
+        return Err(GrantValidationError::SensitiveExceptionsShrunk {
+            removed: removed_exceptions,
         });
     }
 
@@ -571,8 +670,8 @@ fn cadence_widens(prev: ApprovalCadence, next: ApprovalCadence) -> bool {
 mod tests {
     use super::*;
     use crate::envelope::{
-        ApprovalCadence, EnvelopeScope, ExecPolicy, FanoutPolicy, NetworkPolicy, PathAllowlist,
-        PermissionEnvelope,
+        ApprovalCadence, Decision, EnvelopeScope, ExecPolicy, FanoutPolicy, NetworkPolicy,
+        PathAllowlist, PermissionEnvelope,
     };
 
     fn base() -> PermissionEnvelope {
@@ -1116,5 +1215,99 @@ mod tests {
             validate_widening(&env, &next)
                 .unwrap_or_else(|e| panic!("{cap}/{res}: validate_widening rejected: {e}"));
         }
+    }
+
+    // ── Sensitive-path grant flow (PR-A tri-review followup) ──────────────
+
+    /// `propose_widened_envelope` for a `"write"` resource that matches a
+    /// sensitive glob in the *current* envelope must route the grant
+    /// into `sensitive_write_exceptions` (NOT `write.allow`). Otherwise
+    /// the widened envelope would still deny the write — `check_write`
+    /// consults the sensitive list before falling through to allow.
+    #[test]
+    fn propose_routes_sensitive_writes_into_exceptions() {
+        let env = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+        let widened = propose_widened_envelope(&env, "write", "private/notes.md")
+            .expect("propose should succeed for concrete sensitive path");
+        // write.allow is unchanged.
+        assert_eq!(widened.write.allow, env.write.allow);
+        // The exception list got the concrete path appended.
+        assert_eq!(
+            widened.sensitive_write_exceptions,
+            vec!["private/notes.md".to_string()]
+        );
+        // And the widened envelope actually permits the write now.
+        assert_eq!(
+            widened.check_write(std::path::Path::new("private/notes.md")),
+            Decision::Allow
+        );
+    }
+
+    /// Sensitive-path grants must be concrete — a glob in the resource
+    /// would let the user approve a wildcard with one click. Reject.
+    #[test]
+    fn propose_rejects_glob_resource_for_sensitive_path() {
+        let env = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+        for bad in ["private/*.md", "private/?.md", "private/[abc].md"] {
+            let err = propose_widened_envelope(&env, "write", bad)
+                .expect_err(&format!("expected error for glob resource {bad:?}"));
+            assert!(
+                matches!(err, WidenProposalError::GlobInSensitiveResource { .. }),
+                "expected GlobInSensitiveResource for {bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    /// `validate_widening` must reject a `next` that drops a
+    /// `sensitive_write_paths` entry — sensitive globs are deny-wins,
+    /// they can grow but never shrink across a widening.
+    #[test]
+    fn validate_widening_rejects_sensitive_paths_shrink() {
+        let prev = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+        let mut next = prev.clone();
+        next.sensitive_write_paths.clear();
+        let err = validate_widening(&prev, &next).expect_err("should reject shrink");
+        assert!(
+            matches!(err, GrantValidationError::SensitivePathsShrunk { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// `validate_widening` must reject a `next` that drops a
+    /// `sensitive_write_exceptions` entry — exceptions are an additive
+    /// widening axis; if a previous grant got the user's blessing,
+    /// dropping it silently in a later widening is a privilege regression.
+    #[test]
+    fn validate_widening_rejects_sensitive_exceptions_shrink() {
+        let mut prev = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+        prev.sensitive_write_exceptions
+            .push("private/notes.md".into());
+        let mut next = prev.clone();
+        next.sensitive_write_exceptions.clear();
+        let err = validate_widening(&prev, &next).expect_err("should reject shrink");
+        assert!(
+            matches!(err, GrantValidationError::SensitiveExceptionsShrunk { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// `validate_widening` must reject globs in
+    /// `sensitive_write_exceptions` — defence-in-depth alongside
+    /// `propose_widened_envelope`'s rejection. If a malicious caller
+    /// constructs the next envelope by hand, validate_widening still
+    /// catches the glob.
+    #[test]
+    fn validate_widening_rejects_glob_in_sensitive_exception() {
+        let prev = PermissionEnvelope::act_preset(vec!["**".into()], vec![]);
+        let mut next = prev.clone();
+        next.sensitive_write_exceptions.push("private/*.md".into());
+        let err = validate_widening(&prev, &next).expect_err("should reject glob");
+        assert!(
+            matches!(
+                err,
+                GrantValidationError::SensitiveExceptionContainsGlob { .. }
+            ),
+            "got {err:?}"
+        );
     }
 }
