@@ -3370,6 +3370,18 @@ impl AgentHarness {
                                 let emitter = self.emitter.clone();
                                 let cancel_token = cancel_token_for_tools.clone();
                                 let synth_deny = deny_content.clone();
+                                // PR-B4 captures — needed in the
+                                // `Switched` arm to validate the proposed
+                                // widening against the active envelope and
+                                // to dispatch the originally-denied tool
+                                // call once the widening is verified.
+                                // Mirrors the grant-flow Granted arm.
+                                let prev_env = self.permission_envelope.clone();
+                                let tools = self.tools.clone_registry();
+                                let name_for_exec = name.clone();
+                                let input_for_exec = input.clone();
+                                let capability_typed = capability.clone();
+                                let resource_for_widen = resource.clone();
 
                                 let (tx, rx) = tokio::sync::oneshot::channel::<SwitchOutcome>();
                                 {
@@ -3446,6 +3458,156 @@ impl AgentHarness {
                                             ToolSpawnOutcome::Cancelled
                                         }
                                         Some(Ok(Ok(SwitchOutcome::Switched))) => {
+                                            // PR-B4 — Switched now actually
+                                            // runs the originally-denied tool
+                                            // call under a per-call widened
+                                            // envelope. Mirrors the grant-flow
+                                            // Granted arm bit-for-bit (validate
+                                            // widening → recheck preflight →
+                                            // dispatch with timeout/cancel race),
+                                            // adapted for the switch-event
+                                            // surface. The widening is NOT
+                                            // persisted to the harness's
+                                            // permission_envelope — same
+                                            // per-call semantics as grants.
+                                            //
+                                            // Build the widened envelope from
+                                            // the classifier-typed capability
+                                            // and the originally-denied
+                                            // resource, against the active
+                                            // envelope captured before the
+                                            // wait task spawned.
+                                            let widened = match prev_env.as_ref() {
+                                                Some(prev) => {
+                                                    match caduceus_permissions::propose_widened_envelope(
+                                                        prev,
+                                                        capability_str(&capability_typed),
+                                                        &resource_for_widen,
+                                                    ) {
+                                                        Ok(env) => env,
+                                                        Err(_e) => {
+                                                            if let Some(ref em) = emitter {
+                                                                em.emit(AgentEvent::ProfileSwitchResolved {
+                                                                    tool_use_id: tool_use_id_str.clone(),
+                                                                    outcome: "rejected:propose-widening-failed".into(),
+                                                                })
+                                                                .await;
+                                                            }
+                                                            return (
+                                                                idx,
+                                                                name_owned,
+                                                                timeout,
+                                                                synth_error(&synth_deny),
+                                                                started.elapsed(),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                None => {
+                                                    // No active envelope — the
+                                                    // classifier should never
+                                                    // route through SuggestSwitch
+                                                    // in that case (no envelope
+                                                    // → nothing denies → no
+                                                    // SuggestSwitch). Defensive.
+                                                    if let Some(ref em) = emitter {
+                                                        em.emit(AgentEvent::ProfileSwitchResolved {
+                                                            tool_use_id: tool_use_id_str.clone(),
+                                                            outcome: "rejected:no-active-envelope".into(),
+                                                        })
+                                                        .await;
+                                                    }
+                                                    return (
+                                                        idx,
+                                                        name_owned,
+                                                        timeout,
+                                                        synth_error(&synth_deny),
+                                                        started.elapsed(),
+                                                    );
+                                                }
+                                            };
+                                            // Defense-in-depth: validate
+                                            // widening is monotonic.
+                                            // `propose_widened_envelope`
+                                            // round-trips by construction so
+                                            // this should never trip, but
+                                            // mirrors the grant-flow guard.
+                                            let widening_ok = match prev_env.as_ref() {
+                                                Some(prev) => {
+                                                    caduceus_permissions::validate_widening(
+                                                        prev, &widened,
+                                                    )
+                                                    .is_ok()
+                                                }
+                                                None => true,
+                                            };
+                                            if !widening_ok {
+                                                if let Some(ref em) = emitter {
+                                                    em.emit(AgentEvent::ProfileSwitchResolved {
+                                                        tool_use_id: tool_use_id_str.clone(),
+                                                        outcome: "rejected:not-monotonic-widening".into(),
+                                                    })
+                                                    .await;
+                                                }
+                                                return (
+                                                    idx,
+                                                    name_owned,
+                                                    timeout,
+                                                    synth_error(&format!(
+                                                        "{synth_deny} (switch rejected: proposed envelope is not a monotonic widening of the active envelope)"
+                                                    )),
+                                                    started.elapsed(),
+                                                );
+                                            }
+                                            // Recheck preflight under the
+                                            // widened envelope. Mirror the
+                                            // grant arm's three-way branch.
+                                            let recheck = preflight_envelope_of(
+                                                &widened,
+                                                &name_for_exec,
+                                                &input_for_exec,
+                                            );
+                                            match recheck {
+                                                PreflightOutcome::Deny { .. } => {
+                                                    if let Some(ref em) = emitter {
+                                                        em.emit(AgentEvent::ProfileSwitchResolved {
+                                                            tool_use_id: tool_use_id_str.clone(),
+                                                            outcome: "rejected:over-grant-no-coverage".into(),
+                                                        })
+                                                        .await;
+                                                    }
+                                                    return (
+                                                        idx,
+                                                        name_owned,
+                                                        timeout,
+                                                        synth_error(&format!(
+                                                            "{synth_deny} (switch rejected: widened envelope does not cover the originally-denied action)"
+                                                        )),
+                                                        started.elapsed(),
+                                                    );
+                                                }
+                                                PreflightOutcome::Intercept(sim_content) => {
+                                                    if let Some(ref em) = emitter {
+                                                        em.emit(AgentEvent::ProfileSwitchResolved {
+                                                            tool_use_id: tool_use_id_str.clone(),
+                                                            outcome: "switched:simulated".into(),
+                                                        })
+                                                        .await;
+                                                    }
+                                                    return (
+                                                        idx,
+                                                        name_owned,
+                                                        timeout,
+                                                        ToolSpawnOutcome::Completed(Ok(
+                                                            caduceus_core::ToolResult::success(
+                                                                &sim_content,
+                                                            ),
+                                                        )),
+                                                        started.elapsed(),
+                                                    );
+                                                }
+                                                PreflightOutcome::Allow => { /* fall through to dispatch */ }
+                                            }
                                             if let Some(ref em) = emitter {
                                                 em.emit(AgentEvent::ProfileSwitchResolved {
                                                     tool_use_id: tool_use_id_str.clone(),
@@ -3453,13 +3615,50 @@ impl AgentHarness {
                                                 })
                                                 .await;
                                             }
-                                            // Bridge owns the rebuild + re-issue.
-                                            // Synth a deny that carries enough
-                                            // breadcrumb for the agent's next
-                                            // turn to know what happened.
-                                            synth_error(&format!(
-                                                "{synth_deny} (profile switch accepted: target={target_mode_str}; the bridge will rebuild the harness and re-issue the call on the next turn)"
-                                            ))
+                                            // Dispatch under the same
+                                            // timeout/cancel race the
+                                            // normal path uses.
+                                            let exec_outcome = if let Some(token) =
+                                                cancel_token.as_ref()
+                                            {
+                                                if token.is_cancelled() {
+                                                    ToolSpawnOutcome::Cancelled
+                                                } else {
+                                                    let token = token.clone();
+                                                    tokio::select! {
+                                                        biased;
+                                                        res = tokio::time::timeout(timeout, tools.execute(&name_for_exec, input_for_exec)) => {
+                                                            match res {
+                                                                Ok(r) => ToolSpawnOutcome::Completed(r),
+                                                                Err(_) => ToolSpawnOutcome::TimedOut,
+                                                            }
+                                                        }
+                                                        _ = async {
+                                                            loop {
+                                                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                                                if token.is_cancelled() { break; }
+                                                            }
+                                                        } => ToolSpawnOutcome::Cancelled,
+                                                    }
+                                                }
+                                            } else {
+                                                match tokio::time::timeout(
+                                                    timeout,
+                                                    tools.execute(&name_for_exec, input_for_exec),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(r) => ToolSpawnOutcome::Completed(r),
+                                                    Err(_) => ToolSpawnOutcome::TimedOut,
+                                                }
+                                            };
+                                            return (
+                                                idx,
+                                                name_owned,
+                                                timeout,
+                                                exec_outcome,
+                                                started.elapsed(),
+                                            );
                                         }
                                         Some(Ok(Ok(SwitchOutcome::Denied))) => {
                                             if let Some(ref em) = emitter {
