@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# .githooks/pre-commit — fast local gate that runs on every commit.
+#
+# Runs:
+#   1. cargo fmt --all --check   (formatting)
+#   2. cargo check --workspace   (compile gate)
+#
+# Skips automatically when the staged diff is docs-only
+# (`*.md`, `docs/`, `private/`, `.github/`, `.githooks/`, `scripts/`).
+#
+# Bypass for one commit:  git commit --no-verify
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# ── Smart skip: docs-only commits don't need rust gates.
+staged_nonrust=$(
+  git diff --cached --name-only --diff-filter=ACMR \
+    | grep -Ev '\.md$|^docs/|^private/|^\.github/|^\.githooks/|^scripts/' \
+    || true
+)
+if [ -z "$staged_nonrust" ]; then
+  exit 0
+fi
+
+step() { echo "▶ pre-commit: $1"; }
+
+step "cargo fmt --all --check"
+cargo fmt --all --check
+
+step "cargo check --workspace"
+cargo check --workspace
+
+echo "✓ pre-commit: fmt + check green"

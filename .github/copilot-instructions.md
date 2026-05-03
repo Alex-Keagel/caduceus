@@ -98,6 +98,43 @@ This applies to every write tool — `create`, `edit`, `bash` redirects (`> priv
 
 See `~/Dev/.github/copilot-instructions.md` for the cross-repo source of truth.
 
+## Local CI gate — pre-commit + pre-push
+
+Every commit and every push runs the same gates GitHub Actions runs, **before** the change goes out. The CI workflow at `.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace`; the local hooks mirror that so a green local run = a green CI run.
+
+**Once per fresh clone:**
+
+```bash
+scripts/install-git-hooks.sh          # sets core.hooksPath = .githooks
+```
+
+After that, every `git commit` and `git push` runs the version-controlled hooks under `.githooks/`.
+
+### `pre-commit` — fast gate, fires every commit
+
+Runs (skipped automatically on docs-only diffs):
+
+1. `cargo fmt --all --check`
+2. `cargo check --workspace`
+
+### `pre-push` — full CI mirror, fires every push
+
+Runs (skipped automatically on docs-only diffs vs `origin/main`):
+
+1. `cargo fmt --all --check`
+2. `cargo clippy --workspace -- -D warnings`
+3. `cargo test --workspace`
+
+**On-demand invocation** (no commit/push needed):
+
+```bash
+scripts/ci-preflight.sh               # full gate
+```
+
+**Skip rules:** both hooks auto-skip the rust gate when the staged/pushed diff is **only** `*.md` / `docs/` / `private/` / `.github/` / `.githooks/` / `scripts/` files.
+
+**Bypass for one commit/push:** `git commit --no-verify` / `git push --no-verify` — true emergencies only.
+
 ## Conventions
 
 - Crate names: `caduceus-{name}` (kebab-case)
