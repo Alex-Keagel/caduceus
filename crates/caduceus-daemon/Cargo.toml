@@ -1,0 +1,39 @@
+[package]
+name = "caduceus-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "caduceusd — orchestrator daemon for caduceus engine (per spec-caduceus-orchestrator-algorithm)"
+
+[lib]
+name = "caduceus_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "caduceusd"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+blake3 = "1"
+parking_lot = { version = "0.12", features = ["arc_lock"] }
+futures = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal"] }
+libc = "0.2"
+
+[features]
+test-harness = ["dep:tempfile"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[dependencies.tempfile]
+version = "3"
+optional = true

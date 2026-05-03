@@ -1,0 +1,32 @@
+[Unit]
+Description=caduceusd — caduceus orchestrator daemon
+Documentation=https://github.com/Alex-Keagel/caduceus
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/caduceusd --config /etc/caduceus/caduceusd.toml
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+Environment=CADUCEUSD_LOG=info
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+
+# Workspace dirs MUST be writable for the daemon's own use
+ReadWritePaths=/var/lib/caduceus /var/log/caduceus
+
+[Install]
+WantedBy=multi-user.target
