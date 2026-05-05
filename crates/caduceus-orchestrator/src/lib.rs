@@ -58,10 +58,15 @@ mod config_loader;
 mod effort_levels;
 mod execution_tree;
 mod query_config;
+pub mod thread_id;
 pub use config_loader::ConfigLoader;
 pub use effort_levels::EffortLevel;
 pub use execution_tree::{ExecutionTreeViz, VizTreeNode};
 pub use query_config::QueryConfig;
+pub use thread_id::{
+    migrate_pre_spec_layout, resolve_thread_id_for_session, ResolveOutcome, ThreadIdEnv,
+    DEFAULT_BASE_DIR,
+};
 
 // ST-B1 Wave 1 — extracted modules.
 mod context_assembler;
