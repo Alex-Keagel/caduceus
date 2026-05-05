@@ -59,6 +59,7 @@ pub mod decision_register;
 mod effort_levels;
 mod execution_tree;
 mod query_config;
+pub mod restore_protocol;
 pub mod thread_id;
 pub use config_loader::ConfigLoader;
 pub use decision_register::{
@@ -69,6 +70,10 @@ pub use decision_register::{
 pub use effort_levels::EffortLevel;
 pub use execution_tree::{ExecutionTreeViz, VizTreeNode};
 pub use query_config::QueryConfig;
+pub use restore_protocol::{
+    compute_eliminations, persist_and_restore, render_reconciliation_message, run_restore,
+    RestoreOutcome, RestoreTrigger, RECONCILIATION_BUDGET_BYTES,
+};
 pub use thread_id::{
     migrate_pre_spec_layout, resolve_thread_id_for_session, ResolveOutcome, ThreadIdEnv,
     DEFAULT_BASE_DIR,
