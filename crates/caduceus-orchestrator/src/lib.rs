@@ -58,6 +58,7 @@ mod config_loader;
 pub mod decision_register;
 mod effort_levels;
 mod execution_tree;
+pub mod openq_workspace;
 mod query_config;
 pub mod restore_protocol;
 pub mod thread_id;
@@ -69,6 +70,12 @@ pub use decision_register::{
 };
 pub use effort_levels::EffortLevel;
 pub use execution_tree::{ExecutionTreeViz, VizTreeNode};
+pub use openq_workspace::{
+    apply_pool_event, apply_workspace_mutation, handle_workspace_mutation, load_pool,
+    load_workspace_context, persist_pool, persist_workspace_context, pool_path,
+    restore_after_workspace_mutation, workspace_context_path, OpenQuestionPool, WorkspaceContext,
+    WorkspaceMutation, POOL_SCHEMA_VERSION, UNANSWERED_TURNS_THRESHOLD,
+};
 pub use query_config::QueryConfig;
 pub use restore_protocol::{
     compute_eliminations, persist_and_restore, render_reconciliation_message, run_restore,
