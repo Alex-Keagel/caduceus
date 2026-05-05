@@ -1,0 +1,12 @@
+{
+  "expected_locked_count": 5,
+  "expected_no_re_ask_ids": [
+    "student/substrate",
+    "teacher/provider",
+    "naming/loop",
+    "path/scaffold-root",
+    "capabilities/scope"
+  ],
+  "expected_session_resumed_count": 0,
+  "expected_decision_register_restored_count": 1
+}
