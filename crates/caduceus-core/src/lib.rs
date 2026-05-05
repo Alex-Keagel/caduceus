@@ -7,6 +7,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod decision_register;
 pub mod event_redact;
 pub mod loop_detector;
 pub mod path_norm;
@@ -14,6 +15,11 @@ pub mod process_reward;
 pub mod sanitizer;
 pub mod verification;
 
+pub use decision_register::{
+    DecisionEntry, DecisionId, DecisionOp, DecisionRecord, DecisionRegisterErrorCode,
+    DecisionSource, DecisionState, DecisionValue, DecisionValueKind, OpenQuestion, ProducerId,
+    SessionThreadIndex, ThreadId,
+};
 pub use event_redact::{redact_secrets_for_event, REDACTED_SENTINEL};
 pub use loop_detector::{LoopCheckResult, LoopDetector};
 pub use path_norm::{is_path_like_field, normalize_lex, PATH_LIKE_FIELDS};
@@ -82,6 +88,34 @@ impl fmt::Display for ModelId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ToolCallId(pub String);
+
+/// `RequestId` — UUID v4 minted by the originator of an IPC call. Echoed in
+/// all logs, errors, and responses associated with that request. See
+/// `spec-cross-cutting-wiring.md` §2 / `Z7-W11`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RequestId(pub Uuid);
+
+impl RequestId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn from_uuid(u: Uuid) -> Self {
+        Self(u)
+    }
+}
+
+impl Default for RequestId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for RequestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 impl ToolCallId {
     pub fn new(id: impl Into<String>) -> Self {
@@ -1380,6 +1414,123 @@ pub enum AgentEvent {
     /// events ship inside here so schema churn doesn't mint new top-level
     /// variants. Older clients see this under [`AgentEvent::Unknown`].
     Introspection(IntrospectionEventV1),
+
+    /// `spec-decision-register` (P-tier) — first-class events for the
+    /// decision-lifecycle. Free text "✅" rendering MUST NOT substitute for
+    /// these (Z8-D1). The reducer in `caduceus-orchestrator` consumes this
+    /// stream to maintain the `DecisionRegister` projection.
+    DecisionLocked {
+        id: DecisionId,
+        value: DecisionValue,
+        source: DecisionSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        derived_from: Option<DecisionId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<RequestId>,
+        producer_id: ProducerId,
+    },
+
+    /// A previously-locked decision changes value. `prior_value` MUST match
+    /// `entries[id].current`; mismatch surfaces `stale-amend`. `reason`
+    /// MUST be non-empty (Z8-D9, Z8-D9a).
+    DecisionAmended {
+        id: DecisionId,
+        value: DecisionValue,
+        prior_value: DecisionValue,
+        source: DecisionSource,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<RequestId>,
+        producer_id: ProducerId,
+    },
+
+    /// A previously-locked decision is retracted; history preserved.
+    /// `reason` MUST be non-empty (Z8-D9). See spec §3.2.2 rule 3.
+    DecisionUnlocked {
+        id: DecisionId,
+        prior_value: DecisionValue,
+        source: DecisionSource,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<RequestId>,
+        producer_id: ProducerId,
+    },
+
+    /// Lock attempt rejected by the permission envelope. Audit-only:
+    /// recorded in `DecisionEntry::history` with `op = LockDenied`, but
+    /// `state` and `current` are unchanged. See spec §3.9.3 / Z8-D47.
+    DecisionLockDenied {
+        id: DecisionId,
+        attempted_value: DecisionValue,
+        denied_by: String,
+        reason: String,
+        source: DecisionSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<RequestId>,
+    },
+
+    /// Emitted by the orchestrator after `RestoreProtocol` completes. UI
+    /// re-fetches the register on this signal; agent loop sees it as
+    /// confirmation that the `ReconciliationMessage` was injected for the
+    /// next turn. See spec §3.4.3 step 6.
+    DecisionRegisterRestored {
+        thread_id: ThreadId,
+        count: u32,
+        since_event_seq: u64,
+        truncated: bool,
+        displayed_k: u32,
+    },
+
+    /// Reducer-internal error surfaced as a first-class event so it shows
+    /// up in audit logs and the UI rather than being swallowed. See spec
+    /// §4.4 for the closed enum of codes.
+    DecisionRegisterError {
+        code: DecisionRegisterErrorCode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<DecisionId>,
+        detail: String,
+    },
+
+    /// Agent registered an open question with a known `DecisionId`. Drives
+    /// the open-question pool that the orchestrator subtracts from on
+    /// restore (Z8-D24, Z8-D33a — the structural prong of restore).
+    OpenQuestionPresented {
+        id: DecisionId,
+        prompt: String,
+        kind: DecisionValueKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<Vec<String>>,
+    },
+
+    /// Open-question pool entry was eliminated. `reason` is one of:
+    /// - `"locked"` — `DecisionLocked` arrived for this id.
+    /// - `"already-locked"` — restore-time elimination (the register
+    ///   already had a `Locked` entry for this id; Z8-D33a).
+    /// - `"user-skipped"` — user explicitly skipped the question.
+    OpenQuestionEliminated {
+        id: DecisionId,
+        reason: String,
+    },
+
+    /// N=2 turns elapsed after an `OpenQuestionPresented` with no matching
+    /// `DecisionLocked`. Observable to the user surface (which can prompt)
+    /// and to telemetry. Does NOT auto-create a decision (Z8-D48).
+    OpenQuestionUnanswered {
+        id: DecisionId,
+        turns_elapsed: u32,
+        prompt: String,
+    },
+
+    /// One-time event emitted when a pre-spec `~/.caduceus/sessions/<id>/`
+    /// directory is migrated to the `~/.caduceus/threads/<thread_id>/`
+    /// layout. Idempotent (re-runnable; emitted only on the first run that
+    /// performs the migration). See spec §3.0.2.
+    ThreadIdMigrated {
+        session_id: SessionId,
+        thread_id: ThreadId,
+    },
 
     /// G33 — forward-compat catch-all. Any `type` tag this build
     /// doesn't recognise deserialises here, so an older reader doesn't
