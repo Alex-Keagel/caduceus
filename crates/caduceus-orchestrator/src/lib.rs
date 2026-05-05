@@ -55,11 +55,17 @@ pub use time_tracking::{TimeEntry, TimeTracker};
 
 // ST-B1 Wave 0c — extracted modules.
 mod config_loader;
+pub mod decision_register;
 mod effort_levels;
 mod execution_tree;
 mod query_config;
 pub mod thread_id;
 pub use config_loader::ConfigLoader;
+pub use decision_register::{
+    apply_event as apply_decision_event, load as load_decision_register,
+    persist as persist_decision_register, register_path as decision_register_path, ApplyOutcome,
+    DecisionRegister, ReducerError as DecisionReducerError,
+};
 pub use effort_levels::EffortLevel;
 pub use execution_tree::{ExecutionTreeViz, VizTreeNode};
 pub use query_config::QueryConfig;
