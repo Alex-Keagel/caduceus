@@ -55,6 +55,7 @@ pub use time_tracking::{TimeEntry, TimeTracker};
 
 // ST-B1 Wave 0c — extracted modules.
 mod config_loader;
+pub mod decision_ipc;
 pub mod decision_register;
 mod effort_levels;
 mod execution_tree;
@@ -63,6 +64,10 @@ mod query_config;
 pub mod restore_protocol;
 pub mod thread_id;
 pub use config_loader::ConfigLoader;
+pub use decision_ipc::{
+    amend_decision, list_decisions, lock_decision, unlock_decision, InMemoryEnqueuer, IpcApply,
+    IpcEnqueuer,
+};
 pub use decision_register::{
     apply_event as apply_decision_event, load as load_decision_register,
     persist as persist_decision_register, register_path as decision_register_path, ApplyOutcome,
